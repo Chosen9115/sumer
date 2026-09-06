@@ -5,6 +5,15 @@
 //! JSON values; [`crate::MAX_FRAME_BYTES`] bounds a frame's length
 //! *excluding* the terminating LF.
 //!
+//! **A decoded frame is handed on as its original text, never as a
+//! [`serde_json::Value`].** `Value` is a lossy intermediate: it collapses
+//! duplicate object keys (last one wins), so a typed decode downstream of
+//! one can never see -- and can never reject -- `{"id":1,"ok":{"wrong":
+//! true},"ok":{"resources":[]}}`. The framer therefore validates that a
+//! frame *is* JSON (that is the `NotJson` violation) without keeping the
+//! parse, and every typed deserialization in the host runs against these
+//! same bytes.
+//!
 //! Required invariants (see the crate's fuzz target, `fuzz/fuzz_targets/codec.rs`):
 //! - never panics on any byte sequence;
 //! - never allocates beyond `MAX_FRAME_BYTES + 1` bytes for the
@@ -64,7 +73,7 @@ impl FrameDecoder {
     pub fn push(
         &mut self,
         chunk: &[u8],
-        out: &mut Vec<serde_json::Value>,
+        out: &mut Vec<String>,
     ) -> Result<(), ProtocolViolationKind> {
         if let Some(kind) = self.violation {
             return Err(kind);
@@ -72,8 +81,8 @@ impl FrameDecoder {
         for &b in chunk {
             if b == b'\n' {
                 match Self::decode_frame(&self.buf) {
-                    Ok(value) => {
-                        out.push(value);
+                    Ok(text) => {
+                        out.push(text);
                         self.buf.clear();
                     }
                     Err(kind) => {
@@ -92,9 +101,14 @@ impl FrameDecoder {
         Ok(())
     }
 
-    fn decode_frame(bytes: &[u8]) -> Result<serde_json::Value, ProtocolViolationKind> {
+    /// Validates one frame's bytes and returns them as text. The JSON
+    /// parse is done for its verdict only (`NotJson`) and thrown away --
+    /// see the module docs on why the *text* is what gets handed on.
+    fn decode_frame(bytes: &[u8]) -> Result<String, ProtocolViolationKind> {
         let text = std::str::from_utf8(bytes).map_err(|_| ProtocolViolationKind::NonUtf8)?;
-        serde_json::from_str(text).map_err(|_| ProtocolViolationKind::NotJson)
+        serde_json::from_str::<serde::de::IgnoredAny>(text)
+            .map_err(|_| ProtocolViolationKind::NotJson)?;
+        Ok(text.to_owned())
     }
 
     /// `true` once a violation has been recorded; no more frames will ever
@@ -122,7 +136,7 @@ mod tests {
     fn push_all(
         decoder: &mut FrameDecoder,
         chunk: &[u8],
-    ) -> Result<Vec<serde_json::Value>, ProtocolViolationKind> {
+    ) -> Result<Vec<String>, ProtocolViolationKind> {
         let mut out = Vec::new();
         decoder.push(chunk, &mut out)?;
         Ok(out)
@@ -132,7 +146,7 @@ mod tests {
     fn decodes_single_frame() {
         let mut d = FrameDecoder::new();
         let frames = push_all(&mut d, b"{\"id\":1}\n").unwrap();
-        assert_eq!(frames, vec![serde_json::json!({"id": 1})]);
+        assert_eq!(frames, vec![r#"{"id":1}"#.to_owned()]);
         assert_eq!(d.pending_bytes(), 0);
     }
 
@@ -142,29 +156,23 @@ mod tests {
         let frames = push_all(&mut d, b"{\"a\":1}\n{\"b\":2}\n").unwrap();
         assert_eq!(
             frames,
-            vec![serde_json::json!({"a": 1}), serde_json::json!({"b": 2})]
+            vec![r#"{"a":1}"#.to_owned(), r#"{"b":2}"#.to_owned()]
         );
     }
 
     #[test]
     fn empty_push_yields_no_frames() {
         let mut d = FrameDecoder::new();
-        assert_eq!(
-            push_all(&mut d, b"").unwrap(),
-            Vec::<serde_json::Value>::new()
-        );
+        assert_eq!(push_all(&mut d, b"").unwrap(), Vec::<String>::new());
     }
 
     #[test]
     fn partial_frame_across_two_pushes() {
         let mut d = FrameDecoder::new();
-        assert_eq!(
-            push_all(&mut d, b"{\"id\":").unwrap(),
-            Vec::<serde_json::Value>::new()
-        );
+        assert_eq!(push_all(&mut d, b"{\"id\":").unwrap(), Vec::<String>::new());
         assert_eq!(d.pending_bytes(), 6);
         let frames = push_all(&mut d, b"1}\n").unwrap();
-        assert_eq!(frames, vec![serde_json::json!({"id": 1})]);
+        assert_eq!(frames, vec![r#"{"id":1}"#.to_owned()]);
     }
 
     #[test]
@@ -216,7 +224,7 @@ mod tests {
         let mut out = Vec::new();
         let err = d.push(b"{\"a\":1}\nnot json\n", &mut out).unwrap_err();
         assert_eq!(err, ProtocolViolationKind::NotJson);
-        assert_eq!(out, vec![serde_json::json!({"a": 1})]);
+        assert_eq!(out, vec![r#"{"a":1}"#.to_owned()]);
     }
 
     #[test]

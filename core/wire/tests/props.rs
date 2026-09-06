@@ -239,8 +239,14 @@ proptest! {
         let pos_a = must_some(sorted.iter().position(|r| r == &a));
         let pos_b = must_some(sorted.iter().position(|r| r == &b));
 
-        let expected_a_first = fold_order_key(&a.received_at, &a.surface, a.arrival_index)
-            <= fold_order_key(&b.received_at, &b.surface, b.arrival_index);
+        // Computed WITHOUT `fold_order_key`: asking the function under
+        // test what it expects of itself is a tautology that a key
+        // ignoring `received_at` outright would still satisfy. The
+        // timestamp shape is fixed-width `YYYY-MM-DDTHH:MM:SSZ`, so
+        // bytewise string order over it *is* chronological order, and
+        // `surface` is specified as bytewise too.
+        let expected_a_first = (a.received_at.as_str(), a.surface.as_str(), a.arrival_index)
+            <= (b.received_at.as_str(), b.surface.as_str(), b.arrival_index);
         prop_assert_eq!(pos_a < pos_b, expected_a_first);
     }
 }

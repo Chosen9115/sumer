@@ -4,9 +4,15 @@
 //! Every case is driven through the real [`sumer_host::AdapterHandle`] --
 //! the same supervisor a production host uses -- so id lifecycle, protocol
 //! violation detection, and provenance stamping are exercised for real, not
-//! reimplemented here -- including `unsupported_op`'s probe, which reaches
-//! the wire through `AdapterHandle::call_raw`. There is exactly one client
-//! in this crate.
+//! reimplemented here -- including `unsupported_op`'s probe and every
+//! [`wire_pass`], which reach the wire through `AdapterHandle::call_raw`.
+//! There is exactly one client in this crate.
+//!
+//! A host is also a *remediator*, though: it omits every observation over
+//! `MAX_OBSERVATION_BYTES` at decode and stamps fields onto what it keeps.
+//! Two assertions judge the adapter behaviour that hides behind that, so
+//! they read raw reply envelopes on their own fresh processes -- see
+//! [`wire_pass`].
 //!
 //! Resumption ([`sumer_host::paging::ResumeState`]) and revision assignment
 //! / the live-set fold ([`sumer_host::fold::Fold`]) are never reimplemented
@@ -30,8 +36,8 @@ use sumer_host::fold::{Fold, RevisionedObservation};
 use sumer_host::paging::ResumeState;
 use sumer_host::{AdapterHandle, HostError, DEFAULT_DEADLINE};
 use sumer_wire::{
-    CursorResumable, PageRequest, ProtocolViolationKind, Reply, ResourceQuery,
-    MAX_OBSERVATION_BYTES,
+    BalancesReadParams, CursorResumable, HistoryReadParams, PageRequest, ProtocolViolationKind,
+    Reply, ResourceQuery, MAX_OBSERVATION_BYTES, OP_BALANCES_READ, OP_HISTORY_READ,
 };
 
 /// Every fixture with more than this many pages for one resource is
@@ -250,6 +256,26 @@ fn chain_for<'a>(fold: &'a Fold, local_id: &str) -> Vec<&'a RevisionedObservatio
         .collect()
 }
 
+/// How two values for one `local_id` disagree. An observation *chain* is an
+/// array, and rendering two whole chains side by side just truncates into
+/// noise -- so a length mismatch says so, and a content mismatch names the
+/// first index that differs.
+fn disagreement(actual: &Value, expected: &Value) -> String {
+    if let (Value::Array(a), Value::Array(e)) = (actual, expected) {
+        if a.len() != e.len() {
+            return format!(
+                "{} observation(s) in this run, {} in the other",
+                a.len(),
+                e.len()
+            );
+        }
+        if let Some((i, (a_i, e_i))) = a.iter().zip(e).enumerate().find(|(_, (x, y))| x != y) {
+            return format!("observation {i} differs: {} != {}", brief(a_i), brief(e_i));
+        }
+    }
+    format!("{} != {}", brief(actual), brief(expected))
+}
+
 /// Every way two live sets can disagree, rendered one line per `local_id`.
 fn content_diff(
     actual: &BTreeMap<String, Value>,
@@ -259,11 +285,12 @@ fn content_diff(
     for (local_id, expected_obs) in expected {
         match actual.get(local_id) {
             None => out.push(format!("{local_id:?}: missing")),
-            Some(actual_obs) if actual_obs != expected_obs => out.push(format!(
-                "{local_id:?}: {} != {}",
-                brief(actual_obs),
-                brief(expected_obs)
-            )),
+            Some(actual_obs) if actual_obs != expected_obs => {
+                out.push(format!(
+                    "{local_id:?}: {}",
+                    disagreement(actual_obs, expected_obs)
+                ));
+            }
             Some(_) => {}
         }
     }
@@ -273,15 +300,32 @@ fn content_diff(
     out
 }
 
-/// A10, applied to **every** observation the suite ever receives, in every
-/// case: a serialized observation over `MAX_OBSERVATION_BYTES` means the
-/// two-step degrade of spec/observation.md §6 was not performed.
+/// A10: an observation **the adapter put on the wire** that exceeds
+/// `MAX_OBSERVATION_BYTES` means the two-step degrade of
+/// spec/observation.md §6 was not performed.
 ///
-/// The size measured is the *adapter's* observation ([`adapter_view`]), not
-/// the host's enriched copy -- `received_at`/`staleness` were never on the
-/// wire and must not be charged against the adapter's budget.
-fn assert_wire_size(json: &Value, label: &str, failures: &mut Vec<Failure>) {
-    let Ok(bytes) = serde_json::to_vec(json).map(|v| v.len()) else {
+/// `raw` must be an observation exactly as it arrived in the reply frame --
+/// see [`wire_pass`]. Measuring anything else cannot work, in either
+/// direction:
+///
+/// * The host **omits** every over-cap observation at decode
+///   (spec/observation.md §6, "the host enforces the cap too"). By the time
+///   a decoded observation is visible to this suite it is under the cap by
+///   construction, so a check there can never see the violation A10 exists
+///   to catch -- an adapter that skips the degrade entirely is silently
+///   remediated into looking conformant.
+/// * The host's decoded form is not the wire form. `Observation`
+///   serializes its absent optionals as explicit nulls that
+///   `ObservationWire` omits, so re-serializing it charges an adapter for
+///   bytes it never sent -- enough to reject a legitimate record sitting
+///   exactly at the cap.
+///
+/// The count is `serde_json`'s encoding of the same JSON value the adapter
+/// sent, which differs from the adapter's own bytes only in whitespace and
+/// key order -- the difference spec/observation.md §6 explicitly permits
+/// when it says the same thing about the host's measurement.
+fn assert_wire_size(raw: &Value, label: &str, failures: &mut Vec<Failure>) {
+    let Ok(bytes) = serde_json::to_vec(raw).map(|v| v.len()) else {
         failures.push(Failure::new(
             "A10",
             format!("{label}: could not re-serialize the observation to measure it"),
@@ -292,9 +336,10 @@ fn assert_wire_size(json: &Value, label: &str, failures: &mut Vec<Failure>) {
         failures.push(Failure::new(
             "A10",
             format!(
-                "{label}: serialized observation is {bytes} bytes, over MAX_OBSERVATION_BYTES \
-                 ({MAX_OBSERVATION_BYTES}) -- spec/observation.md §6's two-step degrade was not \
-                 applied before it went on the wire"
+                "{label}: the adapter put a {bytes}-byte observation on the wire, over \
+                 MAX_OBSERVATION_BYTES ({MAX_OBSERVATION_BYTES}) -- spec/observation.md §6's \
+                 two-step degrade was not applied before it went out. The host omits it \
+                 afterwards; that is remediation, not conformance"
             ),
         ));
     }
@@ -438,12 +483,11 @@ async fn drain_history(
         assert_status_coverage(&requested, &statuses_json, failures);
         drain.statuses.extend(statuses_json);
 
+        // No size check here, deliberately: the host omits every over-cap
+        // observation at decode, so nothing that reaches this loop can be
+        // one. A10 is measured where the violation is still visible -- at
+        // the wire, in [`wire_pass`].
         for obs in reply.observations {
-            assert_wire_size(
-                &adapter_view(&obs),
-                &format!("history.read({resource_id}) observation {:?}", obs.local_id),
-                failures,
-            );
             drain.local_ids.push(obs.local_id.clone());
             fold.ingest(obs);
         }
@@ -462,6 +506,212 @@ async fn drain_history(
         match next {
             Some(n) => page = Some(n),
             None => return drain,
+        }
+    }
+}
+
+// ---------------------------------------------------------------------
+// The wire pass: the same reads, on a fresh process, read as raw frames.
+// ---------------------------------------------------------------------
+
+/// One adapter lifetime's reads, observed **at the wire**: the raw JSON the
+/// adapter emitted, before the host decoded it, dropped anything over the
+/// cap, or stamped a single field onto it.
+///
+/// This is not a second client -- it is the same [`AdapterHandle`], the same
+/// spawn, the same frame decoder and the same id lifecycle as every other
+/// call in this suite. The only difference is
+/// [`AdapterHandle::call_raw`], which hands back the envelope verbatim
+/// instead of the host's decoded, remediated view of it. Two assertions
+/// need that and cannot be written without it:
+///
+/// * **A10** (see [`assert_wire_size`]): the host omits an over-cap
+///   observation before any decoded reply exists, so the only place the
+///   violation is still visible is the frame it arrived in.
+/// * **A9**: `local_id` purity is a claim about what the *adapter* derives.
+///   Comparing the host's decoded observations compares the host's
+///   serialization of them; comparing raw frames compares the adapter's own
+///   bytes, with nothing host-added in the way.
+///
+/// Requests are built from the same `sumer_wire` param types the typed
+/// reads use, so the bytes on the adapter's stdin are identical to a normal
+/// read's -- a fixture cannot tell a wire pass apart from the crawl it
+/// mirrors.
+///
+/// Returns every history observation seen, keyed by `local_id`, as a JSON
+/// array in arrival order: the `local_id` -> provider-record association,
+/// including records later superseded or tombstoned.
+async fn wire_pass(
+    argv: &[String],
+    path: &Path,
+    run: u64,
+    resource_ids: &[String],
+    label: &str,
+    failures: &mut Vec<Failure>,
+) -> BTreeMap<String, Value> {
+    let mut by_local_id: BTreeMap<String, Vec<Value>> = BTreeMap::new();
+    let handle = match spawn_run(argv, path, run, DEFAULT_DEADLINE).await {
+        Ok(h) => h,
+        Err(e) => {
+            failures.push(Failure::new(
+                "A10",
+                format!("{label}: failed to spawn: {e}"),
+            ));
+            return BTreeMap::new();
+        }
+    };
+
+    // balances.read: measured, not collected -- a balance line has no
+    // `local_id` to associate anything with, so it is A10 evidence only.
+    let params = BalancesReadParams {
+        resource_ids: resource_ids.to_vec(),
+    };
+    match raw_call(&handle, OP_BALANCES_READ, &params, label, failures).await {
+        Some(ok) => {
+            for (i, raw) in raw_observations(&ok, label, failures).iter().enumerate() {
+                assert_wire_size(
+                    raw,
+                    &format!("{label}: balances.read observation {i}"),
+                    failures,
+                );
+            }
+        }
+        None => return by_local_id.into_iter().map(array_value).collect(),
+    }
+
+    for resource_id in resource_ids {
+        let mut page: Option<PageRequest> = None;
+        let mut pages = 0_u32;
+        loop {
+            pages += 1;
+            if pages > MAX_PAGES {
+                failures.push(Failure::new(
+                    "setup",
+                    format!("{label}: history.read({resource_id}) exceeded {MAX_PAGES} pages"),
+                ));
+                break;
+            }
+            let params = HistoryReadParams {
+                resources: vec![ResourceQuery {
+                    resource_id: resource_id.clone(),
+                    page: page.clone(),
+                }],
+            };
+            let Some(ok) = raw_call(&handle, OP_HISTORY_READ, &params, label, failures).await
+            else {
+                break;
+            };
+            for raw in raw_observations(&ok, label, failures) {
+                let Some(local_id) = raw.get("local_id").and_then(Value::as_str) else {
+                    failures.push(Failure::new(
+                        "A2",
+                        format!(
+                            "{label}: an observation arrived with no local_id: {}",
+                            brief(raw)
+                        ),
+                    ));
+                    continue;
+                };
+                assert_wire_size(
+                    raw,
+                    &format!("{label}: history.read({resource_id}) observation {local_id:?}"),
+                    failures,
+                );
+                by_local_id
+                    .entry(local_id.to_owned())
+                    .or_default()
+                    .push(raw.clone());
+            }
+            match next_page(&ok, label, failures) {
+                Some(next) => page = Some(next),
+                None => break,
+            }
+        }
+    }
+    by_local_id.into_iter().map(array_value).collect()
+}
+
+fn array_value((local_id, observations): (String, Vec<Value>)) -> (String, Value) {
+    (local_id, Value::Array(observations))
+}
+
+/// One raw call, reporting anything that is not a success envelope. A wire
+/// pass mirrors reads the host crawl already made successfully, so an `err`
+/// here is a real divergence, not a scripted outcome to tolerate.
+async fn raw_call<P: serde::Serialize>(
+    handle: &AdapterHandle,
+    op: &str,
+    params: &P,
+    label: &str,
+    failures: &mut Vec<Failure>,
+) -> Option<Value> {
+    let params = match serde_json::to_value(params) {
+        Ok(v) => v,
+        Err(e) => {
+            failures.push(Failure::new(
+                "setup",
+                format!("{label}: could not serialize {op} params: {e}"),
+            ));
+            return None;
+        }
+    };
+    match handle.call_raw(op, params).await {
+        Ok(Reply::Ok { ok, .. }) => Some(ok),
+        other => {
+            failures.push(Failure::new(
+                "A10",
+                format!("{label}: {op} did not return a success envelope: {other:?}"),
+            ));
+            None
+        }
+    }
+}
+
+/// A reply body's `observations`, verbatim. Absent or non-array is a
+/// malformed reply -- the typed path rejects it too, but this pass has to
+/// say so itself rather than measure nothing in silence.
+fn raw_observations<'a>(ok: &'a Value, label: &str, failures: &mut Vec<Failure>) -> &'a [Value] {
+    match ok.get("observations") {
+        Some(Value::Array(items)) => items,
+        other => {
+            failures.push(Failure::new(
+                "A2",
+                format!(
+                    "{label}: reply body has no `observations` array (got {})",
+                    other.map_or("nothing".to_owned(), brief)
+                ),
+            ));
+            &[]
+        }
+    }
+}
+
+/// The next page request out of a raw reply body, read from the first
+/// status's `page.next` exactly as [`drain_history`] reads it off the
+/// decoded one.
+///
+/// This deserializes from a [`Value`], which -- unlike the host's typed
+/// path, which now runs against the frame's original text -- cannot see a
+/// duplicate JSON key, because `Value` collapsed it during parsing. That is
+/// not a gap in coverage: `call_raw` is the only thing here that yields a
+/// `Value` at all, and every case running a wire pass also drives the same
+/// frames through the typed crawl, where a duplicate key is rejected.
+fn next_page(ok: &Value, label: &str, failures: &mut Vec<Failure>) -> Option<PageRequest> {
+    let next = ok.pointer("/statuses/0/page/next")?;
+    if next.is_null() {
+        return None;
+    }
+    match serde_json::from_value::<PageRequest>(next.clone()) {
+        Ok(page) => Some(page),
+        Err(e) => {
+            failures.push(Failure::new(
+                "A5",
+                format!(
+                    "{label}: `page.next` is not a valid PageRequest: {e} ({})",
+                    brief(next)
+                ),
+            ));
+            None
         }
     }
 }
@@ -539,21 +789,6 @@ async fn generic_crawl(argv: &[String], path: &Path, fixture: &Value, failures: 
                         .push(s.clone());
                 }
             }
-            for b in &reply.observations {
-                let mut json = serde_json::to_value(b).unwrap_or(Value::Null);
-                if let Some(prov) = json
-                    .pointer_mut("/provenance")
-                    .and_then(Value::as_object_mut)
-                {
-                    prov.remove("received_at");
-                    prov.remove("staleness");
-                }
-                assert_wire_size(
-                    &json,
-                    &format!("balances.read {}/{}", b.resource_id, b.category),
-                    failures,
-                );
-            }
             if let Some(expected_balances) = expect.get("balances") {
                 assert_balances(&reply.observations, expected_balances, failures);
             }
@@ -586,7 +821,17 @@ async fn generic_crawl(argv: &[String], path: &Path, fixture: &Value, failures: 
             .or_default()
             .extend(drain.statuses);
     }
-    for obs in fold.live_set().values() {
+    // Every observation ever ingested, not just the live ones: a
+    // provider_extra key that arrived on a record later superseded or
+    // tombstoned is still a key that arrived undocumented.
+    let all_observed: Vec<(String, String)> = fold
+        .keys()
+        .map(|(a, l)| (a.to_owned(), l.to_owned()))
+        .collect();
+    for obs in all_observed
+        .iter()
+        .flat_map(|(a, l)| fold.chain(a, l).into_iter())
+    {
         if let Some(extra) = observation_json(&obs.observation)
             .get("provider_extra")
             .and_then(Value::as_object)
@@ -608,13 +853,24 @@ async fn generic_crawl(argv: &[String], path: &Path, fixture: &Value, failures: 
         assert_omitted(&fold, expected_omitted, failures);
     }
     if let Some(expected_statuses) = expect.get("statuses") {
-        assert_expected_outcomes(&all_statuses_by_resource, expected_statuses, failures);
+        assert_expected_statuses(
+            &all_statuses_by_resource,
+            expected_statuses,
+            "expect.statuses",
+            failures,
+        );
     }
     if let Some(field_map) = expect.get("fdx_field_map") {
         assert_fdx_field_map(field_map, &emitted_provider_extra, failures);
     }
 
-    // 4. status.read: every resource, one batched call.
+    // 4. status.read: every resource, one batched call. Its reply is the
+    // only one that populates `credential_expires_at` /
+    // `strong_auth_expires_at` / `history_start` (spec/observation.md §7),
+    // so `expect.status_read` is checked against these entries alone --
+    // folding them in with the balances/history statuses would let a
+    // fixture's claim about the clocks be satisfied by a reply that never
+    // carried them.
     match handle.status_read(resource_ids.clone()).await {
         Ok(reply) => {
             let statuses_json: Vec<Value> = reply
@@ -623,6 +879,7 @@ async fn generic_crawl(argv: &[String], path: &Path, fixture: &Value, failures: 
                 .map(|s| serde_json::to_value(s).unwrap_or(Value::Null))
                 .collect();
             assert_status_coverage(&resource_ids, &statuses_json, failures);
+            assert_status_read(&statuses_json, &expect, failures);
         }
         Err(e) => failures.push(Failure::new("A7", format!("status.read failed: {e}"))),
     }
@@ -633,70 +890,46 @@ async fn generic_crawl(argv: &[String], path: &Path, fixture: &Value, failures: 
         assert_envelope_errors(&handle, expected_errors, failures).await;
     }
 
-    // A9: local_id purity across two separate process invocations. Only
-    // meaningful for cases that actually emit local_ids.
-    let first_run = live_content(&fold);
+    // A9 + A10, both measured at the wire, on two further independent
+    // process invocations of the same fixture.
     drop(handle);
-    if !first_run.is_empty() {
-        assert_local_id_purity(argv, path, &resource_ids, &first_run, failures).await;
-    }
+    let first = wire_pass(argv, path, 0, &resource_ids, "wire pass 1", failures).await;
+    let second = wire_pass(argv, path, 0, &resource_ids, "wire pass 2", failures).await;
+    assert_local_id_purity(&first, &second, failures);
 }
 
 /// A9: `local_id` is a pure function of provider data, checked across two
-/// independent process launches -- as an **association**, not a set.
+/// independent process launches -- as the **whole historical association**,
+/// not a set of ids and not the final live set.
 ///
-/// The set of ids alone is satisfied by an adapter that hands out the same
-/// ids on the second launch attached to *different records*: swap the ids of
-/// two observations and the set is identical while every id now names the
-/// wrong thing. A derivation like that is not a function of the record at
-/// all, which is precisely what A9 exists to reject. So what is compared is
-/// the pairing -- each `local_id` against the provider record it identifies
-/// (amount, posting, state, surface, provider_id, provider_extra) -- minus
-/// the two fields the host stamps per receipt, which legitimately differ.
-async fn assert_local_id_purity(
-    argv: &[String],
-    path: &Path,
-    resource_ids: &[String],
-    first_run: &BTreeMap<String, Value>,
+/// Two weaker comparisons this deliberately is not:
+///
+/// * The set of ids alone is satisfied by an adapter that hands out the
+///   same ids on the second launch attached to *different records*: swap
+///   two observations' ids and the set is identical while every id now
+///   names the wrong thing.
+/// * The final live set alone ignores every record that was later
+///   superseded or tombstoned. An adapter can mis-derive the `local_id` of
+///   an intermediate observation -- the tombstone in a reorg chain, the
+///   pending row a posted one supersedes -- and still land on an identical
+///   live set. Purity is a claim about *every* record the derivation
+///   touches, so the comparison is per `local_id` over the full ordered
+///   list of observations carrying it.
+///
+/// Both sides are raw wire frames ([`wire_pass`]), so what is compared is
+/// the adapter's own bytes with nothing host-stamped in the way.
+fn assert_local_id_purity(
+    first: &BTreeMap<String, Value>,
+    second: &BTreeMap<String, Value>,
     failures: &mut Vec<Failure>,
 ) {
-    let handle = match spawn_run(argv, path, 0, DEFAULT_DEADLINE).await {
-        Ok(h) => h,
-        Err(e) => {
-            failures.push(Failure::new(
-                "A9",
-                format!("second invocation failed to spawn: {e}"),
-            ));
-            return;
-        }
-    };
-    if let Err(e) = handle.resources_list().await {
-        failures.push(Failure::new(
-            "A9",
-            format!("second invocation: resources.list failed: {e}"),
-        ));
-        return;
-    }
-    let mut fold = Fold::new();
-    for rid in resource_ids {
-        drain_history(
-            &handle,
-            rid,
-            None,
-            &mut fold,
-            None,
-            DrainFor::Assertion("A9"),
-            failures,
-        )
-        .await;
-    }
-    let second_run = live_content(&fold);
-    for line in content_diff(&second_run, first_run) {
+    for line in content_diff(second, first) {
         failures.push(Failure::new(
             "A9",
             format!(
                 "the local_id -> provider-record association differs between two independent \
-                 process invocations of the same fixture: {line}"
+                 process invocations of the same fixture, across the full observation history \
+                 (not just the final live set): {line}"
             ),
         ));
     }
@@ -777,7 +1010,26 @@ async fn assert_envelope_errors(
 // in `assert.rs`).
 // ---------------------------------------------------------------------
 
+/// `expect.resources` names every resource the adapter may list, and only
+/// those. The count matters for the same reason it does on balances: an
+/// invented resource contradicts nothing on its own, so a
+/// present-and-correct check alone certifies an adapter that reports an
+/// account the provider never had.
 fn assert_resources(actual_json: &[Value], expected_list: &[Value], failures: &mut Vec<Failure>) {
+    if actual_json.len() != expected_list.len() {
+        failures.push(Failure::new(
+            "setup",
+            format!(
+                "resources.list returned {} resource(s), expected {} -- actual ids: {:?}",
+                actual_json.len(),
+                expected_list.len(),
+                actual_json
+                    .iter()
+                    .map(|r| r.get("resource_id").cloned().unwrap_or(Value::Null))
+                    .collect::<Vec<_>>()
+            ),
+        ));
+    }
     for expected in expected_list {
         let Some(resource_id) = expected
             .get("resource_id")
@@ -809,6 +1061,15 @@ fn assert_resources(actual_json: &[Value], expected_list: &[Value], failures: &m
     }
 }
 
+/// A1/A3: every balance line a fixture names arrived with the value it
+/// names -- **and the resource reported no line the fixture did not name**.
+///
+/// The count is half the assertion, not bookkeeping. A balances reply is a
+/// list of provider-named categories (spec/observation.md §2), and nothing
+/// downstream can tell a category the provider actually reported from one
+/// an adapter invented: there is no schema to violate, no other field to
+/// contradict. Checking only that the expected categories are present lets
+/// an adapter append a fabricated line -- any name, any amount -- and pass.
 fn assert_balances(actual: &[sumer_wire::Balance], expected: &Value, failures: &mut Vec<Failure>) {
     let Some(map) = expect_object(expected, "expect.balances", failures) else {
         return;
@@ -823,6 +1084,21 @@ fn assert_balances(actual: &[sumer_wire::Balance], expected: &Value, failures: &
             .iter()
             .filter(|b| &b.resource_id == resource_id)
             .collect();
+        if actual_for_resource.len() != entries.len() {
+            failures.push(Failure::new(
+                "A1",
+                format!(
+                    "resource {resource_id:?}: {} balance line(s), expected {} -- actual \
+                     categories: {:?}",
+                    actual_for_resource.len(),
+                    entries.len(),
+                    actual_for_resource
+                        .iter()
+                        .map(|b| &b.category)
+                        .collect::<Vec<_>>()
+                ),
+            ));
+        }
         for expected_entry in entries {
             let Some(category) = expected_entry
                 .get("category")
@@ -1260,46 +1536,120 @@ fn provider_extra_targets(text: &str) -> Vec<String> {
 
 /// Checks that, across every status observed for a resource (balances.read
 /// and/or history.read alike -- `expect.statuses` does not say which), at
-/// least one carries an `outcome` matching the expected shape. "At least
-/// one of the calls that touched this resource produced this outcome" is
-/// the right granularity here: `expect.statuses` fixtures each exercise
-/// exactly one of the two read paths, and this stays correct either way
-/// without the runner having to guess which.
-fn assert_expected_outcomes(
+/// least one **entry** matches the expected shape as a subset. "At least
+/// one of the calls that touched this resource produced this" is the right
+/// granularity here: `expect.statuses` fixtures each exercise exactly one
+/// of the two read paths, and this stays correct either way without the
+/// runner having to guess which.
+///
+/// The match is against the whole status entry, not just its `outcome`,
+/// because a status entry now states two independent facts: `outcome` (the
+/// freshness one, which §1's staleness table reads) and `degraded` (a
+/// record dropped for size). A fixture that could only name the outcome
+/// could not assert the thing spec/observation.md §6 is emphatic about --
+/// that a degrade leaves the outcome alone -- which is exactly the bug that
+/// made a cached sibling observation look live.
+fn assert_expected_statuses(
     all_statuses_by_resource: &HashMap<String, Vec<Value>>,
     expected: &Value,
+    what: &str,
     failures: &mut Vec<Failure>,
 ) {
-    let Some(map) = expect_object(expected, "expect.statuses", failures) else {
+    let Some(map) = expect_object(expected, what, failures) else {
         return;
     };
-    for (resource_id, expected_outcome) in map {
+    for (resource_id, expected_entry) in map {
         let candidates = all_statuses_by_resource
             .get(resource_id)
             .cloned()
             .unwrap_or_default();
-        let matched = candidates.iter().any(|status| {
-            let mut diffs = Vec::new();
-            match status.get("outcome") {
-                Some(outcome) => json_subset_diff(outcome, expected_outcome, "outcome", &mut diffs),
-                None => diffs.push("no outcome field".to_owned()),
-            }
-            diffs.is_empty()
-        });
-        if !matched {
+        // The closest candidate's own diffs, not two blobs side by side:
+        // "no entry matched {150 bytes} against {400 bytes}" is unreadable
+        // at 3am, and every one of these fields is a single scalar that can
+        // say exactly how it differs.
+        let Some(closest) = candidates
+            .iter()
+            .map(|status| status_entry_diffs(status, expected_entry))
+            .min_by_key(Vec::len)
+        else {
             failures.push(Failure::new(
                 "A7",
-                format!(
-                    "resource {resource_id:?}: no observed status outcome matched expected \
-                     {expected_outcome}; observed outcomes: {:?}",
-                    candidates
-                        .iter()
-                        .map(|s| s.get("outcome").cloned().unwrap_or(Value::Null))
-                        .collect::<Vec<_>>()
-                ),
+                format!("resource {resource_id:?}: {what} names it, but no status entry for it was ever observed"),
+            ));
+            continue;
+        };
+        for diff in closest {
+            failures.push(Failure::new(
+                "A7",
+                format!("resource {resource_id:?} ({what}): {diff}"),
             ));
         }
     }
+}
+
+/// `expect.status_read`: the fields only a `status.read` reply carries.
+///
+/// Two clocks, deliberately independent (spec/observation.md §7): a bearer
+/// credential's expiry and a strong-authentication session's expiry are not
+/// the same event on any provider that has both -- a Wise personal token
+/// does not expire until it is revoked while its SCA re-authentication
+/// lapses on a fixed schedule, and the EU/UK SCA window moved from 90 to
+/// 180 days while banks kept enforcing 90. Collapse them into one field and
+/// the host can no longer tell "reconnect this credential" from "re-run
+/// this authentication step". A fixture therefore names values that
+/// *differ*, so an implementation that reports one clock for both is caught
+/// rather than passing on a coincidence.
+fn assert_status_read(statuses_json: &[Value], expect: &Value, failures: &mut Vec<Failure>) {
+    let Some(expected) = expect.get("status_read") else {
+        return;
+    };
+    let mut by_resource: HashMap<String, Vec<Value>> = HashMap::new();
+    for status in statuses_json {
+        if let Some(rid) = status.get("resource_id").and_then(Value::as_str) {
+            by_resource
+                .entry(rid.to_owned())
+                .or_default()
+                .push(status.clone());
+        }
+    }
+    assert_expected_statuses(&by_resource, expected, "expect.status_read", failures);
+}
+
+/// How one status entry fails to match what a fixture named. Every field
+/// the fixture names must be present and equal -- except a field it names
+/// as `null`, which must be **absent or null** on the entry.
+///
+/// `null` is how a fixture spells "the adapter must not claim to know
+/// this", and it is load-bearing for the two clocks and `history_start`
+/// (spec/observation.md §7). A credential that never expires until it is
+/// revoked has no expiry date; a provider that promised nothing about how
+/// far back its history goes has no `history_start`. Neither is a zero, an
+/// epoch, or a far-future placeholder -- the same rule §2 states for a null
+/// balance amount, and one a subset comparison alone cannot express, since
+/// a subset can only ever say "this field is there and equal".
+fn status_entry_diffs(actual: &Value, expected: &Value) -> Vec<String> {
+    let mut diffs = Vec::new();
+    let mut expected = expected.clone();
+    if let Value::Object(map) = &mut expected {
+        let unknown: Vec<String> = map
+            .iter()
+            .filter(|(_, v)| v.is_null())
+            .map(|(k, _)| k.clone())
+            .collect();
+        for key in unknown {
+            map.remove(&key);
+            match actual.get(&key) {
+                None | Some(Value::Null) => {}
+                Some(claimed) => diffs.push(format!(
+                    "status.{key} must be absent (unknown), got {} -- unknown is never a date, \
+                     and never zero",
+                    brief(claimed)
+                )),
+            }
+        }
+    }
+    json_subset_diff(actual, &expected, "status", &mut diffs);
+    diffs
 }
 
 // ---------------------------------------------------------------------
@@ -1354,24 +1704,10 @@ async fn case_stale_balance(
             if let Some(expected_prov) = expect.get("provenance") {
                 assert_provenance(&reply.observations, expected_prov, failures);
             }
-            if let Some(expected_outcome) = expect.pointer("/statuses/checking-2") {
-                let matched = statuses_json.iter().any(|s| {
-                    let mut d = Vec::new();
-                    match s.get("outcome") {
-                        Some(o) => json_subset_diff(o, expected_outcome, "outcome", &mut d),
-                        None => d.push("no outcome field".to_owned()),
-                    }
-                    d.is_empty()
-                });
-                if !matched {
-                    failures.push(Failure::new(
-                        "A3",
-                        format!(
-                            "checking-2: no status outcome matched {expected_outcome}; observed \
-                             {statuses_json:?}"
-                        ),
-                    ));
-                }
+            if let Some(expected_statuses) = expect.get("statuses") {
+                let observed: HashMap<String, Vec<Value>> =
+                    [("checking-2".to_owned(), statuses_json)].into();
+                assert_expected_statuses(&observed, expected_statuses, "expect.statuses", failures);
             }
         }
         Err(e) => failures.push(Failure::new(
@@ -1406,6 +1742,7 @@ async fn case_stale_balance(
                 &statuses_json,
                 failures,
             );
+            assert_status_read(&statuses_json, &expect, failures);
         }
         Err(e) => failures.push(Failure::new(
             "A4",
@@ -1415,6 +1752,20 @@ async fn case_stale_balance(
             ),
         )),
     }
+
+    // A10 at the wire, on a fresh process: checking-2 only, the one leg
+    // this case answers with a normal `ok` (checking-3's is scripted to be
+    // rejected at the envelope, so it emits no observation to measure).
+    drop(handle);
+    wire_pass(
+        argv,
+        path,
+        0,
+        &["checking-2".to_owned()],
+        "wire pass",
+        failures,
+    )
+    .await;
 }
 
 // ---------------------------------------------------------------------
@@ -1576,6 +1927,10 @@ async fn case_unsupported_op(
             }
         }
     }
+
+    // A10 at the wire, on a fresh process.
+    drop(handle);
+    wire_pass(argv, path, 0, &resource_ids, "wire pass", failures).await;
 }
 
 // ---------------------------------------------------------------------
@@ -1670,6 +2025,19 @@ async fn run_pagination_family(
     if let Some(expected_full) = family.get("full_live_set").and_then(Value::as_array) {
         assert_declared_live_set(&full_live, expected_full, family_name, failures);
     }
+
+    // A10 at the wire: the same uninterrupted run, read raw on a fresh
+    // process. The two interrupted runs are deliberately cut short, so the
+    // full page set only exists here.
+    wire_pass(
+        argv,
+        path,
+        full_idx,
+        std::slice::from_ref(&resource_id),
+        &format!("{family_name} wire pass"),
+        failures,
+    )
+    .await;
 
     // 2. Interrupted-before run: normal pagination by `next`, feeding
     // sumer_host::paging::ResumeState so we know how to resume once it
@@ -2045,6 +2413,29 @@ async fn check_violation_after_resources_list(
     }
 }
 
+/// A reply's `statuses` name exactly the one resource its request asked
+/// about, and nothing else. Every requested `resource_id` appears in
+/// `statuses` exactly once (spec/observation.md §6), so for a single-
+/// resource request that array *is* the reply's identity.
+fn assert_reply_belongs_to(
+    statuses: &[sumer_wire::ResourceStatus],
+    resource_id: &str,
+    label: &str,
+    failures: &mut Vec<Failure>,
+) {
+    let named: Vec<&str> = statuses.iter().map(|s| s.resource_id.as_str()).collect();
+    if named != [resource_id] {
+        failures.push(Failure::new(
+            "A11",
+            format!(
+                "{label}: the reply to the request for {resource_id:?} carried statuses for \
+                 {named:?} -- a reply is correlated to its own request by id, never to whichever \
+                 request happened to be answered first"
+            ),
+        ));
+    }
+}
+
 /// Run 1, `survivable_then_kill`: the one run that exercises A4 (must-
 /// still-succeed) and A11 (tombstoned-discard survives; the final reply's
 /// bogus id kills) together, on one connection.
@@ -2077,11 +2468,12 @@ async fn check_survivable_then_kill(
     // (spec/wire.md §7), so dispatching both at once would risk res-b
     // queueing behind res-a on a conforming serial adapter. Sequential
     // dispatch is correct against any declared `max_in_flight`.
-    if let Err(e) = handle.balances_read(vec!["res-b".to_owned()]).await {
-        failures.push(Failure::new(
+    match handle.balances_read(vec!["res-b".to_owned()]).await {
+        Ok(reply) => assert_reply_belongs_to(&reply.statuses, "res-b", label, failures),
+        Err(e) => failures.push(Failure::new(
             "A4",
             format!("{label}: balances.read(res-b) unexpectedly failed: {e}"),
-        ));
+        )),
     }
     match handle.balances_read(vec!["res-a".to_owned()]).await {
         Err(HostError::Timeout) => {}
@@ -2106,17 +2498,26 @@ async fn check_survivable_then_kill(
             page: None,
         }])
     );
-    if let Err(e) = hist_a {
-        failures.push(Failure::new(
+    // Each reply must carry the content belonging to ITS request. Checking
+    // only that both succeeded asserts nothing about ordering -- swap the
+    // two payloads and a success-only check still passes, which is the one
+    // thing this leg exists to rule out. The `id` is the only correlation
+    // the envelope has (spec/wire.md §6: no `op`/`params` echo), so a host
+    // that matched replies by arrival order would hand res-a's caller
+    // res-b's page here and be caught by exactly this.
+    match hist_a {
+        Ok(reply) => assert_reply_belongs_to(&reply.statuses, "res-a", label, failures),
+        Err(e) => failures.push(Failure::new(
             "A4",
             format!("{label}: history.read(res-a) unexpectedly failed: {e}"),
-        ));
+        )),
     }
-    if let Err(e) = hist_b {
-        failures.push(Failure::new(
+    match hist_b {
+        Ok(reply) => assert_reply_belongs_to(&reply.statuses, "res-b", label, failures),
+        Err(e) => failures.push(Failure::new(
             "A4",
             format!("{label}: history.read(res-b) unexpectedly failed: {e}"),
-        ));
+        )),
     }
 
     // The final, fatal violation: the reply names an id no counter would
@@ -2157,6 +2558,142 @@ mod tests {
             1,
             "identical key sets, different content"
         );
+    }
+
+    /// A wire observation with every optional field absent, padded so its
+    /// serialized form is exactly `bytes` long.
+    fn wire_observation_of(bytes: usize) -> Value {
+        let mut observation = serde_json::json!({
+            "resource_id": "r1",
+            "local_id": "boundary",
+            "state": "active",
+            "surface": "onchain",
+            "posting": "posted",
+            "amount": {"asset": "sat", "amount": "1"},
+            "raw_sign": "provider_positive",
+            "description": "",
+            "provider_extra": {},
+            "provenance": {
+                "adapter_id": "a",
+                "provider_id": "p",
+                "surface": "onchain",
+                "observed_at": "2026-09-01T10:00:00Z",
+                "completeness": "complete"
+            }
+        });
+        let empty = serde_json::to_vec(&observation).unwrap().len();
+        observation["description"] = Value::String("x".repeat(bytes - empty));
+        assert_eq!(serde_json::to_vec(&observation).unwrap().len(), bytes);
+        observation
+    }
+
+    #[test]
+    fn an_observation_exactly_at_the_cap_is_legal() {
+        let mut failures = Vec::new();
+        assert_wire_size(
+            &wire_observation_of(MAX_OBSERVATION_BYTES),
+            "$",
+            &mut failures,
+        );
+        assert!(
+            failures.is_empty(),
+            "MAX_OBSERVATION_BYTES is a cap, not a limit one below it: {failures:?}"
+        );
+    }
+
+    #[test]
+    fn one_byte_over_the_cap_is_not() {
+        let mut failures = Vec::new();
+        assert_wire_size(
+            &wire_observation_of(MAX_OBSERVATION_BYTES + 1),
+            "$",
+            &mut failures,
+        );
+        assert_eq!(failures.len(), 1, "65537 bytes must fail A10");
+    }
+
+    /// Why A10 is measured at the wire and not on the host's decoded copy:
+    /// the same legal record, once decoded and re-serialized, is over the
+    /// cap purely from nulls `ObservationWire` never put on the wire.
+    /// Measuring that form rejected conforming adapters.
+    #[test]
+    fn the_decoded_form_is_not_the_wire_form() {
+        let raw = wire_observation_of(MAX_OBSERVATION_BYTES);
+        let wire: sumer_wire::ObservationWire = serde_json::from_value(raw).unwrap();
+        let stamped = sumer_wire::Observation::stamp(
+            wire,
+            sumer_wire::Rfc3339::new("2026-09-06T00:00:00Z".to_owned()).unwrap(),
+            sumer_wire::Staleness::Live,
+        );
+        let decoded_bytes = serde_json::to_vec(&adapter_view(&stamped)).unwrap().len();
+        assert!(
+            decoded_bytes > MAX_OBSERVATION_BYTES,
+            "expected the decoded form to be inflated past the cap, got {decoded_bytes}"
+        );
+    }
+
+    /// A9's regression: an adapter that mis-derives the `local_id` of an
+    /// observation later superseded or tombstoned still lands on an
+    /// identical final live set. Comparing the live set alone saw nothing.
+    #[test]
+    fn a9_compares_the_whole_chain_not_just_the_final_state() {
+        let first: BTreeMap<String, Value> = [(
+            "tx".to_owned(),
+            serde_json::json!([
+                {"local_id": "tx", "state": "active"},
+                {"local_id": "tx", "state": "tombstoned"},
+                {"local_id": "tx", "state": "active"},
+            ]),
+        )]
+        .into();
+        let second: BTreeMap<String, Value> = [
+            (
+                "tx".to_owned(),
+                serde_json::json!([
+                    {"local_id": "tx", "state": "active"},
+                    {"local_id": "tx", "state": "active"},
+                ]),
+            ),
+            (
+                "wrong-id".to_owned(),
+                serde_json::json!([{"local_id": "wrong-id", "state": "tombstoned"}]),
+            ),
+        ]
+        .into();
+        let mut failures = Vec::new();
+        assert_local_id_purity(&first, &second, &mut failures);
+        assert_eq!(
+            failures.len(),
+            2,
+            "expected the short chain and the stray id: {failures:?}"
+        );
+    }
+
+    /// spec/observation.md §7's two clocks and `history_start`: a fixture
+    /// spells "must not claim to know this" as `null`, and an adapter that
+    /// answers with a date instead fails. Unknown is never an epoch.
+    #[test]
+    fn a_null_in_an_expected_status_entry_means_absent_not_any_value() {
+        let expected = serde_json::json!({
+            "credential_expires_at": null,
+            "strong_auth_expires_at": "2026-12-05T00:00:00Z"
+        });
+        let honest = serde_json::json!({"strong_auth_expires_at": "2026-12-05T00:00:00Z"});
+        assert!(status_entry_diffs(&honest, &expected).is_empty());
+
+        let invented = serde_json::json!({
+            "credential_expires_at": "1970-01-01T00:00:00Z",
+            "strong_auth_expires_at": "2026-12-05T00:00:00Z"
+        });
+        assert_eq!(status_entry_diffs(&invented, &expected).len(), 1);
+
+        // The two clocks are independent: reporting one for both is the
+        // conflation §7 exists to prevent, and must not match.
+        let conflated = serde_json::json!({
+            "credential_expires_at": "2026-12-05T00:00:00Z",
+            "strong_auth_expires_at": "2026-12-05T00:00:00Z"
+        });
+        assert_eq!(status_entry_diffs(&conflated, &expected).len(), 1);
     }
 
     #[test]

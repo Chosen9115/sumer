@@ -26,10 +26,7 @@ fn must_err<T: std::fmt::Debug, E>(r: Result<T, E>) -> E {
 /// Feeds `input` through `decoder` split into consecutive chunks of size
 /// `chunk_size` (the last chunk may be shorter). Returns the frames decoded
 /// and, if the stream ended in a violation, that violation.
-fn decode_chunked(
-    input: &[u8],
-    chunk_size: usize,
-) -> (Vec<serde_json::Value>, Option<ProtocolViolationKind>) {
+fn decode_chunked(input: &[u8], chunk_size: usize) -> (Vec<String>, Option<ProtocolViolationKind>) {
     let mut decoder = FrameDecoder::new();
     let mut out = Vec::new();
     let mut violation = None;
@@ -45,7 +42,7 @@ fn decode_chunked(
 
 /// Asserts that decoding `input` in one shot, byte-by-byte, and in a
 /// handful of other chunk sizes all produce the identical outcome.
-fn assert_split_invariant(input: &[u8]) -> (Vec<serde_json::Value>, Option<ProtocolViolationKind>) {
+fn assert_split_invariant(input: &[u8]) -> (Vec<String>, Option<ProtocolViolationKind>) {
     let whole = decode_chunked(input, input.len().max(1));
     for chunk_size in [1, 2, 3, 7, 64, 4096] {
         let chunked = decode_chunked(input, chunk_size);
@@ -74,12 +71,9 @@ fn frame_split_exactly_on_the_lf_boundary() {
     let mut decoder = FrameDecoder::new();
     let mut out = Vec::new();
     must(decoder.push(&input[..8], &mut out));
-    assert_eq!(out, vec![serde_json::json!({"a": 1})]);
+    assert_eq!(out, vec![r#"{"a":1}"#.to_owned()]);
     must(decoder.push(&input[8..], &mut out));
-    assert_eq!(
-        out,
-        vec![serde_json::json!({"a": 1}), serde_json::json!({"b": 2})]
-    );
+    assert_eq!(out, vec![r#"{"a":1}"#.to_owned(), r#"{"b":2}"#.to_owned()]);
 }
 
 #[test]
@@ -90,7 +84,8 @@ fn multibyte_utf8_character_split_across_a_chunk_boundary() {
     let input = "{\"note\":\"\u{1F600}\"}\n".as_bytes().to_vec();
     let (frames, violation) = assert_split_invariant(&input);
     assert!(violation.is_none());
-    assert_eq!(frames[0]["note"], serde_json::json!("\u{1F600}"));
+    // The frame is handed on as its original bytes, emoji intact.
+    assert_eq!(frames[0], "{\"note\":\"\u{1F600}\"}");
 }
 
 #[test]
@@ -168,7 +163,7 @@ fn frames_before_violation_survive_regardless_of_chunking() {
     let input = b"{\"ok\":1}\ngarbage\n";
     for chunk_size in [1, 2, 5, input.len()] {
         let (frames, violation) = decode_chunked(input, chunk_size);
-        assert_eq!(frames, vec![serde_json::json!({"ok": 1})]);
+        assert_eq!(frames, vec![r#"{"ok":1}"#.to_owned()]);
         assert_eq!(violation, Some(ProtocolViolationKind::NotJson));
     }
 }

@@ -59,7 +59,12 @@ pub const OUTBOUND_QUEUE_CAPACITY: usize = 64;
 /// still-pending call on this connection at once.
 #[derive(Debug)]
 enum Delivery {
-    Reply(Reply<Value>, Rfc3339),
+    /// The frame's original text, plus the host's receipt stamp. Text, not
+    /// a parsed `Value`: `Value` collapses duplicate object keys, so every
+    /// typed decode downstream of one is blind to a duplicate the adapter
+    /// actually sent. The caller re-deserializes these same bytes into the
+    /// shape its op expects.
+    Reply(String, Rfc3339),
     Crashed(Option<i32>),
     Violation(ProtocolViolationKind),
 }
@@ -142,7 +147,7 @@ struct QueuedRequest {
     params: Value,
     deadline: Duration,
     enqueued_at: Instant,
-    responder: oneshot::Sender<Result<(Reply<Value>, Rfc3339), HostError>>,
+    responder: oneshot::Sender<Result<(String, Rfc3339), HostError>>,
 }
 
 impl Mux {
@@ -216,7 +221,7 @@ impl Mux {
     fn deliver(
         &self,
         id: RequestId,
-        reply: Reply<Value>,
+        frame: String,
         received_at: Rfc3339,
     ) -> Result<ReplyOutcome, MuxViolation> {
         let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
@@ -228,7 +233,7 @@ impl Mux {
                 let prev = std::mem::replace(slot, Slot::Answered);
                 drop(inner);
                 if let Slot::Pending(tx) = prev {
-                    let _ = tx.send(Delivery::Reply(reply, received_at));
+                    let _ = tx.send(Delivery::Reply(frame, received_at));
                 }
                 Ok(ReplyOutcome::Delivered)
             }
@@ -268,7 +273,7 @@ impl Mux {
         true
     }
 
-    fn terminal(&self) -> Option<Terminal> {
+    pub(crate) fn terminal(&self) -> Option<Terminal> {
         self.inner
             .lock()
             .unwrap_or_else(|e| e.into_inner())
@@ -293,12 +298,17 @@ impl Mux {
     /// Enqueues one request and awaits its outcome. Backpressure is the
     /// bounded channel itself: `send().await` blocks the caller while the
     /// queue is full, per the frozen contract.
+    ///
+    /// Returns the reply frame's original text and the host's receipt
+    /// stamp; deserializing it is the caller's job, and doing it from
+    /// these bytes (rather than from a `Value` this layer parsed) is what
+    /// keeps duplicate-key and unknown-field rejection alive end to end.
     pub async fn call(
         &self,
         op: String,
         params: Value,
         deadline: Duration,
-    ) -> Result<(Reply<Value>, Rfc3339), HostError> {
+    ) -> Result<(String, Rfc3339), HostError> {
         if let Some(t) = self.terminal() {
             return Err(t.into());
         }
@@ -325,10 +335,16 @@ impl Mux {
     fn on_frame(
         &self,
         hello_done: &mut bool,
-        value: Value,
+        frame: String,
         received_at: Rfc3339,
     ) -> Result<(), ProtocolViolationKind> {
-        let reply: Reply<Value> = match serde_json::from_value(value) {
+        // Envelope validation runs on the frame's own bytes -- id,
+        // exactly-one-of ok/err, no unknown or repeated keys -- and the
+        // same bytes are then handed to the caller for its typed decode.
+        // The payload is skipped rather than materialized here: this layer
+        // only needs the id, and the caller decodes the body into the
+        // shape its op expects anyway.
+        let reply: Reply<serde::de::IgnoredAny> = match serde_json::from_str(&frame) {
             Ok(r) => r,
             Err(_) => {
                 return Err(if *hello_done {
@@ -344,7 +360,7 @@ impl Mux {
             }
             *hello_done = true;
         }
-        match self.deliver(reply.id(), reply, received_at) {
+        match self.deliver(reply.id(), frame, received_at) {
             Ok(_) => Ok(()),
             Err(violation) => Err(violation.into()),
         }
@@ -447,7 +463,7 @@ async fn pump(
         tokio::spawn(async move {
             let outcome = tokio::time::timeout_at(send_deadline, delivery_rx).await;
             let result = match outcome {
-                Ok(Ok(Delivery::Reply(reply, received_at))) => Ok((reply, received_at)),
+                Ok(Ok(Delivery::Reply(frame, received_at))) => Ok((frame, received_at)),
                 Ok(Ok(Delivery::Crashed(status))) => Err(HostError::AdapterCrashed { status }),
                 Ok(Ok(Delivery::Violation(kind))) => Err(HostError::ProtocolViolation(kind)),
                 Ok(Err(_)) => Err(mux2.terminal_error()),

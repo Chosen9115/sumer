@@ -59,8 +59,10 @@ conforming-looking implementations can disagree about whether
 | `MAX_OBSERVATION_BYTES` | 65,536 (64 KiB) | per serialized observation inside a reply — see `spec/observation.md` §6 |
 
 A frame at or under `MAX_FRAME_BYTES` that still contains an oversized
-observation is not a wire-level violation; it is handled inside the reply body
-per `spec/observation.md`. A frame that itself exceeds `MAX_FRAME_BYTES` is a
+observation is not a wire-level violation; it is handled inside the reply
+body per `spec/observation.md` §6 — the record is omitted and reported in
+its resource's status `degraded { local_id?, bytes }` field, which sits
+beside that status's `outcome` and never replaces it. A frame that itself exceeds `MAX_FRAME_BYTES` is a
 wire-level violation regardless of what is inside it.
 
 ## 2. Fatal frames: no resync
@@ -291,7 +293,8 @@ happens, or an adapter-internal fault with no resource to attribute it to.
 Anything the adapter can pin to a specific requested resource — rate limiting,
 a stale cache, revoked credentials, a resource that no longer exists — is
 reported as one of the `status` outcomes carried inside a normal `ok` reply's
-`statuses` array (see `spec/observation.md` §7), keyed by that `resource_id`.
+`statuses` array (see `spec/observation.md` §6 and §7), keyed by that
+`resource_id`.
 
 The wire-level `err.code` vocabulary is closed and small: `unsupported_protocol`,
 `unsupported`, `invalid_request`, `not_ready`, `internal`. None of these name a

@@ -318,11 +318,31 @@ Every read reply has the shape:
 
 **Every requested `resource_id` appears in `statuses` exactly once** — never
 zero times, never more than once, regardless of whether that resource
-produced any observations. The possible outcomes:
+produced any observations. A status entry is:
+
+    { resource_id, outcome, degraded?, provider_detail?, page?,
+      credential_expires_at?, strong_auth_expires_at?, history_start? }
+
+`outcome` names exactly one of:
 
     fetched { page_empty: bool }, not_fetched, stale { as_of },
     rate_limited { retry_after_ms }, unavailable, reauth_required, revoked,
-    gone, sca_required, oversized_observation { local_id?, bytes }
+    gone, sca_required
+
+**`outcome` carries the freshness fact and nothing else.** It is what §1's
+staleness table reads, so anything that overwrites it changes how every
+observation from that resource is stamped. The oversized-observation
+degrade below is not a freshness fact — a resource can be serving cached
+data *and* have dropped one record for size — so it rides in its own
+optional field:
+
+    degraded?: { local_id?, bytes }
+
+An absent `degraded` means nothing was dropped. It is set by whichever
+side did the omitting (the adapter, or the host enforcing the cap at
+decode), and it never replaces `outcome`: a resource that answers
+`stale { as_of }` and drops an oversized record reports both, on one entry,
+and its surviving observations are still stamped `Cached`.
 
 **Oversized-observation handling** is a two-step degrade, never a hard
 failure of the page:
@@ -336,27 +356,39 @@ failure of the page:
    is the one field with no bounded shape.
 2. If the observation is **still** too large after truncating
    `provider_extra` (an oversized `description`, for instance, is not fixed
-   by step 1), the adapter **omits that observation entirely**, reports
-   `oversized_observation { local_id?, bytes }` in `statuses`, and
-   **continues the page** — it keeps emitting every other observation that
+   by step 1), the adapter **omits that observation entirely**, sets
+   `degraded { local_id?, bytes }` on that resource's status entry — leaving
+   the entry's `outcome` exactly as it would have been otherwise — and
+   **continues the page**: it keeps emitting every other observation that
    fits.
 
 **The host enforces the cap too, at decode.** Steps 1 and 2 are the
 adapter's obligations, and an adapter that skips them is non-conforming — but
 "the adapter promised" is not enforcement. A host MUST measure each decoded
 observation and, for any that still exceeds `MAX_OBSERVATION_BYTES`, perform
-step 2 itself: omit that observation, report `oversized_observation
-{ local_id?, bytes }` for its resource, and continue the page. The host does
+step 2 itself: omit that observation, set `degraded { local_id?, bytes }` on
+its resource's status entry, and continue the page. The host does
 not attempt step 1 (truncating `provider_extra` on the adapter's behalf) —
 that would hand a caller a record the adapter never emitted, silently
 altered.
 
 Because **every requested `resource_id` appears in `statuses` exactly once**,
-the host *replaces* that resource's outcome with `oversized_observation`
-rather than appending a second entry for it; the entry's `page` is kept, so
-the resource stays resumable. `bytes` is the size the host measured on its
-own serialization of the decoded observation, which differs from the
-adapter's bytes only in JSON whitespace and key order.
+the host sets `degraded` on that resource's existing entry rather than
+appending a second one; everything else on the entry — `outcome`,
+`provider_detail`, and `page`, so the resource stays resumable — is left
+untouched. `bytes` is the size the host measured on its own serialization
+of the decoded observation, which differs from the adapter's bytes only in
+JSON whitespace and key order.
+
+**Why `degraded` is a field and not an outcome.** An earlier version of this
+document spelled the degrade as an outcome, `oversized_observation`, which
+forced whoever reported it to overwrite whatever the resource had said
+about its own freshness. An adapter that degraded a record on a `stale`
+resource therefore erased the `stale { as_of }` — and §1's table then
+stamped that resource's perfectly good cached observations `Live`. The two
+facts are independent: one describes the records that arrived, the other
+describes a record that did not. Keeping them in separate fields is what
+lets a single entry state both without either overwriting the other.
 
 The reason this is a two-step degrade rather than a single reject-and-move-on:
 **a resource must never be bricked by one large event.** An adapter (or a host

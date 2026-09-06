@@ -107,7 +107,7 @@ this order, just before the reply is written:
 | Key | Effect |
 |---|---|
 | `pad: [{"path": [...], "bytes": N}]` | overwrite each `path` in the body with `N` copies of `"x"`. Lets a fixture be *genuinely* oversized — a 200 KB description, a 120 KB `provider_extra` — without carrying 200 KB of literal JSON. |
-| `degrade: true` | run `spec/observation.md` §6's two-step degrade over the padded body, measuring real serialized bytes: an observation over `MAX_OBSERVATION_BYTES` (65,536) has its `provider_extra` replaced by exactly `{"_truncated": true, "_original_bytes": N}` and its `completeness` set to `partial`; if it is *still* too large it is omitted entirely and its resource's status outcome becomes `oversized_observation {local_id, bytes}` with the measured size. Every other observation on the page is emitted regardless. |
+| `degrade: true` | run `spec/observation.md` §6's two-step degrade over the padded body, measuring real serialized bytes: an observation over `MAX_OBSERVATION_BYTES` (65,536) has its `provider_extra` replaced by exactly `{"_truncated": true, "_original_bytes": N}` and its `completeness` set to `partial`; if it is *still* too large it is omitted entirely and its resource's status entry gains `degraded {local_id, bytes}` with the measured size — **beside** its `outcome`, never replacing it (a resource can be `stale` *and* have dropped a record; overwriting the outcome erased the freshness the staleness table reads). Every other observation on the page is emitted regardless. |
 
 `pad` + `degrade` together are what make `oversized_observation.json` a real
 test rather than a declaration: the fixture states no byte counts, it states
@@ -131,7 +131,7 @@ fixture stated.**
 |---|---|
 | a run's `hello` | `{protocol:"1", adapter_id:"fake-adapter", adapter_version:"0.1.0", capabilities:[all four], local_id_derivation:"fixture-literal@1", max_in_flight:1}`. `protocol_violations.json`'s `survivable_then_kill` run still writes its own, because it needs `max_in_flight: 2`. |
 | keys of an observation's `provenance` | the run-level `"provenance"` object, for keys the observation omits. `adapter_id`/`surface`/`observed_at` are usually constant across a run; `completeness` usually is not, so it is usually written per observation. |
-| a `statuses` entry's `outcome` | `fetched {page_empty: <did this resource contribute any observation to THIS reply>}` — **computed from the reply**, not declared, so it cannot drift out of step with the observations beside it. Any other outcome (`stale`, `rate_limited`, `oversized_observation`, ...) is written out in full. |
+| a `statuses` entry's `outcome` | `fetched {page_empty: <did this resource contribute any observation to THIS reply>}` — **computed from the reply**, not declared, so it cannot drift out of step with the observations beside it. Any other outcome (`stale`, `rate_limited`, `revoked`, ...) is written out in full. `degraded` is never a default — only `degrade: true` sets it, from real measured bytes. |
 
 This removed ~600 lines of copy-paste across the twelve fixtures without
 changing a single byte of meaning on the wire: replaying every fixture
@@ -253,12 +253,12 @@ those documents rather than additions to them:
 | `large_amounts.json` | 78-digit uint256 wei, 18-decimal ETH, satoshi integers all round-trip exactly (A1) |
 | `pending_to_posted.json` | bank pending→posted forks `local_id`; both chain entries retained (A2, A8) |
 | `reorg_vanish.json` | one `local_id` goes active→**tombstoned**→active; tombstone is not terminal (A2, A8) |
-| `stale_balance.json` | `stale{as_of}` outcome + `Cached` staleness survive; a literal `received_at` on the wire is rejected without killing the connection (A3, A4, A7) |
+| `stale_balance.json` | `stale{as_of}` outcome + `Cached` staleness survive; a literal `received_at` on the wire is rejected without killing the connection; and `status.read` reports the two independent clocks with genuinely different values, one of them absent because the credential never expires until revoked (A3, A4, A7) |
 | `duplicate_events.json` | same `provider_id` on two surfaces is two different `local_id`s — dedup-by-`provider_id`-alone is forbidden (A2, A8) |
 | `interrupted_pagination.json` | both `exact` and `batch_restart` cursor families survive a mid-batch adapter kill and fresh-process resume (A2, A5) |
 | `null_category.json` | exactly one null category, exactly one asserted non-null — kills emit-null-for-everything (A3) |
 | `provider_json_number.json` | `json.loads(..., parse_float=Decimal)` + `format(d,'f')` recipe, proven against a 27-sig-digit fraction and a uint256-scale float token (A1) |
-| `oversized_observation.json` | truncation marker + `Partial`, an untouched small sibling in the same page, and a fully-omitted third observation reported via `oversized_observation{local_id,bytes}` (A10) |
+| `oversized_observation.json` | truncation marker + `Partial`, untouched small siblings either side of it in the same page, and a fully-omitted third observation reported via `degraded {local_id, bytes}` on a resource whose `outcome` stays `stale` (A10) |
 | `unsupported_op.json` | an undeclared op (`execute`) never closes the connection; ops before and after still succeed (A4) |
 | `protocol_violations.json` | `PreHelloOutput`, `UnknownId`, `DuplicateId`, `OversizeFrame`, `NotJson`, `NonUtf8` all kill; tombstoned-reply-discard and out-of-order replies do not (A4, A11) |
 | `fdx_lossless.json` | one sanitized FDX 6.4-shaped payload (account + 2 balances + 3 transactions, one deliberately using the `AUTHORIZATION` status that has no direct Sumer `posting` equivalent) maps to Sumer types with every field landing somewhere named in `expect.fdx_field_map` — nothing silently dropped (A1) |

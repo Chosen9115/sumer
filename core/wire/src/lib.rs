@@ -21,7 +21,8 @@ pub const MAX_FRAME_BYTES: usize = 1_048_576;
 
 /// Largest allowed serialized byte length of a single observation before an
 /// adapter must truncate `provider_extra` (and, if still oversized, omit
-/// the observation and report `oversized_observation` instead). Enforcing
+/// the observation and report it in the status's `degraded` field instead).
+/// Enforcing
 /// this bound is the adapter's/host's job; this crate only names the
 /// constant both sides must agree on.
 pub const MAX_OBSERVATION_BYTES: usize = 65_536;
@@ -38,9 +39,9 @@ pub use envelope::{ErrorBody, HelloParams, HelloReply, Reply, Request, RequestId
 pub use error::{ProtocolViolationKind, WireErrorCode};
 pub use observation::{
     fold_order_key, validate_plain_text, Balance, BalanceWire, CanonicalHint, Completeness,
-    CursorResumable, Observation, ObservationState, ObservationWire, PageReply, PageRequest,
-    PlainTextError, Posting, Provenance, ProvenanceWire, ProviderDetail, RawSign, ReadOutcome,
-    ResourceStatus, Rfc3339, Rfc3339Error, Staleness,
+    CursorResumable, Degraded, Observation, ObservationState, ObservationWire, PageReply,
+    PageRequest, PlainTextError, Posting, Provenance, ProvenanceWire, ProviderDetail, RawSign,
+    ReadOutcome, ResourceStatus, Rfc3339, Rfc3339Error, Staleness,
 };
 pub use ops::{
     BalancesReadParams, BalancesReadReply, HistoryReadParams, HistoryReadReply, ResourceDescriptor,

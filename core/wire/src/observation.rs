@@ -595,26 +595,15 @@ object_only!(ProviderDetail, "provider_detail: an object", serialize);
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ReadOutcome {
-    Fetched {
-        page_empty: bool,
-    },
+    Fetched { page_empty: bool },
     NotFetched,
-    Stale {
-        as_of: Rfc3339,
-    },
-    RateLimited {
-        retry_after_ms: u64,
-    },
+    Stale { as_of: Rfc3339 },
+    RateLimited { retry_after_ms: u64 },
     Unavailable,
     ReauthRequired,
     Revoked,
     Gone,
     ScaRequired,
-    OversizedObservation {
-        #[serde(skip_serializing_if = "Option::is_none")]
-        local_id: Option<String>,
-        bytes: u64,
-    },
 }
 
 /// The four outcome bodies, each object-only (see [`crate::shape`]): a
@@ -642,14 +631,25 @@ struct RateLimitedBody {
 }
 object_only!(RateLimitedBody, "a `rate_limited` body: an object");
 
-#[derive(Deserialize)]
+/// One observation this resource could not deliver because it exceeded
+/// [`crate::MAX_OBSERVATION_BYTES`] (spec/observation.md §6), reported
+/// beside the resource's outcome rather than instead of it: a resource can
+/// be stale *and* have dropped an oversized record, and the outcome is
+/// where the freshness fact lives. Set by whichever side did the omitting
+/// -- the adapter, or the host enforcing the cap at decode.
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(remote = "Self", deny_unknown_fields)]
-struct OversizedBody {
-    #[serde(default)]
-    local_id: Option<String>,
-    bytes: u64,
+pub struct Degraded {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub local_id: Option<String>,
+    pub bytes: u64,
 }
-object_only!(OversizedBody, "an `oversized_observation` body: an object");
+
+object_only!(
+    Degraded,
+    "a `degraded` entry: an object with `bytes` and an optional `local_id`",
+    serialize
+);
 
 const OUTCOME_VARIANTS: &[&str] = &[
     "fetched",
@@ -661,7 +661,6 @@ const OUTCOME_VARIANTS: &[&str] = &[
     "revoked",
     "gone",
     "sca_required",
-    "oversized_observation",
 ];
 
 /// Hand-written so an outcome names **exactly one** variant, and so each
@@ -711,13 +710,6 @@ impl<'de> Deserialize<'de> for ReadOutcome {
                     "rate_limited" => ReadOutcome::RateLimited {
                         retry_after_ms: map.next_value::<RateLimitedBody>()?.retry_after_ms,
                     },
-                    "oversized_observation" => {
-                        let body = map.next_value::<OversizedBody>()?;
-                        ReadOutcome::OversizedObservation {
-                            local_id: body.local_id,
-                            bytes: body.bytes,
-                        }
-                    }
                     other => return Err(A::Error::unknown_variant(other, OUTCOME_VARIANTS)),
                 };
                 if map.next_key::<serde::de::IgnoredAny>()?.is_some() {
@@ -734,7 +726,10 @@ impl<'de> Deserialize<'de> for ReadOutcome {
 }
 
 /// One entry of a reply's `statuses` array. Every requested `resource_id`
-/// appears exactly once across a reply's `statuses`.
+/// appears exactly once across a reply's `statuses` -- which is why an
+/// oversized-observation degrade rides in `degraded` rather than as an
+/// outcome of its own: one entry, two independent facts (how fresh this
+/// resource's data is, and whether a record was dropped for size).
 ///
 /// `credential_expires_at`/`strong_auth_expires_at`/`history_start` are
 /// populated only by `status.read` (the two clocks the contract calls out:
@@ -745,6 +740,11 @@ impl<'de> Deserialize<'de> for ReadOutcome {
 pub struct ResourceStatus {
     pub resource_id: String,
     pub outcome: ReadOutcome,
+    /// An observation this resource dropped for exceeding
+    /// [`crate::MAX_OBSERVATION_BYTES`]. Independent of `outcome`: the
+    /// degrade is not a freshness fact and must never overwrite one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub degraded: Option<Degraded>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub provider_detail: Option<ProviderDetail>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -919,7 +919,7 @@ mod tests {
                 "observed_at": "2026-09-06T12:00:00Z", "completeness": "complete"
             }
         });
-        let result: Result<ObservationWire, _> = serde_json::from_value(json);
+        let result: Result<ObservationWire, _> = serde_json::from_str(&json.to_string());
         assert!(result.is_err());
     }
 
@@ -933,7 +933,7 @@ mod tests {
             "received_at": "2026-09-06T12:00:01Z",
             "completeness": "complete"
         });
-        let result: Result<ProvenanceWire, _> = serde_json::from_value(json);
+        let result: Result<ProvenanceWire, _> = serde_json::from_str(&json.to_string());
         assert!(result.is_err(), "received_at on the wire must be rejected");
     }
 
@@ -945,7 +945,7 @@ mod tests {
             "staleness": "live",
             "completeness": "complete"
         });
-        let result: Result<ProvenanceWire, _> = serde_json::from_value(json);
+        let result: Result<ProvenanceWire, _> = serde_json::from_str(&json.to_string());
         assert!(
             result.is_err(),
             "staleness is host-computed, never adapter-supplied"
@@ -954,10 +954,13 @@ mod tests {
 
     #[test]
     fn provenance_stamp_carries_wire_fields_through() {
-        let wire: ProvenanceWire = serde_json::from_value(serde_json::json!({
-            "adapter_id": "a", "provider_id": "p", "surface": "checking",
-            "observed_at": "2026-09-06T12:00:00Z", "completeness": "complete"
-        }))
+        let wire: ProvenanceWire = serde_json::from_str(
+            &serde_json::json!({
+                "adapter_id": "a", "provider_id": "p", "surface": "checking",
+                "observed_at": "2026-09-06T12:00:00Z", "completeness": "complete"
+            })
+            .to_string(),
+        )
         .unwrap();
         let full = Provenance::stamp(wire, ts("2026-09-06T12:00:05Z"), Staleness::Live);
         assert_eq!(full.adapter_id, "a");
@@ -978,7 +981,7 @@ mod tests {
                 "observed_at": "2026-09-06T12:00:00Z", "completeness": "unknown"
             }
         });
-        let balance: BalanceWire = serde_json::from_value(json).unwrap();
+        let balance: BalanceWire = serde_json::from_str(&json.to_string()).unwrap();
         assert!(balance.amount.is_none());
     }
 
@@ -992,7 +995,7 @@ mod tests {
                 "observed_at": "2026-09-06T12:00:00Z", "completeness": "unknown"
             }
         });
-        let result: Result<BalanceWire, _> = serde_json::from_value(json);
+        let result: Result<BalanceWire, _> = serde_json::from_str(&json.to_string());
         assert!(
             result.is_err(),
             "a missing amount must not silently become None or zero"
@@ -1009,7 +1012,7 @@ mod tests {
                 "observed_at": "2026-09-06T12:00:00Z", "completeness": "unknown"
             }
         });
-        let result: Result<BalanceWire, _> = serde_json::from_value(json);
+        let result: Result<BalanceWire, _> = serde_json::from_str(&json.to_string());
         assert!(
             result.is_err(),
             "a balance batching multiple resources must be able to attribute each line"
@@ -1031,21 +1034,24 @@ mod tests {
                 "observed_at": "2026-09-06T12:00:00Z", "completeness": "complete"
             }
         });
-        let result: Result<ObservationWire, _> = serde_json::from_value(json);
+        let result: Result<ObservationWire, _> = serde_json::from_str(&json.to_string());
         assert!(result.is_err(), "history.read batches multiple resources");
     }
 
     #[test]
     fn balance_stamp_carries_resource_id_through() {
-        let wire: BalanceWire = serde_json::from_value(serde_json::json!({
-            "resource_id": "checking-1",
-            "category": "available",
-            "amount": null,
-            "provenance": {
-                "adapter_id": "a", "provider_id": "p", "surface": "checking",
-                "observed_at": "2026-09-06T12:00:00Z", "completeness": "unknown"
-            }
-        }))
+        let wire: BalanceWire = serde_json::from_str(
+            &serde_json::json!({
+                "resource_id": "checking-1",
+                "category": "available",
+                "amount": null,
+                "provenance": {
+                    "adapter_id": "a", "provider_id": "p", "surface": "checking",
+                    "observed_at": "2026-09-06T12:00:00Z", "completeness": "unknown"
+                }
+            })
+            .to_string(),
+        )
         .unwrap();
         let stamped = Balance::stamp(wire, ts("2026-09-06T12:00:05Z"), Staleness::Live);
         assert_eq!(stamped.resource_id, "checking-1");
@@ -1071,6 +1077,7 @@ mod tests {
         let status = ResourceStatus {
             resource_id: "acct1".to_owned(),
             outcome: ReadOutcome::Fetched { page_empty: false },
+            degraded: None,
             provider_detail: None,
             page: None,
             credential_expires_at: None,
@@ -1084,6 +1091,34 @@ mod tests {
             back.outcome,
             ReadOutcome::Fetched { page_empty: false }
         ));
+        assert!(back.degraded.is_none());
+        assert!(
+            !json.contains("degraded"),
+            "an absent degrade is not written at all: {json}"
+        );
+    }
+
+    #[test]
+    fn a_degraded_resource_keeps_its_own_outcome() {
+        // Both facts on one entry: the data is stale, AND one record was
+        // dropped for size. Neither overwrites the other.
+        let text = r#"{"resource_id":"acct1","outcome":{"stale":{"as_of":"2026-09-06T11:00:00Z"}},
+                       "degraded":{"local_id":"huge","bytes":260000}}"#;
+        let status: ResourceStatus = serde_json::from_str(text).unwrap();
+        assert!(matches!(status.outcome, ReadOutcome::Stale { .. }));
+        let degraded = status.degraded.unwrap();
+        assert_eq!(degraded.local_id.as_deref(), Some("huge"));
+        assert_eq!(degraded.bytes, 260_000);
+    }
+
+    #[test]
+    fn oversized_observation_is_no_longer_an_outcome() {
+        // It moved to `degraded`; an adapter still spelling it as an
+        // outcome names a variant that does not exist, rather than
+        // silently overwriting the resource's freshness.
+        let result: Result<ReadOutcome, _> =
+            serde_json::from_str(r#"{"oversized_observation":{"local_id":"huge","bytes":9}}"#);
+        assert!(result.is_err());
     }
 
     #[test]

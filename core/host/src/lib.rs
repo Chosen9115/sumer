@@ -27,9 +27,10 @@ use std::time::Duration;
 
 use mux::Mux;
 use sumer_wire::{
-    Balance, ErrorBody, HelloParams, HelloReply, Observation, ProtocolViolationKind, ReadOutcome,
-    Reply, ResourceQuery, ResourceStatus, Rfc3339, Staleness, WireErrorCode, MAX_OBSERVATION_BYTES,
-    OP_BALANCES_READ, OP_HELLO, OP_HISTORY_READ, OP_RESOURCES_LIST, OP_STATUS_READ,
+    Balance, Degraded, ErrorBody, HelloParams, HelloReply, Observation, ProtocolViolationKind,
+    ReadOutcome, Reply, ResourceQuery, ResourceStatus, Rfc3339, Staleness, WireErrorCode,
+    MAX_OBSERVATION_BYTES, OP_BALANCES_READ, OP_HELLO, OP_HISTORY_READ, OP_RESOURCES_LIST,
+    OP_STATUS_READ,
 };
 
 /// Default per-request deadline (frozen contract): 30 seconds.
@@ -159,8 +160,13 @@ impl AdapterHandle {
 
         let (kill_tx, kill_rx) = tokio::sync::mpsc::channel(1);
         let mux = Mux::spawn(spawned.stdin, kill_tx.clone());
-        tokio::spawn(mux::read_loop(mux.clone(), spawned.stdout, kill_tx.clone()));
-        tokio::spawn(process::supervise(spawned.child, kill_rx, mux.clone()));
+        let reader = tokio::spawn(mux::read_loop(mux.clone(), spawned.stdout, kill_tx.clone()));
+        tokio::spawn(process::supervise(
+            spawned.child,
+            kill_rx,
+            mux.clone(),
+            reader,
+        ));
 
         let offered = HelloParams {
             protocol: OFFERED_PROTOCOLS.iter().map(|v| (*v).to_owned()).collect(),
@@ -174,7 +180,7 @@ impl AdapterHandle {
         let hello_result = mux
             .call(OP_HELLO.to_owned(), hello_params, default_deadline)
             .await;
-        let (reply, _received_at) = match hello_result {
+        let (frame, _received_at) = match hello_result {
             Ok(pair) => pair,
             Err(e) => {
                 let _ = kill_tx.try_send(None);
@@ -182,15 +188,13 @@ impl AdapterHandle {
             }
         };
 
-        let ok_value = match reply {
-            Reply::Err { err, .. } => {
+        // Decoded from the frame's own bytes, like every other reply.
+        let hello = match serde_json::from_str::<Reply<HelloReply>>(&frame) {
+            Ok(Reply::Ok { ok, .. }) => ok,
+            Ok(Reply::Err { err, .. }) => {
                 let _ = kill_tx.try_send(None);
                 return Err(HostError::Wire(err));
             }
-            Reply::Ok { ok, .. } => ok,
-        };
-        let hello: HelloReply = match serde_json::from_value(ok_value) {
-            Ok(h) => h,
             Err(e) => {
                 let _ = kill_tx.try_send(None);
                 return Err(HostError::Wire(ErrorBody::new(
@@ -333,11 +337,16 @@ impl AdapterHandle {
         op: &str,
         params: serde_json::Value,
     ) -> Result<Reply<serde_json::Value>, HostError> {
-        let (reply, _received_at) = self
+        let (frame, _received_at) = self
             .mux
             .call(op.to_owned(), params, self.default_deadline)
             .await?;
-        Ok(reply)
+        serde_json::from_str(&frame).map_err(|e| {
+            HostError::Wire(ErrorBody::new(
+                WireErrorCode::InvalidRequest,
+                format!("malformed {op} reply: {e}"),
+            ))
+        })
     }
 
     /// Sends one call and decodes its `ok` payload as `R`, discarding the
@@ -380,21 +389,22 @@ impl AdapterHandle {
                 format!("could not serialize {op} params: {e}"),
             ))
         })?;
-        let (reply, received_at) = self
+        let (frame, received_at) = self
             .mux
             .call(op.to_owned(), params_value, self.default_deadline)
             .await?;
+        // Straight from the frame's bytes to `R`: no `serde_json::Value`
+        // in between, which would collapse a duplicate key inside `ok`
+        // before `R`'s own deserializer ever saw it.
+        let reply = serde_json::from_str::<Reply<R>>(&frame).map_err(|e| {
+            HostError::Wire(ErrorBody::new(
+                WireErrorCode::InvalidRequest,
+                format!("malformed {op} reply: {e}"),
+            ))
+        })?;
         match reply {
             Reply::Err { err, .. } => Err(HostError::Wire(err)),
-            Reply::Ok { ok, .. } => {
-                let parsed = serde_json::from_value(ok).map_err(|e| {
-                    HostError::Wire(ErrorBody::new(
-                        WireErrorCode::InvalidRequest,
-                        format!("malformed {op} reply: {e}"),
-                    ))
-                })?;
-                Ok((parsed, received_at))
-            }
+            Reply::Ok { ok, .. } => Ok((ok, received_at)),
         }
     }
 }
@@ -432,8 +442,7 @@ fn staleness_by_resource(statuses: &[ResourceStatus]) -> HashMap<String, Stalene
                 | ReadOutcome::RateLimited { .. }
                 | ReadOutcome::ReauthRequired
                 | ReadOutcome::Revoked
-                | ReadOutcome::ScaRequired
-                | ReadOutcome::OversizedObservation { .. } => Staleness::Live,
+                | ReadOutcome::ScaRequired => Staleness::Live,
             };
             (status.resource_id.clone(), staleness)
         })
@@ -457,8 +466,8 @@ fn staleness_for(by_resource: &HashMap<String, Staleness>, resource_id: &str) ->
 // ---------------------------------------------------------------------
 
 /// Drops any observation whose serialized size exceeds
-/// [`MAX_OBSERVATION_BYTES`] and reports `oversized_observation` for its
-/// resource, continuing the page with everything that fits.
+/// [`MAX_OBSERVATION_BYTES`] and reports it in its resource's `degraded`
+/// field, continuing the page with everything that fits.
 ///
 /// The adapter is supposed to have done this itself (truncate
 /// `provider_extra`, then omit the record and report it). The host repeats
@@ -490,18 +499,20 @@ fn drop_oversized<T: serde::Serialize>(
         .collect()
 }
 
-/// Records an `oversized_observation` outcome for one resource. It replaces
-/// that resource's existing outcome rather than adding a second entry:
-/// **every requested `resource_id` appears in `statuses` exactly once**
-/// (spec/observation.md §6), and the page's paging state (`page`) is kept
-/// so the read stays resumable.
+/// Records the dropped record on one resource's status. It sets that
+/// entry's `degraded` field rather than adding a second entry -- **every
+/// requested `resource_id` appears in `statuses` exactly once**
+/// (spec/observation.md §6) -- and rather than replacing its `outcome`,
+/// which carries a different fact: how fresh what this resource *did*
+/// deliver is. Overwriting `stale { as_of }` here would mis-stamp a
+/// perfectly good cached sibling as `Live`.
 fn report_oversized(
     statuses: &mut Vec<ResourceStatus>,
     resource_id: String,
     local_id: Option<String>,
     bytes: usize,
 ) {
-    let outcome = ReadOutcome::OversizedObservation {
+    let degraded = Degraded {
         local_id,
         bytes: u64::try_from(bytes).unwrap_or(u64::MAX),
     };
@@ -509,10 +520,16 @@ fn report_oversized(
         .iter_mut()
         .find(|status| status.resource_id == resource_id)
     {
-        Some(existing) => existing.outcome = outcome,
+        Some(existing) => existing.degraded = Some(degraded),
+        // A resource that produced an observation but no status entry is
+        // already a malformed reply (the conformance suite's assertion to
+        // make). The host still records what it dropped rather than
+        // omitting a record silently, and `fetched` is the only outcome
+        // consistent with having received observations from it.
         None => statuses.push(ResourceStatus {
             resource_id,
-            outcome,
+            outcome: ReadOutcome::Fetched { page_empty: false },
+            degraded: Some(degraded),
             provider_detail: None,
             page: None,
             credential_expires_at: None,

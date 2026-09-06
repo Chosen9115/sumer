@@ -101,25 +101,57 @@ the wire's 30-second default, so a scenario that deliberately forces a
 host-side timeout doesn't cost 30 real seconds per run. A runner that
 ignores it entirely is still conformant.
 
-## A9's requirement: two process invocations, and an association, not a set
+## The wire pass: what the adapter sent, not what survived the host
 
-Whenever a case's fold produces any `local_id`s, this runner spawns your
-adapter a **second, independent** time for that same fixture and compares
-what the two runs produced. A `local_id` derived from anything
-process-local -- a freshly generated UUID, an in-memory counter that
-doesn't survive a restart -- fails here even though a single run would have
-looked perfectly fine.
+Most of this suite reads through `sumer_host::AdapterHandle`'s typed calls,
+which is the point -- your adapter is exercised by a real host. But a host
+is also a *remediator*: it omits every observation over
+`MAX_OBSERVATION_BYTES` at decode (spec/observation.md §6), and it stamps
+fields onto what it keeps. Both of those hide adapter behaviour that two
+assertions exist to judge.
 
-What is compared is the **association**, not the set: each `local_id`
-against the provider record it identifies (amount, posting, state, surface,
-`provider_id`, `provider_extra`), with the two host-stamped fields
-(`received_at` and the `staleness` derived from it) excluded because they
-legitimately differ per receipt. Comparing the bare set of ids is not
-enough, and this suite used to make that mistake: an adapter that hands out
-the same ids on the second launch attached to *different records* -- swap
-two observations' ids and the set is identical while every id now names the
-wrong thing -- has a derivation that is not a function of the record at
-all, which is precisely what A9 exists to reject.
+So after the typed crawl, the runner makes one or more **wire passes**:
+fresh adapter processes, driven through `AdapterHandle::call_raw`, which
+returns the reply envelope verbatim. Same spawn, same frame decoder, same
+id lifecycle -- there is still exactly one client in this crate -- but what
+comes back is what your adapter actually emitted.
+
+* **A10** is measured there and only there. An over-cap observation is
+  omitted by the host *before* any decoded reply exists, so a suite that
+  measured decoded observations could never see the violation: it would
+  certify an adapter that skipped the degrade entirely. Measuring the
+  decoded form is also wrong in the other direction -- `Observation`
+  serializes absent optionals as explicit nulls that `ObservationWire`
+  omits, which charges an adapter for bytes it never sent and rejects a
+  legal record sitting exactly at the cap.
+* **A9** compares two wire passes against each other.
+
+One thing the wire pass cannot see: a duplicate JSON key inside a reply
+body. `call_raw` hands back the body as a parsed value, and a value
+collapses duplicates. That is not a hole -- the typed crawl reads the same
+frames' original *text*, where a duplicate key is rejected outright.
+
+## A9's requirement: two process invocations, and the whole history
+
+For every case that reads history, this runner spawns your adapter
+**twice more**, independently, and compares what the two runs emitted. A
+`local_id` derived from anything process-local -- a freshly generated
+UUID, an in-memory counter that doesn't survive a restart -- fails here
+even though a single run would have looked perfectly fine.
+
+What is compared is the **association**, over the **whole observation
+history**: each `local_id` against every raw record that carried it, in
+arrival order. Two weaker comparisons this deliberately is not, both of
+which this suite has made:
+
+- The bare **set of ids** is satisfied by an adapter that hands out the
+  same ids on the second launch attached to *different records*: swap two
+  observations' ids and the set is identical while every id now names the
+  wrong thing.
+- The final **live set** ignores every record that was later superseded or
+  tombstoned. Mis-derive the `local_id` of the tombstone in a reorg chain,
+  or of the pending row a posted one supersedes, and the live set is still
+  identical. Purity is a claim about every record the derivation touches.
 
 ## Assertions implemented (A1-A11)
 
@@ -128,16 +160,16 @@ its stated mitigation, not just its happy-path check:
 
 | # | What it proves | The degenerate implementation it kills |
 |---|---|---|
-| A1 | Exact-value fidelity (`Amount::cmp_same_asset`, plus digit-count/scale evidence where a fixture asks for it) | An adapter (or host) that silently round-trips an amount through a float |
+| A1 | Exact-value fidelity (`Amount::cmp_same_asset`, plus digit-count/scale evidence where a fixture asks for it), and the balances list is compared by count as well as by content | An adapter (or host) that silently round-trips an amount through a float, *and* one that appends a balance line — any category, any amount — the provider never reported (nothing else in the model can contradict an invented category, so only the count catches it) |
 | A2 | Live-set equality after folding | Ignoring `state`/`supersedes` entirely |
 | A3 | `null` (unknown) is never zero | Emitting `null` for every category, or `0` for every unknown one |
 | A4 | Error class is never plain text; ops around a failure still succeed | Returning the same error for everything, or killing the connection on any hiccup |
 | A5 | Exactly-resumable cursor, bracketed both ways, over the resumed live set's full **financial content** | Re-emitting everything (passes only because dedup absorbs it), emitting nothing (fails the live-set half), *and* re-emitting the right `local_id`s carrying different amounts (which a key-set comparison could not see) |
 | A6 | The live set floor: non-empty when expected | "Report success" with nothing behind it |
-| A7 | Every requested `resource_id` in `statuses`, exactly once | One blanket status for a whole batch |
+| A7 | Every requested `resource_id` in `statuses`, exactly once; and `status.read`'s own fields — the two independent clocks and `history_start` — compared against values a fixture makes deliberately *differ* | One blanket status for a whole batch, *and* an implementation that reports one clock for both `credential_expires_at` and `strong_auth_expires_at` (which passes whenever a fixture lets the two values coincide), *and* one that renders an unknown clock or `history_start` as a date instead of omitting it (`expect` spells "must not claim to know this" as `null`) |
 | A8 | Full chain retention, in fold order | Keeping only the final state |
-| A9 | `local_id` purity across two independent process launches, compared as record-to-id associations | A freshly generated UUID per run, *and* a derivation that reuses the same ids for different records on the second run |
-| A10 | The oversized-observation two-step degrade, four ways at once, driven by genuinely oversized input | Truncating (or dropping) the whole page over one bad record, *and* leaving leaked payload beside the truncation marker (`provider_extra` is compared exactly, and every observation received is measured against `MAX_OBSERVATION_BYTES`) |
+| A9 | `local_id` purity across two independent process launches, compared as record-to-id associations over the full observation history | A freshly generated UUID per run, a derivation that reuses the same ids for different records on the second run, *and* one that mis-identifies only a record that is later superseded or tombstoned (identical live set, different history) |
+| A10 | The oversized-observation two-step degrade, five ways at once, driven by genuinely oversized input, measured **at the wire** | Truncating (or dropping) the whole page over one bad record, leaving leaked payload beside the truncation marker (`provider_extra` is compared exactly), reporting the degrade *as* the resource's outcome so its freshness is erased, *and* skipping the degrade entirely and letting the host omit the record for you (every observation is measured as the adapter emitted it, before host remediation) |
 | A11 | Fatal violations kill; a tombstoned reply is discarded and the connection survives | A host that kills the connection on *any* anomaly |
 
 ## Honest limits of black-box testing

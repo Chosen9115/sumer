@@ -37,13 +37,17 @@ const BALANCES_READ_FRAME: &str = r#"{"id":2,"ok":{"observations":[{"resource_id
 
 const STATUS_READ_FRAME: &str = r#"{"id":3,"ok":{"statuses":[{"resource_id":"wallet-eth","outcome":{"fetched":{"page_empty":false}}},{"resource_id":"wallet-btc","outcome":{"fetched":{"page_empty":false}}}]}}"#;
 
-// Captured from SUMER_FIXTURE=conformance/cases/oversized_observation.json,
-// a history.read reply -- exercises the A10 degrade path (truncated sibling
-// present, oversized sibling omitted with `oversized_observation` in
-// `statuses`) and the per-resource `page` nested inside `statuses[i]`
+// Captured VERBATIM from a run of `adapters/fake/fake_adapter.py` with
+// SUMER_FIXTURE=conformance/cases/oversized_observation.json -- a
+// history.read reply. Its whole value is that these are real adapter bytes,
+// so it is re-captured rather than hand-edited whenever the shape changes.
+// It exercises the A10 degrade path (truncated sibling present, oversized
+// sibling omitted and reported in that resource's `degraded` field, beside
+// -- never instead of -- the `stale` outcome the resource actually has) and
+// the per-resource `page` nested inside `statuses[i]`
 // (Ruling A3/A4: history.read is batched, so paging state lives per
 // resource, never as a reply-wide sibling of `observations`/`statuses`).
-const HISTORY_READ_OVERSIZED_FRAME: &str = r#"{"id":1,"ok":{"observations":[{"resource_id":"wallet-oversized","local_id":"wallet-oversized:sibling-small","provider_id":"sibling-small","state":"active","surface":"onchain","posting":"posted","amount":{"asset":"sat","amount":"500"},"raw_sign":"provider_positive","description":"SMALL SIBLING EVENT, UNTRUNCATED (fixture placeholder)","provider_extra":{"memo":"small and ordinary"},"provenance":{"adapter_id":"fake-adapter","provider_id":"sibling-small","surface":"onchain","observed_at":"2026-09-01T10:00:00Z","completeness":"complete"}},{"resource_id":"wallet-oversized","local_id":"wallet-oversized:big-truncatable","provider_id":"big-truncatable","state":"active","surface":"onchain","posting":"posted","amount":{"asset":"sat","amount":"700000"},"raw_sign":"provider_positive","description":"EVENT WHOSE provider_extra WAS TOO LARGE AND HAS BEEN TRUNCATED (fixture placeholder)","provider_extra":{"_truncated":true,"_original_bytes":120000},"provenance":{"adapter_id":"fake-adapter","provider_id":"big-truncatable","surface":"onchain","observed_at":"2026-09-01T10:05:00Z","completeness":"partial"}}],"statuses":[{"resource_id":"wallet-oversized","outcome":{"oversized_observation":{"local_id":"wallet-oversized:big-untruncatable","bytes":260000}},"page":{"cursor_resumable":"exact","next":null}}]}}"#;
+const HISTORY_READ_OVERSIZED_FRAME: &str = r#"{"id":1,"ok":{"observations":[{"resource_id":"wallet-oversized","local_id":"wallet-oversized:sibling-small","provider_id":"sibling-small","state":"active","surface":"onchain","posting":"posted","amount":{"asset":"sat","amount":"500"},"raw_sign":"provider_positive","description":"SMALL SIBLING EVENT, UNTRUNCATED (fixture placeholder)","provider_extra":{"memo":"small and ordinary"},"provenance":{"adapter_id":"fake-adapter","surface":"onchain","completeness":"complete","provider_id":"sibling-small","observed_at":"2026-09-01T10:00:00Z"}},{"resource_id":"wallet-oversized","local_id":"wallet-oversized:big-truncatable","provider_id":"big-truncatable","state":"active","surface":"onchain","posting":"posted","amount":{"asset":"sat","amount":"700000"},"raw_sign":"provider_positive","description":"EVENT WITH A HUGE provider_extra, TRUNCATED BY THE ADAPTER'S OWN TWO-STEP DEGRADE (fixture placeholder)","provider_extra":{"_truncated":true,"_original_bytes":120028},"provenance":{"adapter_id":"fake-adapter","surface":"onchain","completeness":"partial","provider_id":"big-truncatable","observed_at":"2026-09-01T10:05:00Z"}},{"resource_id":"wallet-oversized","local_id":"wallet-oversized:sibling-after","provider_id":"sibling-after","state":"active","surface":"onchain","posting":"posted","amount":{"asset":"sat","amount":"700"},"raw_sign":"provider_positive","description":"SMALL SIBLING EVENT EMITTED AFTER THE OMITTED ONE (fixture placeholder)","provider_extra":{"memo":"still ordinary"},"provenance":{"adapter_id":"fake-adapter","surface":"onchain","completeness":"complete","provider_id":"sibling-after","observed_at":"2026-09-01T10:15:00Z"}}],"statuses":[{"resource_id":"wallet-oversized","outcome":{"stale":{"as_of":"2026-09-01T09:00:00Z"}},"page":{"cursor_resumable":"exact","next":null},"degraded":{"local_id":"wallet-oversized:big-untruncatable","bytes":200480}}]}}"#;
 
 #[test]
 fn hello_frame_from_real_adapter_deserializes() {
@@ -131,24 +135,29 @@ fn history_read_oversized_frame_from_real_adapter_deserializes() {
     match reply {
         Reply::Ok { ok, .. } => {
             // A10: truncated sibling present with completeness partial and
-            // the truncation marker, small sibling untouched, oversized
-            // third observation omitted entirely (only two observations,
-            // not three) but still reported in statuses.
-            assert_eq!(ok.observations.len(), 2);
+            // the truncation marker, the two small siblings untouched, the
+            // oversized fourth observation omitted entirely (three
+            // observations, not four) but still reported in statuses.
+            assert_eq!(ok.observations.len(), 3);
             assert_eq!(ok.observations[0].resource_id, "wallet-oversized");
             assert_eq!(ok.statuses.len(), 1);
             let status = &ok.statuses[0];
             assert_eq!(status.resource_id, "wallet-oversized");
-            match &status.outcome {
-                ReadOutcome::OversizedObservation { local_id, bytes } => {
-                    assert_eq!(
-                        local_id.as_deref(),
-                        Some("wallet-oversized:big-untruncatable")
-                    );
-                    assert_eq!(*bytes, 260_000);
-                }
-                other => panic!("expected OversizedObservation, got {other:?}"),
-            }
+            // The captured resource is deliberately STALE: this is the
+            // case the old `oversized_observation` outcome destroyed, since
+            // reporting the degrade AS the outcome erased the freshness the
+            // staleness table reads.
+            assert!(
+                matches!(status.outcome, ReadOutcome::Stale { .. }),
+                "the degrade rides beside the outcome, never over it: {:?}",
+                status.outcome
+            );
+            let degraded = must_some(status.degraded.as_ref());
+            assert_eq!(
+                degraded.local_id.as_deref(),
+                Some("wallet-oversized:big-untruncatable")
+            );
+            assert_eq!(degraded.bytes, 200_480);
             // The per-resource page lives nested inside this status entry,
             // never as a reply-wide sibling (Ruling A3/A4).
             let page = must_some(status.page.as_ref());

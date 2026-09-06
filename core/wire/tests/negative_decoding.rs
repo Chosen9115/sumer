@@ -11,33 +11,54 @@
 //!     applied to the rest.
 
 use sumer_wire::{
-    BalanceWire, BalancesReadParams, BalancesReadReply, ErrorBody, HelloParams, HelloReply,
-    HistoryReadParams, HistoryReadReply, ObservationWire, PageReply, PageRequest, ProvenanceWire,
-    ProviderDetail, ReadOutcome, Reply, Request, ResourceDescriptor, ResourceQuery, ResourceStatus,
-    ResourcesListParams, ResourcesListReply, StatusReadParams, StatusReadReply,
+    BalanceWire, BalancesReadParams, BalancesReadReply, Degraded, ErrorBody, FrameDecoder,
+    HelloParams, HelloReply, HistoryReadParams, HistoryReadReply, ObservationWire, PageReply,
+    PageRequest, ProvenanceWire, ProviderDetail, ReadOutcome, Reply, Request, ResourceDescriptor,
+    ResourceQuery, ResourceStatus, ResourcesListParams, ResourcesListReply, StatusReadParams,
+    StatusReadReply,
 };
 
-/// Asserts `json` does not deserialize as `T`.
+/// Feeds `text` through the real framer -- the only path bytes from an
+/// adapter ever take into a wire type -- and returns the frame it yields.
+/// Deserializing anything in this file from anything else would be testing
+/// a path production does not use: `serde_json::Value` in particular
+/// collapses duplicate keys, so a check run against one cannot see them.
+fn framed(text: &str) -> String {
+    let mut decoder = FrameDecoder::new();
+    let mut frames = Vec::new();
+    let mut line = text.to_owned();
+    line.push('\n');
+    match decoder.push(line.as_bytes(), &mut frames) {
+        Ok(()) => {}
+        Err(kind) => panic!("the framer rejected {text} outright: {kind:?}"),
+    }
+    match frames.len() {
+        1 => frames.remove(0),
+        n => panic!("expected exactly one frame from {text}, got {n}"),
+    }
+}
+
+/// Asserts `json` does not deserialize as `T`, through the framer.
 macro_rules! rejects {
     ($ty:ty, $json:expr, $why:expr) => {{
         let value: serde_json::Value = $json;
-        let result: Result<$ty, _> = serde_json::from_value(value.clone());
+        let text = serde_json::to_string(&value).expect("serialize");
+        rejects_frame!($ty, &text, $why);
+    }};
+}
+
+/// As [`rejects`], for a frame that cannot be written as a
+/// `serde_json::Value` in the first place -- a duplicate key, say.
+macro_rules! rejects_frame {
+    ($ty:ty, $text:expr, $why:expr) => {{
+        let text: &str = $text;
+        let frame = framed(text);
+        let result: Result<$ty, _> = serde_json::from_str(&frame);
         assert!(
             result.is_err(),
-            "{}: {} deserialized as {} but must be rejected",
+            "{}: {} deserialized as {} off the framer but must be rejected",
             $why,
-            value,
-            stringify!($ty)
-        );
-        // The same bytes through the string decoder, which is the path a
-        // real frame actually takes.
-        let text = serde_json::to_string(&value).expect("re-serialize");
-        let result: Result<$ty, _> = serde_json::from_str(&text);
-        assert!(
-            result.is_err(),
-            "{}: {} deserialized as {} from a frame string but must be rejected",
-            $why,
-            text,
+            frame,
             stringify!($ty)
         );
     }};
@@ -46,10 +67,12 @@ macro_rules! rejects {
 macro_rules! accepts {
     ($ty:ty, $json:expr) => {{
         let value: serde_json::Value = $json;
-        let result: Result<$ty, _> = serde_json::from_value(value.clone());
+        let text = serde_json::to_string(&value).expect("serialize");
+        let frame = framed(&text);
+        let result: Result<$ty, _> = serde_json::from_str(&frame);
         match result {
             Ok(v) => v,
-            Err(e) => panic!("{value} should deserialize as {}: {e}", stringify!($ty)),
+            Err(e) => panic!("{frame} should deserialize as {}: {e}", stringify!($ty)),
         }
     }};
 }
@@ -100,10 +123,36 @@ fn reply_without_id_is_malformed() {
 }
 
 #[test]
-fn reply_with_a_duplicate_ok_is_malformed() {
-    let result: Result<Reply<serde_json::Value>, _> =
-        serde_json::from_str(r#"{"id":1,"ok":{"a":1},"ok":{"b":2}}"#);
-    assert!(result.is_err(), "a repeated ok field is malformed");
+fn duplicate_keys_are_malformed_off_the_framer() {
+    // The trap this closes: `serde_json::Value` keeps the LAST of two
+    // duplicate keys and drops the first, so a host that parsed a frame
+    // into a `Value` before decoding it typed would accept every one of
+    // these. They are checked here on the bytes the framer hands on.
+    rejects_frame!(
+        Reply<serde_json::Value>,
+        r#"{"id":1,"ok":{"a":1},"ok":{"b":2}}"#,
+        "a repeated `ok` is malformed"
+    );
+    rejects_frame!(
+        Reply<serde_json::Value>,
+        r#"{"id":1,"id":2,"ok":{}}"#,
+        "a repeated `id` is malformed"
+    );
+    rejects_frame!(
+        Request,
+        r#"{"id":1,"op":"hello","op":"balances.read","params":{}}"#,
+        "a repeated `op` is malformed"
+    );
+    rejects_frame!(
+        HelloReply,
+        r#"{"protocol":"1","protocol":"999","adapter_id":"a","adapter_version":"0.1","capabilities":[],"local_id_derivation":"d@1"}"#,
+        "a repeated `protocol` is malformed"
+    );
+    rejects_frame!(
+        ResourceStatus,
+        r#"{"resource_id":"c1","outcome":"unavailable","outcome":{"fetched":{"page_empty":false}}}"#,
+        "a repeated `outcome` is malformed"
+    );
 }
 
 #[test]
@@ -202,9 +251,14 @@ fn positional_arrays_are_not_wire_objects() {
         "an outcome body is an object"
     );
     rejects!(
+        Degraded,
+        serde_json::json!(["abc", 70000]),
+        "a degrade entry is an object"
+    );
+    rejects!(
         ReadOutcome,
-        serde_json::json!({"oversized_observation": ["abc", 70000]}),
-        "an outcome body is an object"
+        serde_json::json!({"oversized_observation": {"local_id": "abc", "bytes": 70000}}),
+        "oversized degradation is `degraded`, not an outcome"
     );
     rejects!(
         ReadOutcome,

@@ -25,6 +25,12 @@ use crate::mux::{Mux, Terminal};
 /// interpreter or script may expect.
 const ENV_ALLOWLIST: &[&str] = &["PATH", "HOME", "LANG", "LC_ALL", "TMPDIR"];
 
+/// How long a natural exit waits for the reader loop to drain the child's
+/// last bytes before concluding nothing explains the exit. Normally
+/// instant: the exit closed stdout, so the reader is one EOF from
+/// returning.
+const READER_DRAIN: std::time::Duration = std::time::Duration::from_secs(1);
+
 /// A freshly spawned adapter process with its stdio handles already split
 /// out. `stdin`/`stdout` are owned by the caller (the mux's writer and
 /// reader loops); `child` remains for waiting on exit.
@@ -111,9 +117,16 @@ async fn drain_stderr(mut stderr: tokio::process::ChildStderr) {
 /// protocol violation; or [`crate::AdapterHandle`]'s `Drop`, for an ordinary
 /// shutdown), so nothing else ever needs `&mut Child` concurrently.
 ///
-/// - Natural exit -> [`Terminal::Crashed`]. There is no auto-restart (frozen
-///   contract, section (f)): a crashed adapter stays crashed for the life
-///   of the handle.
+/// - Natural exit -> [`Terminal::Crashed`], but only after the reader loop
+///   has finished. The child's exit closed its stdout, so `reader` is
+///   about to return, and whatever it read out of the last bytes -- a
+///   malformed frame, a duplicate id -- is published before it does.
+///   Latching `Crashed` without waiting for that would hand the caller
+///   "gone, and nothing established why" while the host in fact killed the
+///   adapter for a violation it can name, and `Mux::finish` keeps the
+///   first reason, so the truer one would arrive too late to matter.
+///   There is no auto-restart (frozen contract, section (f)): a crashed
+///   adapter stays crashed for the life of the handle.
 /// - `Some(Some(kind))` on `kill_tx` -> the child is killed and the mux is
 ///   finished with [`Terminal::Violation`].
 /// - Channel closed, or `Some(None)` -> a deliberate, non-violation
@@ -127,11 +140,20 @@ pub async fn supervise(
     mut child: Child,
     mut kill_rx: tokio::sync::mpsc::Receiver<Option<sumer_wire::ProtocolViolationKind>>,
     mux: Arc<Mux>,
+    reader: tokio::task::JoinHandle<()>,
 ) {
     tokio::select! {
         status = child.wait() => {
             let code = status.ok().and_then(|s| s.code());
-            mux.finish(Terminal::Crashed(code));
+            // ponytail: bounded rather than an unconditional await --
+            // stdout EOF is guaranteed by the exit only if nothing the
+            // child forked still holds the write end. If one does, the
+            // crash is reported a second late instead of never.
+            let _ = tokio::time::timeout(READER_DRAIN, reader).await;
+            match kill_rx.try_recv() {
+                Ok(Some(kind)) => mux.finish(Terminal::Violation(kind)),
+                _ => mux.finish(Terminal::Crashed(code)),
+            };
         }
         msg = kill_rx.recv() => {
             let _ = child.start_kill();
@@ -147,6 +169,34 @@ pub async fn supervise(
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn an_established_violation_outranks_a_process_that_already_exited() {
+        // The deterministic form of the race: the child is already gone
+        // (so `child.wait()` is the only ready branch when `supervise`
+        // starts), and the reader loop publishes the violation it read out
+        // of the child's last bytes a moment later. An adapter that emits
+        // a malformed frame and exits in the same breath produces exactly
+        // this schedule; `AdapterCrashed` would then latch first and the
+        // truer reason -- the host killed it for a violation it can name
+        // -- would be rejected as a late second opinion.
+        let spawned = spawn(&["true".to_owned()], std::iter::empty()).unwrap();
+        let (kill_tx, kill_rx) = tokio::sync::mpsc::channel(1);
+        let mux = Mux::spawn(spawned.stdin, kill_tx.clone());
+        let reader = tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            let _ = kill_tx
+                .send(Some(sumer_wire::ProtocolViolationKind::NotJson))
+                .await;
+        });
+
+        supervise(spawned.child, kill_rx, mux.clone(), reader).await;
+
+        match mux.terminal() {
+            Some(Terminal::Violation(sumer_wire::ProtocolViolationKind::NotJson)) => {}
+            other => panic!("expected the violation to win, got {other:?}"),
+        }
+    }
 
     #[tokio::test]
     async fn spawn_rejects_empty_argv() {

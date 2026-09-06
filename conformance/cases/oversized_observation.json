@@ -188,6 +188,11 @@
                     "statuses": [
                       {
                         "resource_id": "wallet-oversized",
+                        "outcome": {
+                          "stale": {
+                            "as_of": "2026-09-01T09:00:00Z"
+                          }
+                        },
                         "page": {
                           "cursor_resumable": "exact",
                           "next": null
@@ -252,6 +257,7 @@
             "memo": "small and ordinary"
           },
           "provenance": {
+            "staleness": "cached",
             "completeness": "complete"
           }
         },
@@ -268,6 +274,7 @@
             "_original_bytes": 120028
           },
           "provenance": {
+            "staleness": "cached",
             "completeness": "partial"
           }
         },
@@ -283,6 +290,7 @@
             "memo": "still ordinary"
           },
           "provenance": {
+            "staleness": "cached",
             "completeness": "complete"
           }
         }
@@ -291,19 +299,26 @@
     "omitted_observations": {
       "wallet-oversized": [
         {
-          "local_id": "wallet-oversized:big-untruncatable",
-          "reported_bytes": 200480
+          "local_id": "wallet-oversized:big-untruncatable"
         }
       ]
     },
     "statuses": {
       "wallet-oversized": {
-        "oversized_observation": {
+        "outcome": {
+          "stale": {
+            "as_of": "2026-09-01T09:00:00Z"
+          }
+        },
+        "degraded": {
           "local_id": "wallet-oversized:big-untruncatable",
           "bytes": 200480
+        },
+        "page": {
+          "cursor_resumable": "exact"
         }
       }
     },
-    "notes": "NOTHING HERE IS DECLARED; every size is real. The script pads two fields just before the reply is written -- provider_extra.bulk_provider_payload to 120,000 bytes on big-truncatable, and description to 200,000 bytes on big-untruncatable -- and the adapter then runs spec/observation.md section 6's two-step degrade over the actual serialized bytes. The numbers in this expect block are the values that degrade PRODUCES, not values the fixture asserts into existence: _original_bytes 120028 is the serialized size of the provider_extra that was thrown away ({\"bulk_provider_payload\":\"<120000 bytes>\"}), and bytes 200480 is the measured size of big-untruncatable AFTER step 1 truncated its provider_extra and step 1 still could not save it. Four things must hold at once or A10 is vacuous: (1) big-truncatable is PRESENT with provider_extra collapsed to EXACTLY {_truncated:true,_original_bytes:120028} -- compared exactly, not as a subset, because an adapter that leaves a leaked 70 KB field sitting beside the truncation marker satisfies a subset check while shipping an observation still far over MAX_OBSERVATION_BYTES; (2) its provenance.completeness is partial; (3) sibling-small BEFORE it and sibling-after AFTER it are ordinary untruncated observations in the SAME page -- an adapter that gives up on a page once it meets one oversized entry fails here even though the truncated entry itself looks right; (4) big-untruncatable never appears in observations at all, yet its outcome is reported through the resource's single statuses entry with its REAL byte count, and the resource stays readable. The runner independently measures every observation it receives in every case against MAX_OBSERVATION_BYTES, so an oversized observation cannot slip through any fixture by being unasserted."
+    "notes": "NOTHING HERE IS DECLARED; every size is real. The script pads two fields just before the reply is written -- provider_extra.bulk_provider_payload to 120,000 bytes on big-truncatable, and description to 200,000 bytes on big-untruncatable -- and the adapter then runs spec/observation.md section 6's two-step degrade over the actual serialized bytes. The numbers in this expect block are the values that degrade PRODUCES, not values the fixture asserts into existence: _original_bytes 120028 is the serialized size of the provider_extra that was thrown away ({\"bulk_provider_payload\":\"<120000 bytes>\"}), and degraded.bytes 200480 is the measured size of big-untruncatable AFTER step 1 truncated its provider_extra and step 1 still could not save it. Five things must hold at once or A10 is vacuous: (1) big-truncatable is PRESENT with provider_extra collapsed to EXACTLY {_truncated:true,_original_bytes:120028} -- compared exactly, not as a subset, because an adapter that leaves a leaked 70 KB field sitting beside the truncation marker satisfies a subset check while shipping an observation still far over MAX_OBSERVATION_BYTES; (2) its provenance.completeness is partial; (3) sibling-small BEFORE it and sibling-after AFTER it are ordinary untruncated observations in the SAME page -- an adapter that gives up on a page once it meets one oversized entry fails here even though the truncated entry itself looks right; (4) big-untruncatable never appears in observations at all, yet the resource's single statuses entry reports it in `degraded` with its REAL byte count, and the resource stays readable (its `page` survives); (5) THE RESOURCE IS DELIBERATELY STALE. Its outcome is stale{as_of}, and the degrade must leave that alone -- `degraded` sits beside `outcome`, never on top of it. Every surviving observation is therefore stamped staleness:cached, which is asserted on all three. An implementation that reports the degrade AS the outcome erases the stale{as_of}, and section 1's freshness table then stamps three perfectly good cached observations `live`: a resource that is both stale and degraded is the exact case that bug hides in. The runner measures every observation AT THE WIRE (a raw-frame pass over a fresh process, see runner.rs `wire_pass`), before the host's own cap enforcement can omit anything, so an adapter that skips the degrade entirely is caught emitting the oversized record rather than being silently remediated into looking conformant."
   }
 }

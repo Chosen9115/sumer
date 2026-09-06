@@ -472,6 +472,11 @@ async fn an_observation_over_the_cap_is_dropped_and_reported() {
     // truncating `provider_extra` cannot fix), alongside a normal sibling.
     // The page must survive: the sibling is delivered, the oversized record
     // is omitted, and the resource's status says why.
+    //
+    // The resource is `stale` in the same reply, which is the case the
+    // degrade must not destroy: dropping a record says nothing about how
+    // fresh the ones that remain are, so the freshness outcome stays put
+    // and the degradation is reported beside it.
     let script = format!(
         "{PRELUDE}\nhello_ok(read(), capabilities=['history.read'])\n\
          def obs(local_id, description):\n\
@@ -484,8 +489,9 @@ async fn an_observation_over_the_cap_is_dropped_and_reported() {
          req = read()\n\
          send({{'id': req['id'], 'ok': {{\n\
         \x20   'observations': [obs('small', 'rent'), obs('huge', 'D' * 100000)],\n\
-        \x20   'statuses': [{{'resource_id': 'acct1', 'outcome': {{'fetched': {{'page_empty': False}}}},\n\
-        \x20                 'page': {{'cursor_resumable': 'exact', 'next': None}}}}]}}}})\n"
+        \x20   'statuses': [{{'resource_id': 'acct1', 'outcome': {{'stale': {{'as_of': '2026-09-06T11:00:00Z'}}}},\n\
+        \x20                 'page': {{'cursor_resumable': 'exact',\n\
+        \x20                          'next': {{'kind': 'cursor', 'cursor': 'block-841000'}}}}}}]}}}})\n"
     );
     let handle = spawn(&script, Duration::from_secs(5))
         .await
@@ -510,20 +516,86 @@ async fn an_observation_over_the_cap_is_dropped_and_reported() {
     );
 
     assert_eq!(reply.statuses.len(), 1, "one status per requested resource");
-    match &reply.statuses[0].outcome {
-        sumer_wire::ReadOutcome::OversizedObservation { local_id, bytes } => {
-            assert_eq!(local_id.as_deref(), Some("huge"));
+    let status = &reply.statuses[0];
+    match &status.outcome {
+        sumer_wire::ReadOutcome::Stale { as_of } => {
+            assert_eq!(as_of.as_str(), "2026-09-06T11:00:00Z")
+        }
+        other => panic!("the degrade must not overwrite the freshness outcome, got {other:?}"),
+    }
+    match &status.degraded {
+        Some(degraded) => {
+            assert_eq!(degraded.local_id.as_deref(), Some("huge"));
             assert!(
-                *bytes > 65_536,
-                "the reported size is the real one, got {bytes}"
+                degraded.bytes > 65_536,
+                "the reported size is the real one, got {}",
+                degraded.bytes
             );
         }
-        other => panic!("expected oversized_observation, got {other:?}"),
+        None => panic!("the dropped record must be reported, got {status:?}"),
     }
-    assert!(
-        reply.statuses[0].page.is_some(),
-        "the resource stays resumable"
+    assert_eq!(
+        reply.observations[0].provenance.staleness,
+        sumer_wire::Staleness::Cached,
+        "a sibling of a dropped record keeps the freshness its own resource reported"
     );
+
+    // Resumable means the cursor the adapter sent is still there, not
+    // merely that some page object survived.
+    let page = status.page.as_ref().expect("the resource stays resumable");
+    match &page.next {
+        Some(sumer_wire::PageRequest::Cursor { cursor }) => assert_eq!(cursor, "block-841000"),
+        other => panic!("the resume cursor must survive the degrade, got {other:?}"),
+    }
+    assert_eq!(page.cursor_resumable, sumer_wire::CursorResumable::Exact);
+}
+
+#[tokio::test]
+async fn an_adapter_side_degrade_does_not_destroy_the_staleness_it_reported() {
+    // The adapter did the omitting itself (spec/observation.md §6 step 2),
+    // so the host has nothing to measure -- and no chance to snapshot the
+    // freshness first. `degraded` is a field of its own precisely so this
+    // resource can say both things at once: what it is serving is old,
+    // *and* one record was too large to serve at all.
+    let script = format!(
+        "{PRELUDE}\nhello_ok(read(), capabilities=['history.read'])\n\
+         req = read()\n\
+         send({{'id': req['id'], 'ok': {{\n\
+        \x20   'observations': [{{'resource_id': 'acct1', 'local_id': 'small', 'state': 'active',\n\
+        \x20                     'surface': 'checking', 'posting': 'posted',\n\
+        \x20                     'amount': {{'asset': 'USD', 'amount': '1.00'}},\n\
+        \x20                     'raw_sign': 'provider_positive', 'description': 'rent',\n\
+        \x20                     'provenance': {{'adapter_id': 'a', 'provider_id': 'p', 'surface': 'checking',\n\
+        \x20                                    'observed_at': '2026-09-06T12:00:00Z',\n\
+        \x20                                    'completeness': 'complete'}}}}],\n\
+        \x20   'statuses': [{{'resource_id': 'acct1',\n\
+        \x20                 'outcome': {{'stale': {{'as_of': '2026-09-06T11:00:00Z'}}}},\n\
+        \x20                 'degraded': {{'local_id': 'huge', 'bytes': 260000}}}}]}}}})\n"
+    );
+    let handle = spawn(&script, Duration::from_secs(5))
+        .await
+        .expect("handshake");
+    let reply = handle
+        .history_read(vec![sumer_wire::ResourceQuery {
+            resource_id: "acct1".to_owned(),
+            page: None,
+        }])
+        .await
+        .expect("history.read");
+
+    assert_eq!(
+        reply.observations[0].provenance.staleness,
+        sumer_wire::Staleness::Cached,
+        "an adapter-side degrade must not make a cached sibling look live"
+    );
+    let status = &reply.statuses[0];
+    assert!(matches!(
+        status.outcome,
+        sumer_wire::ReadOutcome::Stale { .. }
+    ));
+    let degraded = status.degraded.as_ref().expect("the degrade is reported");
+    assert_eq!(degraded.local_id.as_deref(), Some("huge"));
+    assert_eq!(degraded.bytes, 260_000);
 }
 
 #[tokio::test]
@@ -626,5 +698,86 @@ async fn a_failed_write_reports_the_real_terminal_reason_not_a_guess() {
     assert!(
         first.is_ok(),
         "the first, legitimate copy of that reply is still delivered: {first:?}"
+    );
+}
+
+// ---------------------------------------------------------------------
+// Duplicate keys, on the real transport
+// ---------------------------------------------------------------------
+//
+// `serde_json::Value` collapses duplicate object keys (last one wins), so
+// any decode that goes through `Value` before the typed decode silently
+// erases them. These two cases pin both layers -- the envelope and the
+// `ok` payload -- to the bytes the adapter actually wrote, through the
+// real framer, the real reader loop and the real public API.
+
+#[tokio::test]
+async fn a_duplicate_ok_field_is_rejected_on_the_real_transport() {
+    // Written raw: `json.dumps` cannot emit a duplicate key.
+    let script = format!(
+        "{PRELUDE}\nhello_ok(read())\nreq = read()\n\
+         sys.stdout.write('{{\"id\": %d, \"ok\": {{\"wrong\": true}}, \"ok\": {{\"resources\": []}}}}\\n' % req['id'])\n\
+         sys.stdout.flush()\nread()\n"
+    );
+    let handle = spawn(&script, Duration::from_secs(2))
+        .await
+        .expect("handshake");
+    let result = handle.resources_list().await;
+    assert!(
+        matches!(
+            result,
+            Err(HostError::ProtocolViolation(ProtocolViolationKind::NotJson))
+        ),
+        "a repeated `ok` must not be collapsed into a well-formed reply, got {result:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_duplicate_field_inside_the_ok_payload_is_rejected() {
+    let script = format!(
+        "{PRELUDE}\nhello_ok(read(), capabilities=['balances.read'])\nreq = read()\n\
+         sys.stdout.write('{{\"id\": %d, \"ok\": {{\"observations\": [], \"statuses\": [], \"statuses\": [{{\"resource_id\": \"acct1\", \"outcome\": \"unavailable\"}}]}}}}\\n' % req['id'])\n\
+         sys.stdout.flush()\nread()\n"
+    );
+    let handle = spawn(&script, Duration::from_secs(2))
+        .await
+        .expect("handshake");
+    let result = handle.balances_read(vec!["acct1".to_owned()]).await;
+    match result {
+        Err(HostError::Wire(err)) => assert_eq!(
+            err.code,
+            sumer_wire::WireErrorCode::InvalidRequest,
+            "a repeated key inside `ok` is a malformed reply, got {err:?}"
+        ),
+        other => panic!("a repeated `statuses` must not be collapsed, got {other:?}"),
+    }
+}
+
+// ---------------------------------------------------------------------
+// A named violation outranks an unexplained exit
+// ---------------------------------------------------------------------
+
+#[tokio::test]
+async fn a_violation_wins_over_an_immediately_following_exit() {
+    // The schedule the previous fix left open: the adapter emits a
+    // malformed frame and exits in the same breath, so `child.wait()` can
+    // resolve before the reader loop's kill request is ever looked at. The
+    // caller must still be told the truth -- the host killed this adapter
+    // for a violation it can name -- not `AdapterCrashed`, which means
+    // "gone, and nothing established why".
+    let script = format!(
+        "{PRELUDE}\nhello_ok(read())\nread()\n\
+         sys.stdout.write('not json at all\\n')\nsys.stdout.flush()\nsys.exit(3)\n"
+    );
+    let handle = spawn(&script, Duration::from_secs(2))
+        .await
+        .expect("handshake");
+    let result = handle.resources_list().await;
+    assert!(
+        matches!(
+            result,
+            Err(HostError::ProtocolViolation(ProtocolViolationKind::NotJson))
+        ),
+        "an established violation must outrank the exit that followed it, got {result:?}"
     );
 }
