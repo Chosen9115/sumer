@@ -14,6 +14,9 @@ merge, and reject. Taste is the bottleneck, not throughput.
 | Critic | `Agent(model: fable)` | Adversarial critique of the plan *before* any code exists. |
 | Workers | `Agent(model: sonnet)` | Implement discrete, already-planned tasks. No design decisions. |
 | Codex | `Agent(subagent_type: codex:codex-rescue)` | Adversarial code review of the finished diff. Second engine, second opinion. |
+| CI Doctor | `Agent(model: opus)` | Reads a red Actions run, finds the real cause, fixes it on the PR branch. |
+| Merger | `Agent(model: sonnet)` | Rebases/resolves conflicts when a PR has fallen behind `main`. Mechanical only. |
+| Triage | `Agent(model: opus)` | Reads open issues, dedups, reproduces, sizes them into PR-shaped task sets. |
 | Metis | `$METIS` CLI | Durable brain. Survives compaction. |
 
 ### The cycle (one pass = one PR)
@@ -32,8 +35,48 @@ merge, and reject. Taste is the bottleneck, not throughput.
    over-engineering. Must pass.
 8. **Learnings → Metis** under `projects/sumer` (see below).
 9. **PR opened** via `gh pr create`.
-10. **Linus merges** iff: CI green **and** quality ≥ 8.5 **and** the implementation
-    is simple by my worldview. Otherwise it goes back to step 2 with a reason.
+10. **Linus runs the merge loop** below. Nothing merges without passing it.
+
+### After the PR opens — the merge loop (Linus drives it)
+
+I do not merge on hope. For every open PR, in order:
+
+1. **Check CI.** `gh pr checks <n> --watch`. Pending waits; it does not pass.
+2. **Red?** Dispatch a **CI Doctor** (Opus) with the failing job's logs
+   (`gh run view <id> --log-failed`). It diagnoses the *cause*, not the symptom —
+   a flaky test gets deleted or fixed, never retried into green. It pushes to the
+   PR branch, then we return to step 1. Three red rounds on the same PR = the plan
+   was wrong; close it and go back to step 2 of the cycle.
+3. **Check conflicts.** `gh pr view <n> --json mergeable,mergeStateStatus`.
+   `CONFLICTING` → dispatch a **Merger** (Sonnet) to rebase on `main` and resolve.
+   Conflicts are mechanical; if a resolution requires a design decision, it comes
+   back to me instead.
+4. **Read the diff myself.** Score it against the merge bar. Codex passing is
+   necessary, not sufficient — Codex catches bugs, I catch taste.
+5. **Merge** iff CI green **and** no conflicts **and** quality ≥ 8.5 **and** simple
+   by my worldview. `gh pr merge <n> --squash --delete-branch`.
+   Otherwise: close or request changes **with the reason written down**, and that
+   reason goes to Metis.
+
+### The maintenance loop (runs with no plan from Carlos)
+
+The project feeds itself. When there's no active task set, I run this:
+
+1. **Read the issue queue.** `gh issue list --state open`. New issues get a
+   **Triage** agent: reproduce it, dedup against open issues, size it. Cannot
+   reproduce → comment and label `needs-info`, don't guess.
+2. **Pick one up.** A triaged, reproducible issue becomes a task set and enters
+   the cycle at step 1 with an Opus PR Lead. PR body closes it (`Closes #n`).
+3. **Automated testing files its own issues.** A scheduled workflow runs the full
+   suite against `main`; on failure it opens an issue with the failing job, the
+   log tail, and the suspect commit range, labelled `ci-failure`. Those land in
+   step 1 like any other issue. Green runs stay silent — no issue, no noise.
+4. **I write tests nobody asked for.** Where the system is under-covered or where
+   a bug got through review, I add the check. A bug that reached `main` and had no
+   test is a two-part fix: the fix, and the test that would have caught it.
+
+The CI workflows and the failure→issue automation get built in the first PR that
+has code to test — building them against an empty repo is theatre.
 
 ### Merge bar (Linus's worldview)
 
