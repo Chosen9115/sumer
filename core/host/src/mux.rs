@@ -44,7 +44,7 @@ use serde_json::Value;
 use sumer_wire::{ErrorBody, ProtocolViolationKind, Reply, RequestId, Rfc3339, WireErrorCode};
 use tokio::io::AsyncWriteExt;
 use tokio::process::ChildStdin;
-use tokio::sync::{mpsc, oneshot, Semaphore};
+use tokio::sync::{mpsc, oneshot, Notify, Semaphore};
 
 use crate::HostError;
 
@@ -143,6 +143,9 @@ pub struct Mux {
     /// `None` on every production connection ([`Mux::spawn`]); only
     /// [`Mux::spawn_recorded`] fills this in. See [`Transcript`].
     transcript: Option<Arc<Transcript>>,
+    /// Fired by [`Mux::begin_close`]: tells [`pump`] to stop and drop the
+    /// child's stdin, which is what gives a connection a defined END.
+    closing: Notify,
 }
 
 /// One request/reply pair as it passed through [`Mux::call`].
@@ -176,10 +179,16 @@ pub struct Exchange {
 /// (spec/wire.md §6: "the connection survives"). An oversized or
 /// otherwise non-conforming observation riding in on a reply that arrives
 /// after its own deadline is therefore invisible to measurement forever.
-/// This is an accepted hole, not a bug to fix: its aperture is bounded by
-/// the deadline that caused the tombstone in the first place, never
-/// unbounded. It is written down here so a future reviewer does not
-/// rediscover it as a surprise.
+///
+/// **The aperture is one id, not one deadline.** A tombstoned slot is
+/// never cleared: `deliver` discards *every* later reply naming that id,
+/// for the rest of the connection's life, however long after the deadline
+/// it arrives. What bounds this is that only a request the host gave up on
+/// is ever tombstoned, and each such request is one id -- not that late
+/// replies stop being discarded once the deadline is some distance past.
+/// This is an accepted hole, not a bug to fix, and it is written down
+/// accurately here so a future reviewer does not rediscover it as a
+/// surprise -- an overstated safety claim would be worse than the hole.
 #[derive(Default)]
 pub(crate) struct Transcript(Mutex<Vec<Exchange>>);
 
@@ -269,6 +278,7 @@ impl Mux {
             outbox: tx,
             semaphore: semaphore.clone(),
             transcript,
+            closing: Notify::new(),
         });
         tokio::spawn(pump(mux.clone(), rx, stdin, semaphore, kill_tx));
         mux
@@ -369,6 +379,27 @@ impl Mux {
             let _ = tx.send(Delivery::from(reason));
         }
         true
+    }
+
+    /// Ends the connection from the host's side: [`pump`] stops pulling and
+    /// **drops the child's stdin**, so an adapter blocked on reading its
+    /// stdin sees EOF and exits.
+    ///
+    /// This is what gives an execution a defined CLOSE. Without it a
+    /// connection has no end at all: the last measured reply is delivered,
+    /// the caller judges what it has, and anything the adapter writes
+    /// afterwards -- a malformed frame, a second answer to an id already
+    /// answered -- lands (or does not) in whatever order the scheduler
+    /// happens to pick. After this call the adapter's exit closes its
+    /// stdout, the reader loop drains every remaining byte before it sees
+    /// that EOF, and `supervise` latches the terminal reason. So "the
+    /// connection ended clean" becomes a fact that can be waited for and
+    /// checked, rather than a race nobody looks at.
+    ///
+    /// Requests already queued are still sent: this is a close, not a
+    /// cancel. Idempotent, and safe on a connection that is already gone.
+    pub(crate) fn begin_close(&self) {
+        self.closing.notify_one();
     }
 
     pub(crate) fn terminal(&self) -> Option<Terminal> {
@@ -484,6 +515,11 @@ impl Mux {
 /// and writes the frame under the request's deadline, then races what is
 /// left of that same deadline against the reply in its own task so the
 /// pump keeps moving.
+///
+/// It owns `stdin` for the connection's whole life, so **returning from here
+/// closes the child's stdin**. That is the one lever [`Mux::begin_close`]
+/// pulls: already-queued requests are drained first (`biased`, queue before
+/// close), and only an empty queue lets the close win.
 async fn pump(
     mux: Arc<Mux>,
     mut rx: mpsc::Receiver<QueuedRequest>,
@@ -491,7 +527,15 @@ async fn pump(
     semaphore: Arc<Semaphore>,
     kill_tx: mpsc::Sender<Option<ProtocolViolationKind>>,
 ) {
-    while let Some(req) = rx.recv().await {
+    loop {
+        let req = tokio::select! {
+            biased;
+            queued = rx.recv() => match queued {
+                Some(req) => req,
+                None => return,
+            },
+            () = mux.closing.notified() => return,
+        };
         if let Some(t) = mux.terminal() {
             let _ = req.responder.send(Err(t.into()));
             continue;

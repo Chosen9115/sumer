@@ -1,0 +1,34 @@
+{
+  "fixture": "pending_to_posted",
+  "assertions": [
+    "A11"
+  ],
+  "why": "The adapter answers the whole measured crawl correctly and only THEN puts a malformed frame on the wire, after the final status.read reply. Mux::read_loop delivers a valid reply before it reports a violation in whatever follows, so the crawl completed, every sequence matched, and the connection died with nobody looking at it. This is the mutant that survived until an execution was given a defined CLOSE: finish() now shuts the connection down and reads the terminal reason, so output after the last measured reply is still output. One more probe read would only have moved the hole one reply further out.",
+  "adapter": null,
+  "patch": [
+    {
+      "path": "/script/runs/0/on/status.read/0/do",
+      "value": [
+        {
+          "op": "reply_ok",
+          "body": {
+            "statuses": [
+              {
+                "resource_id": "checking-1",
+                "outcome": {
+                  "fetched": {
+                    "page_empty": false
+                  }
+                }
+              }
+            ]
+          }
+        },
+        {
+          "op": "stdout_raw",
+          "text": "} not a frame, and not the answer to anything\n"
+        }
+      ]
+    }
+  ]
+}

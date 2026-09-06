@@ -279,6 +279,48 @@ cannot ask an adapter to abandon work it has already accepted. (Both are
 tracked as deliberately deferred; see `constitution/FOUNDING_PLAN.md` §10 and
 the frozen contract's "Deliberately NOT building" list.)
 
+### Closing a connection: stdin EOF is the END
+
+**An adapter MUST exit when its stdin reaches EOF.**
+
+The host closes the adapter's stdin to say that no further requests are
+coming. That is the defined end of a connection, and the only one this
+protocol has: there is no `goodbye` frame and no shutdown op, because a
+frame is something an adapter can fail to read, and a closed pipe is not.
+
+An adapter still running after stdin EOF is **unjudgeable**. The host issued
+its last id before the close, so nothing the adapter writes afterwards
+answers a request, and there is no caller left for it to reach: it is output
+that cannot be attributed, accepted, or refused by anyone. A conformance
+suite cannot decide whether such a connection ended clean, because it never
+ends. It is also a **leaked process** — with no auto-restart and no cancel
+frame, closing the connection is the only lever the host has left, and an
+adapter that ignores it has taken that lever away.
+
+The host's side of the bargain: it stops sending, closes stdin, and then
+waits for the process to exit for as long as that connection's own deadline
+(default 30s, above). An adapter that has not exited by then is killed, and
+the connection ends in a `StdinEofIgnored` protocol violation — a host-side
+outcome like every other kind in §8, never a wire `err`, since there is no
+longer anyone to reply to. Any request still outstanding resolves as it
+would for any other terminal violation.
+
+Exiting means exiting: flush what you have already written, drop whatever
+you are still holding, and return. Work that was in flight when EOF arrived
+does not get to finish — its reply has nowhere to go.
+
+**Per language, because the default behaviour differs and this is exactly
+where an implementer gets it wrong.** The bug is always the same shape: a
+read loop that treats EOF as "nothing to read *yet*" rather than "nothing to
+read *ever*", or a runtime that stays up after the read loop is done.
+
+| Runtime | What EOF does | What to write |
+|---|---|---|
+| Python | `for line in sys.stdin:` stops at EOF and the loop exits naturally. `while True:` around a bare `sys.stdin.readline()` does not: at EOF `readline()` returns `""` — falsy, not an exception — forever, so the loop spins at 100% CPU and never leaves. | Iterate `sys.stdin` directly, or, if you must call `readline()`, `break` on the empty string. Mind the order of the strip: `readline()` gives `"\n"` for a blank line and `""` for EOF, so those are distinguishable — until `line = line.rstrip("\n")` runs first, after which the usual blank-line skip (`if not line: continue`) is exactly the edit that turns EOF into an infinite loop. |
+| Node.js | `process.stdin` emits `end` (and its async iterator finishes) at EOF, but neither exits the process: Node exits when the event loop has no work left, and a listening socket, an open handle, or a pending timer keeps it alive with nothing to read. A `readline` interface emits `close`, not `end`. | Handle `end` (or `for await (const line of rl)` falling through) and drive shutdown from there — close your handles, or `unref()` them, and call `process.exit(0)` once your last write has flushed. |
+| Go | `bufio.Scanner.Scan()` returns `false` at EOF, so `for s.Scan()` exits on its own — but check `s.Err()` afterwards, since it also returns `false` on a read error and on a line over the buffer limit. A bare `os.Stdin.Read` loop gets `n == 0, err == io.EOF` and must treat it as the end; `io.EOF` is not an error to log and retry. | `for s.Scan() { … }` then `return`, or compare against `io.EOF` explicitly. Do not leave the main goroutine blocked on a channel that only a request would fill. |
+| JVM | `BufferedReader.readLine()` returns `null` at EOF, so `while ((line = r.readLine()) != null)` exits. It never throws for EOF, so a `while (true)` loop that only catches `IOException` never leaves. Separately, returning from `main` does not end the JVM while a non-daemon thread or an un-shutdown `ExecutorService` is alive. | Loop on the `!= null` condition, and make every worker thread a daemon or shut the pool down on the way out. |
+
 ## 8. Error channels: `err` versus `status`
 
 Two different mechanisms report failure, and mixing them up is the single
@@ -312,10 +354,9 @@ wire, from a request that could not be processed at all. It must not be.
 
 Host-side outcomes — `Timeout`, `AdapterCrashed{status}`, `IdsExhausted`
 (§6), and `ProtocolViolation{kind}` (`OversizeFrame`, `NotJson`, `NonUtf8`,
-`UnknownId`, `DuplicateId`, `PreHelloOutput`) — never appear on the wire at
-all. They are
-things the host concludes *about* the adapter (or its absence of an answer),
-not something the adapter emits.
+`UnknownId`, `DuplicateId`, `PreHelloOutput`, `StdinEofIgnored`) — never
+appear on the wire at all. They are things the host concludes *about* the
+adapter (or its absence of an answer), not something the adapter emits.
 
 ## 9. Isolation boundary
 
@@ -394,7 +435,9 @@ entirely. The one hint defined so far is `deadline_ms`, which lets a fixture
 ask the runner to shorten its request deadline (default 30s, §7) below the
 default for that run — used by a scenario that must force a host-side
 timeout deliberately (e.g. proving a tombstoned reply is discarded rather
-than the adapter being killed for being slow) without costing the full
-default deadline's wall-clock time per test run. A runner that ignores
+than the adapter being killed for being slow), or that must watch a close
+fail to complete (§7: an adapter that ignores its stdin EOF is only known
+to have ignored it once the connection's deadline has passed), without
+costing the full default deadline's wall-clock time per test run. A runner that ignores
 `conformance_hints` entirely is still conformant; it just pays the full
 default deadline for any scenario that wanted a shorter one.

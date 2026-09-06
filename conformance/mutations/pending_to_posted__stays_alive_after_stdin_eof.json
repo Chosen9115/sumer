@@ -1,0 +1,13 @@
+{
+  "fixture": "pending_to_posted",
+  "assertions": [
+    "A11"
+  ],
+  "covers": [
+    "A11",
+    "StdinEofIgnored"
+  ],
+  "why": "The adapter answers the whole measured crawl correctly and then refuses to exit when the host closes its stdin -- written as the read loop spec/wire.md section 7 names, where readline() returns \"\" forever at EOF and the loop treats that as 'nothing to read yet'. This is the mutant the close boundary could not kill while no rule required an adapter to exit: close() waited out the connection deadline, reported nothing, and everything the process did after the last measured reply went unjudged. spec/wire.md section 7 now makes stdin EOF the defined END of a connection, so failing to exit within the deadline is ProtocolViolation::StdinEofIgnored and lands on this execution like any other terminal violation. It costs one deadline per execution to observe, which is what the fixture's conformance_hints.deadline_ms pays for.",
+  "adapter": "stays_alive_after_stdin_eof.py",
+  "patch": []
+}

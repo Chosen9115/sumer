@@ -1,6 +1,6 @@
 //! One adapter execution, judged before it can be looked at.
 //!
-//! # The three properties this module exists to enforce
+//! # The four properties this module exists to enforce
 //!
 //! **1. One execution, both views.** A crawl is spawned through
 //! [`AdapterHandle::spawn_recorded`], so the typed evidence (the
@@ -16,11 +16,12 @@
 //!
 //! **2. An unjudged execution is unobtainable.** [`JudgedExecution`]'s
 //! fields are private, [`assert_execution`] is private, and the only
-//! constructor is [`run_crawl`], which judges before it returns. A driver
-//! that forgets to assert does not compile, because there is nothing to
-//! forget: it never holds an unjudged execution in the first place. "Every
-//! driver remembers to call the assertion" is exactly the discipline that
-//! failed seven times, and it is not shipped again.
+//! constructor is [`run_crawl`], which judges before it returns -- on
+//! **every** path out, the ones that never got a connection included. A
+//! driver that forgets to assert does not compile, because there is
+//! nothing to forget: it never holds an unjudged execution in the first
+//! place. "Every driver remembers to call the assertion" is exactly the
+//! discipline that failed seven times, and it is not shipped again.
 //!
 //! **3. Raw measurement lives inside that judgement.** A10 measures every
 //! observation in [`JudgedExecution::raw_observations`] -- parsed out of
@@ -30,6 +31,16 @@
 //! nulls the wire omits. Measuring the decoded form previously produced
 //! both a false positive at exactly 65,536 bytes and a missed violation
 //! one byte over.
+//!
+//! **4. An execution has an END, and the end is judged.** [`finish`]
+//! closes the connection ([`AdapterHandle::close`]) and consults the
+//! terminal reason before it hands anything back. Delivering a valid reply
+//! and *then* breaking the protocol used to be free: the last measured
+//! reply resolves its caller, the crawl runs out of calls, and whatever
+//! the adapter wrote afterwards -- garbage, a second answer to an id
+//! already answered -- killed a connection nobody was still looking at.
+//! Adding one more probe read would only move that boundary; closing at it
+//! removes it.
 //!
 //! # The honest limit
 //!
@@ -53,9 +64,15 @@
 //! drop is legally not a violation -- spec/wire.md §6, "the connection
 //! survives". So an oversized observation riding in on a reply that
 //! arrived after its own deadline is invisible to A10's measurement,
-//! forever. This is accepted, not fixed: the aperture is bounded by the
-//! deadline that caused the tombstone, never unbounded. It is written down
-//! so the next reviewer does not rediscover it as a surprise.
+//! forever.
+//!
+//! **What bounds it is one id, not one deadline.** A tombstoned slot is
+//! never cleared, so every later reply naming that id is discarded for the
+//! rest of the connection's life, however long after the deadline it
+//! arrives. The hole is narrow because only a request the host already
+//! gave up on is ever tombstoned -- not because late replies stop being
+//! discarded. This is accepted, not fixed, and stated accurately: an
+//! overstated safety claim is worse than a documented hole.
 
 use crate::assert::{
     assert_status_coverage, brief, expect_array, expect_object, expect_str, expect_u64,
@@ -65,9 +82,10 @@ use crate::ledger::{compare_sequence, parse_declared, Completeness, Ledger, ObsK
 use serde_json::Value;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::Path;
+use std::time::Duration;
 use sumer_host::fold::Fold;
 use sumer_host::paging::ResumeState;
-use sumer_host::{AdapterHandle, Exchange, HostError};
+use sumer_host::{AdapterHandle, Exchange, HostError, Terminal};
 use sumer_wire::{
     CursorResumable, PageRequest, Reply, ResourceQuery, MAX_OBSERVATION_BYTES, OP_BALANCES_READ,
     OP_HISTORY_READ,
@@ -112,12 +130,18 @@ impl Resumption {
     }
 }
 
-/// How much of its declared ledger an execution was obliged to emit.
+/// How much of its declared **history** an execution was obliged to emit.
 ///
 /// **A driver constant. Never a fixture key.** See
 /// [`crate::ledger::Completeness`] for why, and
 /// `case_interrupted_pagination` for the only four `Truncated` call sites
 /// in this crate.
+///
+/// **It relaxes the history sequence and nothing else.** Interruption is a
+/// property of *pagination*, and only `history.read` is paginated:
+/// `balances.read` is one batched, unpaginated call (Contract Amendment 1
+/// Ruling A3), so a run that died half-way through page two still owes its
+/// whole declared balances sequence. See [`assert_execution`].
 pub(crate) enum Mode<'a> {
     /// Read to exhaustion; the emitted sequence must equal the declared one.
     Complete,
@@ -275,13 +299,16 @@ impl JudgedExecution {
 ///
 /// `expect` is the fixture's `expect` block -- or, for
 /// `interrupted_pagination`, one family's sub-block, which carries the
-/// same keys.
+/// same keys. `deadline` is the per-request deadline this execution's
+/// connection is built with, including the one [`finish`] gives the
+/// adapter to exit at stdin EOF -- see `runner::deadline_of`.
 pub(crate) async fn run_crawl(
     argv: &[String],
     path: &Path,
     run: u64,
     expect: &Value,
     mode: Mode<'_>,
+    deadline: Duration,
     failures: &mut Vec<Failure>,
 ) -> JudgedExecution {
     let label = format!(
@@ -305,10 +332,24 @@ pub(crate) async fn run_crawl(
         Mode::Truncated { across, killed } => (Completeness::Truncated, Some(across), killed),
     };
 
-    let handle = match AdapterHandle::spawn_recorded(argv.to_vec(), env_for(path, run)).await {
+    let handle = match AdapterHandle::spawn_recorded_with_deadline(
+        argv.to_vec(),
+        env_for(path, run),
+        deadline,
+    )
+    .await
+    {
         Ok(h) => h,
         Err(e) => {
+            // No connection, so no transcript and nothing to close -- but
+            // the judgement still runs, because "an unjudged execution is
+            // unobtainable" has to be true of the failed-start path too or
+            // it is not an invariant, it is a habit with one exception.
+            // What it reports is that this execution emitted none of what
+            // the fixture declared, which is exactly what happened.
             failures.push(Failure::new("setup", format!("{label}: spawn failed: {e}")));
+            let live_fold = across.as_deref().map_or(&exec.fold, |a| &a.fold);
+            assert_execution(&exec, expect, completeness, live_fold, failures);
             return exec;
         }
     };
@@ -333,7 +374,7 @@ pub(crate) async fn run_crawl(
                 "setup",
                 format!("{label}: resources.list failed: {e}"),
             ));
-            return finish(exec, &handle, expect, completeness, across, failures);
+            return finish(exec, handle, expect, completeness, across, failures).await;
         }
     };
     let resources_json: Vec<Value> = resources.resources.iter().map(to_json).collect();
@@ -351,7 +392,7 @@ pub(crate) async fn run_crawl(
             "setup",
             format!("{label}: resources.list returned no resources"),
         ));
-        return finish(exec, &handle, expect, completeness, across, failures);
+        return finish(exec, handle, expect, completeness, across, failures).await;
     }
     if across.is_some() && exec.resource_ids.len() != 1 {
         failures.push(Failure::new(
@@ -427,7 +468,7 @@ pub(crate) async fn run_crawl(
                         format!("{label}: the adapter died (exit {status:?}) during balances.read"),
                     ));
                 }
-                return finish(exec, &handle, expect, completeness, across, failures);
+                return finish(exec, handle, expect, completeness, across, failures).await;
             }
             Err(e) => failures.push(Failure::new(
                 "A2",
@@ -551,16 +592,49 @@ pub(crate) async fn run_crawl(
         assert_fdx_field_map(&label, field_map, &emitted_provider_extra, failures);
     }
 
-    finish(exec, &handle, expect, completeness, across, failures)
+    finish(exec, handle, expect, completeness, across, failures).await
 }
 
-/// Takes the transcript off the connection, runs the per-execution
-/// judgement, and hands back the (now judged) execution. Every early
-/// return in [`run_crawl`] goes through here -- an execution that failed
-/// half-way is still judged on what it did emit.
-fn finish(
+/// Takes the transcript off the connection, **closes the connection and
+/// judges how it ended**, runs the per-execution judgement, and hands back
+/// the (now judged) execution. Every early return in [`run_crawl`] that
+/// had a connection goes through here -- an execution that failed half-way
+/// is still judged on what it did emit.
+///
+/// # The close boundary
+///
+/// An execution ends at a defined point, and that point is checked. The
+/// hole this closes: `Mux::read_loop` delivers a valid reply *before* it
+/// reports a violation in whatever follows, so an adapter could answer the
+/// entire measured crawl and then put garbage (or a second answer to an id
+/// already answered) on the wire, killing its connection after the last
+/// thing anyone was waiting for. The crawl was over, nothing else was ever
+/// asked, and the case passed.
+///
+/// Adding one more probe read after the crawl would only move that hole one
+/// reply further out. Instead this closes the connection --
+/// [`AdapterHandle::close`] drops the child's stdin, the adapter exits, the
+/// reader loop drains every byte it wrote before EOF, and the terminal
+/// reason is latched -- and then reads the verdict. A `Terminal::Violation`
+/// is this execution's failure.
+///
+/// An adapter that ignores its stdin EOF and stays alive does not escape
+/// this either. It used to: with no rule requiring it to exit, `close`
+/// waited out the connection's deadline, reported nothing, and that
+/// execution's post-crawl output went unjudged. spec/wire.md §7 now says
+/// **an adapter MUST exit when its stdin reaches EOF**, so the host
+/// reports that failure as `ProtocolViolation::StdinEofIgnored` and it
+/// lands here like any other terminal violation. The boundary holds for
+/// every adapter, not just the cooperative ones -- which is what makes it
+/// a boundary.
+///
+/// It costs one deadline of wall clock to observe, since not-having-exited
+/// is only knowable once the deadline has passed. A fixture that contains
+/// such an adapter pays for it with `conformance_hints.deadline_ms`
+/// (spec/wire.md §11).
+async fn finish(
     mut exec: JudgedExecution,
-    handle: &AdapterHandle,
+    handle: AdapterHandle,
     expect: &Value,
     completeness: Completeness,
     across: Option<&mut Resumption>,
@@ -568,18 +642,47 @@ fn finish(
 ) -> JudgedExecution {
     exec.transcript = handle.transcript();
     exec.request_shapes = exec.transcript.iter().map(request_shape).collect();
+
+    // Nothing is in flight here (the crawl awaits serially and is over), so
+    // the transcript above cannot change across the close.
+    // No crawl-driven fixture ever expects a violation -- the one case that
+    // does (`protocol_violations`) never comes through here, because its
+    // runs end in a killed connection rather than a completed crawl. So a
+    // violation at the close is unconditionally this execution's failure;
+    // there is no "expected" one to filter out, and inventing a filter for
+    // a case that cannot reach this function would be a hole with a comment
+    // on it.
+    if let Some(Terminal::Violation(kind)) = handle.close().await {
+        failures.push(Failure::new(
+            "A11",
+            format!(
+                "{}: the connection ended in ProtocolViolation::{kind:?} -- the adapter answered \
+                 everything it was asked and then broke the protocol on the way out. An execution \
+                 is judged up to its CLOSE, not up to the last thing someone happened to be \
+                 waiting for: output after the last measured reply is still output, and a process \
+                 that will not exit at stdin EOF has not closed at all",
+                exec.label
+            ),
+        ));
+    }
+
     let live_fold = across.map_or(&exec.fold, |a| &a.fold);
     assert_execution(&exec, expect, completeness, live_fold, failures);
     exec
 }
 
-/// The per-execution judgement. Private, and called from exactly one place
-/// -- [`run_crawl`], before it returns. Nothing outside this module can
+/// The per-execution judgement. Private, and called only from
+/// [`run_crawl`] (via [`finish`], or directly on the one path that never
+/// got a connection), before it returns. Nothing outside this module can
 /// obtain a [`JudgedExecution`] that has not been through here.
+///
+/// `history_completeness` is named for what it governs. It is the ONLY
+/// sequence an interruption can relax -- see the note where it is applied
+/// below.
 fn assert_execution(
     exec: &JudgedExecution,
     expect: &Value,
-    completeness: Completeness,
+    history_completeness: Completeness,
     live_fold: &Fold,
     failures: &mut Vec<Failure>,
 ) {
@@ -619,6 +722,19 @@ fn assert_execution(
             .seqs
             .get(&(resource_id.clone(), kind))
             .map_or(&[][..], Vec::as_slice);
+        // **Truncation is scoped to the sequence that can actually be cut
+        // short.** An interruption is a pagination event, and `history` is
+        // the only paginated sequence: `balances.read` is one batched,
+        // unpaginated call (Contract Amendment 1 Ruling A3), answered in
+        // full or not at all. Handing `Truncated` to every sequence let a
+        // resumed run drop its declared balance line entirely -- an empty
+        // slice is a contiguous slice of anything -- while its history and
+        // the A5 fold bracket stayed untouched and nothing objected. A
+        // balance is owed in full by every execution, interrupted or not.
+        let completeness = match kind {
+            ObsKind::Balances => Completeness::Complete,
+            ObsKind::History => history_completeness,
+        };
         compare_sequence(
             &SequenceRef {
                 label,
@@ -648,7 +764,9 @@ fn assert_execution(
         }
     }
 
-    assert_live(label, expect, live_fold, completeness, failures);
+    // The live set is folded out of `history` alone, so it is the history
+    // completeness that governs it.
+    assert_live(label, expect, live_fold, history_completeness, failures);
 }
 
 /// `expect.live`: the `local_id`s that must be live once the fold settles,

@@ -117,9 +117,11 @@ rather than only ever using the default.
 `conformance_hints.deadline_ms`, when a fixture sets it, is advisory only
 — never part of the wire protocol, never sent to or read by the adapter.
 It lets a fixture request a shorter per-connection request deadline than
-the wire's 30-second default, so a scenario that deliberately forces a
-host-side timeout doesn't cost 30 real seconds per run. A runner that
-ignores it entirely is still conformant.
+the wire's 30-second default, so a scenario whose whole point is a deadline
+*expiring* doesn't cost 30 real seconds per run — a deliberate host-side
+timeout, or an adapter caught not exiting at stdin EOF (`spec/wire.md` §7),
+neither of which is observable any sooner. A runner that ignores it
+entirely is still conformant.
 
 ## The `expect` block: what a fixture declares
 
@@ -218,6 +220,15 @@ killed or resumed. A fixture is an adapter-adjacent file; one that could
 declare its own leniency would be the thing under test deciding how hard
 the test is.
 
+**And that relaxation applies to `history` only.** Interruption is a
+pagination event, and `history.read` is the only paginated op:
+`balances.read` is one batched, unpaginated call (Contract Amendment 1
+Ruling A3), so an interrupted run still owes its whole declared `balances`
+sequence. Relaxing every sequence of an interrupted execution let a resumed
+run drop its balance line and pass — the empty slice is a contiguous slice
+of anything — which is what
+`interrupted_pagination__resumed_balance_vanishes` now holds.
+
 ## One execution, both views
 
 Most of this suite reads through `sumer_host::AdapterHandle`'s typed
@@ -252,9 +263,29 @@ Why A10 has to be measured on the adapter's own bytes, in both directions:
 One thing this cannot see: an oversized observation riding in on a reply
 that arrived after its own deadline. The host discards a tombstoned reply
 before it reaches any caller, including the recording, and that discard is
-legally not a violation (`spec/wire.md` §6). The aperture is bounded by
-the deadline that caused the tombstone, and it is accepted rather than
-fixed.
+legally not a violation (`spec/wire.md` §6). **The aperture is one id, not
+one deadline** — a tombstoned slot is never cleared, so every later reply
+naming that id is discarded for the rest of the connection's life, however
+long after the deadline it arrives. What keeps the hole narrow is that only
+a request the host already gave up on is ever tombstoned. It is accepted
+rather than fixed, and stated as it actually behaves: an overstated safety
+claim would be worse than the hole.
+
+## An execution has an end, and the end is judged
+
+The crawl closes its connection before it judges: the child's stdin is
+dropped, the adapter exits, the reader loop drains every byte it wrote
+before that EOF, and the terminal reason is read. A connection that ended
+in a protocol violation fails the execution.
+
+Without that boundary an execution had no end at all. The host delivers a
+valid reply *before* it reports a violation in whatever follows it, so an
+adapter could answer the entire measured crawl and then put garbage (or a
+second answer to an id already answered) on the wire — killing a connection
+nobody was still waiting on — and the case passed. Adding one more probe
+read after the crawl would only have moved that hole one reply further out;
+`pending_to_posted__garbage_after_the_final_reply` is the mutant that holds
+the boundary itself.
 
 ## A9's requirement: two executions, and the whole history
 
@@ -310,7 +341,7 @@ its stated mitigation, not just its happy-path check:
 | A8 | Full history retention, in emission order, as part of A2's sequence | Keeping only the final state |
 | A9 | `local_id` purity across two independent, fully judged executions, gated on request-shape equality, compared as record-to-id associations over the full observation history | A freshly generated UUID per run, a derivation that reuses the same ids for different records on the second run, one that mis-identifies only a record that is later superseded or tombstoned (identical live set, different history), *and* an adapter that empties both executions so they agree (each execution still fails its own ledger) |
 | A10 | The oversized-observation two-step degrade, five ways at once, driven by genuinely oversized input, measured on the adapter's own frames from **every** execution | Truncating (or dropping) the whole page over one bad record, leaving leaked payload beside the truncation marker (`provider_extra` is compared exactly), reporting the degrade *as* the resource's outcome so its freshness is erased, *and* skipping the degrade entirely and letting the host omit the record for you |
-| A11 | Fatal violations kill; a tombstoned reply is discarded and the connection survives | A host that kills the connection on *any* anomaly |
+| A11 | Fatal violations kill; a tombstoned reply is discarded and the connection survives; and every crawl is judged up to its **close**, not up to the last reply someone was waiting for | A host that kills the connection on *any* anomaly, *and* an adapter that answers the whole measured crawl and only then breaks the protocol, including by refusing to exit when its stdin closes |
 
 ## Honest limits of black-box testing
 

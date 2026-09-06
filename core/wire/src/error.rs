@@ -24,9 +24,11 @@ pub enum WireErrorCode {
 ///
 /// [`crate::codec::FrameDecoder`] can only ever produce `OversizeFrame`,
 /// `NonUtf8`, or `NotJson` (frame-level corruption). `UnknownId`,
-/// `DuplicateId`, and `PreHelloOutput` are host-loop classifications built
-/// on top of the decoded frames (id bookkeeping, and the pre-hello-output
-/// rule) and are enforced by the host, not by this crate's framer.
+/// `DuplicateId`, `PreHelloOutput`, and `StdinEofIgnored` are host-loop
+/// classifications built on top of the decoded frames (id bookkeeping, the
+/// pre-hello-output rule, and what the process does once the host has
+/// closed its stdin) and are enforced by the host, not by this crate's
+/// framer.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ProtocolViolationKind {
     /// The frame (excluding its terminating LF) exceeded
@@ -43,6 +45,12 @@ pub enum ProtocolViolationKind {
     DuplicateId,
     /// The adapter wrote to stdout before its hello reply.
     PreHelloOutput,
+    /// The host closed the adapter's stdin -- the defined end of a
+    /// connection (spec/wire.md §7) -- and the process was still running
+    /// when the connection's deadline expired. Anything it writes from
+    /// here answers no request and reaches no caller, so the connection
+    /// cannot be judged to have ended cleanly; it did not end.
+    StdinEofIgnored,
 }
 
 #[cfg(test)]

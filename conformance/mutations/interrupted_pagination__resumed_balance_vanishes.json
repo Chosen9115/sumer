@@ -1,0 +1,14 @@
+{
+  "fixture": "interrupted_pagination",
+  "assertions": [
+    "A1"
+  ],
+  "why": "The resuming process drops its declared balance line entirely and keeps every status. Nothing else about the run changes: the resumed history is intact, the A5 fold bracket is intact, expect.live is intact. This is the mutant that survived while Mode::Truncated was handed to EVERY sequence of an interrupted execution -- an empty slice is a contiguous slice of anything, so a vanished balance read as 'cut short'. Interruption is a pagination event and only history.read is paginated; balances are batched and owed in full by every execution, interrupted or not.",
+  "adapter": null,
+  "patch": [
+    {
+      "path": "/script/runs/2/on/balances.read/0/do/0/body/observations",
+      "value": []
+    }
+  ]
+}

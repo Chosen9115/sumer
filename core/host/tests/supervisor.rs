@@ -16,7 +16,7 @@
 
 use std::time::Duration;
 
-use sumer_host::{AdapterHandle, HostError};
+use sumer_host::{AdapterHandle, HostError, Terminal};
 use sumer_wire::ProtocolViolationKind;
 
 fn py(script: &str) -> Vec<String> {
@@ -780,4 +780,44 @@ async fn a_violation_wins_over_an_immediately_following_exit() {
         ),
         "an established violation must outrank the exit that followed it, got {result:?}"
     );
+}
+
+// ---------------------------------------------------------------------
+// The close boundary: stdin EOF is the END (spec/wire.md §7)
+// ---------------------------------------------------------------------
+
+#[tokio::test]
+async fn an_adapter_that_exits_at_stdin_eof_closes_cleanly() {
+    // `for line in sys.stdin` ends at EOF, so dropping the child's stdin
+    // is enough to end this process. Its exit code is the terminal
+    // reason, and no violation is held against it.
+    let script = format!("{PRELUDE}\nhello_ok(read())\nfor line in sys.stdin:\n    pass\n");
+    let handle = spawn(&script, Duration::from_secs(5))
+        .await
+        .expect("handshake");
+    match handle.close().await {
+        Some(Terminal::Crashed(Some(0))) => {}
+        other => panic!("expected a clean exit at stdin EOF, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn an_adapter_that_ignores_stdin_eof_is_a_protocol_violation() {
+    // The exact mistake spec/wire.md §7 names for Python: at EOF
+    // `readline()` returns `""` forever, and a loop that reads that as
+    // "nothing to read *yet*" never leaves. Nothing this process writes
+    // from here answers a request or reaches a caller, and the host has
+    // no lever left but the kill -- so the connection did not end, and
+    // saying it ended for no known reason would be a lie.
+    let script = format!(
+        "{PRELUDE}\nimport time\nhello_ok(read())\nwhile True:\n    \
+         line = sys.stdin.readline()\n    if not line:\n        time.sleep(0.05)\n        continue\n"
+    );
+    let handle = spawn(&script, Duration::from_millis(500))
+        .await
+        .expect("handshake");
+    match handle.close().await {
+        Some(Terminal::Violation(ProtocolViolationKind::StdinEofIgnored)) => {}
+        other => panic!("expected StdinEofIgnored, got {other:?}"),
+    }
 }

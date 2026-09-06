@@ -91,6 +91,26 @@ pub async fn run_case(argv: &[String], path: &Path) -> CaseOutcome {
     CaseOutcome { case, failures }
 }
 
+/// The request deadline every connection this fixture opens is built with:
+/// `conformance_hints.deadline_ms` when the fixture names one, else the
+/// frozen contract's 30-second default (spec/wire.md §7).
+///
+/// The hint is advisory and non-normative (spec/wire.md §11) -- a runner
+/// may ignore it entirely and stay conformant. This one honours it,
+/// because the scenarios that need it are the ones whose whole point is a
+/// deadline *expiring*: a tombstoned reply that must be discarded, and an
+/// adapter that must be caught not exiting at stdin EOF. Neither is
+/// observable before the deadline passes, and at the default that is 30
+/// seconds of wall clock per execution to learn one bit.
+fn deadline_of(fixture: &Value) -> Duration {
+    Duration::from_millis(
+        fixture
+            .pointer("/conformance_hints/deadline_ms")
+            .and_then(Value::as_u64)
+            .unwrap_or(30_000),
+    )
+}
+
 // ---------------------------------------------------------------------
 // The standard case: two judged executions of the same crawl.
 // ---------------------------------------------------------------------
@@ -103,8 +123,9 @@ pub async fn run_case(argv: &[String], path: &Path) -> CaseOutcome {
 /// agree with each other perfectly and fail their own ledger check.
 async fn case_crawl(argv: &[String], path: &Path, fixture: &Value, failures: &mut Vec<Failure>) {
     let expect = fixture.get("expect").cloned().unwrap_or(Value::Null);
-    let first = run_crawl(argv, path, 0, &expect, Mode::Complete, failures).await;
-    let second = run_crawl(argv, path, 0, &expect, Mode::Complete, failures).await;
+    let deadline = deadline_of(fixture);
+    let first = run_crawl(argv, path, 0, &expect, Mode::Complete, deadline, failures).await;
+    let second = run_crawl(argv, path, 0, &expect, Mode::Complete, deadline, failures).await;
     assert_local_id_purity(&first, &second, failures);
 }
 
@@ -187,6 +208,7 @@ async fn case_interrupted_pagination(
     failures: &mut Vec<Failure>,
 ) {
     let expect = fixture.get("expect").cloned().unwrap_or(Value::Null);
+    let deadline = deadline_of(fixture);
     for family_name in ["exact", "batch_restart"] {
         let Some(family) = expect.pointer(&format!("/families/{family_name}")).cloned() else {
             failures.push(Failure::new(
@@ -195,7 +217,7 @@ async fn case_interrupted_pagination(
             ));
             continue;
         };
-        run_pagination_family(argv, path, family_name, &family, failures).await;
+        run_pagination_family(argv, path, family_name, &family, deadline, failures).await;
     }
 }
 
@@ -227,6 +249,7 @@ async fn run_pagination_family(
     path: &Path,
     family_name: &str,
     family: &Value,
+    deadline: Duration,
     failures: &mut Vec<Failure>,
 ) {
     let Some(resource_id) = family
@@ -257,7 +280,16 @@ async fn run_pagination_family(
 
     // 1. The uninterrupted run: pagination driven purely by the wire's own
     // `next`, no resumption question asked.
-    let full = run_crawl(argv, path, full_idx, family, Mode::Complete, failures).await;
+    let full = run_crawl(
+        argv,
+        path,
+        full_idx,
+        family,
+        Mode::Complete,
+        deadline,
+        failures,
+    )
+    .await;
 
     // 2 + 3. The killed run and the run that resumes it, sharing one
     // `ResumeState` (which decides what to resend) and one `Fold` (which
@@ -273,6 +305,7 @@ async fn run_pagination_family(
             across: &mut across,
             killed: true,
         },
+        deadline,
         failures,
     )
     .await;
@@ -294,6 +327,7 @@ async fn run_pagination_family(
             across: &mut across,
             killed: false,
         },
+        deadline,
         failures,
     )
     .await;
@@ -402,11 +436,7 @@ async fn case_protocol_violations(
     failures: &mut Vec<Failure>,
 ) {
     let expect = fixture.get("expect").cloned().unwrap_or(Value::Null);
-    let deadline_ms = fixture
-        .pointer("/conformance_hints/deadline_ms")
-        .and_then(Value::as_u64)
-        .unwrap_or(30_000);
-    let deadline = Duration::from_millis(deadline_ms);
+    let deadline = deadline_of(fixture);
 
     let Some(runs) = expect.get("runs").and_then(Value::as_array).cloned() else {
         failures.push(Failure::new(

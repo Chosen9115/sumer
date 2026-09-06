@@ -1,5 +1,8 @@
 {
   "case": "pending_to_posted",
+  "conformance_hints": {
+    "deadline_ms": 3000
+  },
   "script": {
     "runs": [
       {

@@ -186,6 +186,11 @@ impl Ledger {
 /// Every [`Mode::Truncated`](crate::exec::Mode) in this crate is written
 /// down at a call site in `case_interrupted_pagination`, where the runner
 /// -- not the fixture -- knows the execution was cut short.
+///
+/// **And it is per SEQUENCE, not per execution.** `crate::exec` picks it
+/// per `(resource, kind)`: `history` -- the only paginated sequence -- can
+/// be truncated, `balances` never is. An interrupted execution is not a
+/// blanket licence to emit less of everything.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Completeness {
     /// The emitted sequence must EQUAL the declared sequence.
@@ -197,6 +202,11 @@ pub enum Completeness {
     /// This relaxes exactly one half of the assertion -- "everything
     /// declared was emitted". Content mismatch, orphans (more emitted than
     /// declared), and omitted-never-appears stay fully armed.
+    ///
+    /// The empty slice is a legal slice of anything, so this mode cannot
+    /// tell a run that emitted nothing from one that was cut short at zero.
+    /// That is the price of the relaxation, and the reason it is handed
+    /// only to the one sequence an interruption can genuinely cut short.
     Truncated,
 }
 

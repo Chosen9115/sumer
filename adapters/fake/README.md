@@ -35,6 +35,15 @@ JSON object per line on stdout. Nothing else ever reaches stdout, except
 in the one fixture (`protocol_violations.json`, run 0) that deliberately
 violates that rule to test `ProtocolViolation::PreHelloOutput`.
 
+Close stdin (Ctrl-D, or the end of the pipe) and it exits. That is
+`spec/wire.md` §7's rule — an adapter MUST exit when its stdin reaches EOF
+— and the read loop gets it for free: `for line in sys.stdin` ends at EOF,
+`main()` returns, the process is gone. It is deliberately *not* written as
+`while True:` around `sys.stdin.readline()`, which is the shape that spins
+forever on the empty string EOF returns. The mutation battery breaks
+exactly that (`mutations/adapters/stays_alive_after_stdin_eof.py`) and
+requires the host to report `ProtocolViolation::StdinEofIgnored`.
+
 ## The fixture schema
 
 ```jsonc
@@ -212,18 +221,25 @@ runner MUST iterate every index in `runs[]`, not just the default.
 
 ## `conformance_hints` (advisory, non-normative)
 
-`protocol_violations.json` is the only fixture with a top-level
-`conformance_hints` key. It names `deadline_ms: 300` because its
-`survivable_then_kill` run sleeps 600ms on one request specifically to
-force a host-side timeout before replying anyway (testing that a
-tombstoned reply is discarded, not that the adapter is killed for being
-slow). The frozen contract's default request deadline is 30 seconds
-(`spec/wire.md`, Constants) and defines **no mechanism** for a fixture to
-ask the runner to shorten it for a test. `conformance_hints` is not wire
-protocol, not consumed by the adapter, and the runner is free to ignore
-it — in which case this one scenario needs a real 30-second-plus sleep to
-stay honest, which is impractical for a fast suite. Flagging this as a gap
-worth closing in the actual runner design, not solving it unilaterally.
+Two fixtures carry a top-level `conformance_hints` key, and both do it for
+the same reason: their scenario is only observable once a deadline has
+*expired*, and at the 30-second default (`spec/wire.md` §7) that is 30 real
+seconds of wall clock per execution.
+
+* `protocol_violations.json` names `deadline_ms: 2000`. Its
+  `survivable_then_kill` run `defer`s a request and answers it later, from
+  another rule — so the host's deadline is certain to expire first, and the
+  discard of that late reply is what the run tests (not the adapter being
+  killed for being slow).
+* `pending_to_posted.json` names `deadline_ms: 3000`, because one mutant of
+  it refuses to exit at stdin EOF and "has not exited" is only knowable
+  after the deadline. The honest adapter never comes near it: it answers in
+  milliseconds and exits the moment stdin closes.
+
+`conformance_hints` is not wire protocol, is never sent to or read by the
+adapter, and a runner is free to ignore it entirely and stay conformant
+(`spec/wire.md` §11) — it would just pay the full default deadline for
+these two.
 
 ## Wire shapes
 

@@ -25,8 +25,8 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
-pub use mux::Exchange;
 use mux::Mux;
+pub use mux::{Exchange, Terminal};
 use sumer_wire::{
     Balance, Degraded, ErrorBody, HelloParams, HelloReply, Observation, ProtocolViolationKind,
     ReadOutcome, Reply, ResourceQuery, ResourceStatus, Rfc3339, Staleness, WireErrorCode,
@@ -117,6 +117,9 @@ pub struct AdapterHandle {
     /// `None` unless this handle was built with [`AdapterHandle::spawn_recorded`]
     /// (or its `_with_deadline` sibling) -- see [`AdapterHandle::transcript`].
     transcript: Option<Arc<mux::Transcript>>,
+    /// [`process::supervise`]'s task: the one place a terminal reason is
+    /// ever latched. `None` once [`AdapterHandle::close`] has taken it.
+    supervisor: Option<tokio::task::JoinHandle<()>>,
 }
 
 impl Drop for AdapterHandle {
@@ -203,7 +206,7 @@ impl AdapterHandle {
             (Mux::spawn(spawned.stdin, kill_tx.clone()), None)
         };
         let reader = tokio::spawn(mux::read_loop(mux.clone(), spawned.stdout, kill_tx.clone()));
-        tokio::spawn(process::supervise(
+        let supervisor = tokio::spawn(process::supervise(
             spawned.child,
             kill_rx,
             mux.clone(),
@@ -273,6 +276,7 @@ impl AdapterHandle {
             default_deadline,
             kill_tx,
             transcript,
+            supervisor: Some(supervisor),
         })
     }
 
@@ -291,6 +295,54 @@ impl AdapterHandle {
             .as_ref()
             .map(|t| t.snapshot())
             .unwrap_or_default()
+    }
+
+    /// Ends this connection and reports **how it ended**.
+    ///
+    /// Closing the child's stdin (see [`mux::Mux::begin_close`]) makes a
+    /// well-behaved adapter exit; its exit closes stdout; the reader loop
+    /// drains every remaining byte before it sees that EOF; and
+    /// [`process::supervise`] then latches the terminal reason. Awaiting
+    /// that supervisor task is therefore not a guess about timing -- it is
+    /// the point after which no further evidence can arrive on this
+    /// connection.
+    ///
+    /// This is what makes "the adapter answered everything I asked and
+    /// then broke the protocol" observable at all. Without a close there is
+    /// no last moment to look at: the final reply is delivered before the
+    /// reader has even parsed what follows it, so a caller that judges and
+    /// walks away never learns the connection died of a violation.
+    ///
+    /// An adapter that is still running when `default_deadline` expires has
+    /// broken the rule that gives this boundary its meaning -- spec/wire.md
+    /// §7: **an adapter MUST exit when its stdin reaches EOF**. It is
+    /// reported as [`ProtocolViolationKind::StdinEofIgnored`], not as
+    /// `None`: everything such a process writes from here answers no
+    /// request and reaches no caller, so a caller told "it ended, reason
+    /// unknown" would be told the connection ended, which is precisely what
+    /// did not happen. `Drop` (below) kills the process on the way out.
+    ///
+    /// `None` keeps the meaning it always had -- no terminal reason was
+    /// ever latched, i.e. a deliberate non-violation shutdown. A
+    /// cooperative exit is not `None`: it is `Terminal::Crashed(status)`
+    /// carrying the process's own exit code, which this boundary reads as
+    /// an ordinary end rather than a violation.
+    pub async fn close(mut self) -> Option<Terminal> {
+        self.mux.begin_close();
+        if let Some(supervisor) = self.supervisor.take() {
+            if tokio::time::timeout(self.default_deadline, supervisor)
+                .await
+                .is_err()
+            {
+                // `finish` is first-wins, so this can only ever be the
+                // reason when nothing truer was latched: a violation the
+                // reader loop already named, or the exit the supervisor
+                // would have reported, outranks it by having arrived first.
+                self.mux
+                    .finish(Terminal::Violation(ProtocolViolationKind::StdinEofIgnored));
+            }
+        }
+        self.mux.terminal()
     }
 
     /// `resources.list`: no observations, no per-resource status (nothing
