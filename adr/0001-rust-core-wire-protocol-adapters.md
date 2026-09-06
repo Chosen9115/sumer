@@ -135,3 +135,32 @@ defects in the first draft. All three are corrected above.
    dependency-floor**, which are demonstrable, and *not* on a claim that agents
    write better Rust than TypeScript, which is currently unevidenced. The tripwire
    exists to collect that evidence.
+
+## Revision 2 — 2026-09-06, reconciled with founding plan v2
+
+The founding plan was revised (368 lines, replacing the 1967-line draft) and its
+preamble requires that implementation changes reconcile accepted ADRs explicitly
+rather than silently override them. Plan §9 narrows this ADR's scope. Reconciled:
+
+1. **"Rust for everything the core team ships" is withdrawn.** Rust is for the core
+   runtime, policy enforcement, reconciliation, the initial CLI, and reference
+   adapters. Plan §9 explicitly warns against "a permanent rule requiring every UI
+   and tool to use Rust," and permits TypeScript for a future browser interface.
+   That is the operative scope; this ADR's original phrasing was broader than the
+   decision it was making.
+2. **Rust does not make financial logic correct.** Plan §9 states this directly and
+   it supersedes any remaining implication otherwise here. Exact money types,
+   checked arithmetic, validated inputs, and tests of financial invariants are
+   required regardless of language. The compiler is not a substitute for them.
+3. **The security gap is now plan text, not just an ADR caveat.** Plan §6: "Process
+   separation is a crash boundary, not a complete security boundary." Untrusted
+   adapters are gated behind defined and tested OS-level restrictions; until that
+   gate passes, only explicitly trusted adapters may run and the limitation must be
+   visible to the user. This ADR's Revision 1 security note is upgraded from an open
+   requirement to a delivery gate on Milestone 4.
+4. **Adapters never receive wallet private keys, but "no adapter handles a secret"
+   is false.** Plan §6 requires documenting bearer-credential exposure and upstream
+   scopes where a provider forces it, instead of claiming blanket secret isolation.
+
+The core decision — Rust core, adapters as processes over a versioned JSON Lines
+wire, conformance testing black-box processes — stands unchanged.

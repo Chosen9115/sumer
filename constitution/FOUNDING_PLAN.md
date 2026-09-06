@@ -1,1967 +1,368 @@
-# Open Financial System
-## Founding Plan for an Agent-Driven, Community-Built Financial Operating System
+# Sumer
+## Founding plan for an open financial operating system
 
-> **Working thesis:** Your money should not live inside a financial institution's interface. Financial institutions, networks, assets, and financial products should live inside an open system that the user controls.
+Revised: 2026-09-06
 
----
+> Your financial environment should belong to you. Banks, wallets, brokers, payment providers, and applications should connect to it through open interfaces, with authority you can inspect and constrain.
 
-# 0. Purpose
+This document establishes the direction, architecture, and first delivery sequence. It distinguishes commitments for the first implementation from capabilities that must be earned through working software. It does not by itself supersede accepted repository ADRs; implementation changes must reconcile those records explicitly.
 
-This document defines the initial operating model for a global, open-source, agent-driven financial system.
+# 1. Purpose
 
-The goal is not to build another neobank, crypto wallet, brokerage, payment app, or fintech super-app.
+Sumer is an open system for understanding and, eventually, operating financial resources across providers. A user or organization can connect accounts and wallets, inspect their financial position, choose applications, and authorize specific actions without giving one application unrestricted control.
 
-The goal is to build an **open financial operating system**: a common layer through which people, businesses, developers, institutions, networks, and autonomous agents can interact with financial resources across the world.
+The long-term scope includes banks, Bitcoin, other blockchains, stablecoins, brokerages, securities, and regional payment providers. No financial ideology is privileged. Assets and providers retain their technical, legal, custody, and settlement differences.
 
-The system should allow:
+The first product is deliberately small:
 
-- a bank account to coexist with a Bitcoin wallet;
-- USDC on Base to coexist with cash in a traditional bank;
-- Ethereum assets to coexist with government securities;
-- local payment rails such as ACH, SPEI, SEPA, Pix, UPI, or Faster Payments to plug into a common interface;
-- regulated institutions to enforce their own legal and compliance requirements;
-- users to control their own keys, permissions, policies, applications, and providers;
-- developers anywhere in the world to add support for new financial resources without permission from a central company;
-- agents to continuously extend, test, audit, document, and improve the system.
+> Connect a Bitcoin wallet and a bank account, see accurate balances and history together, understand the source and freshness of every observation, and export the complete record.
 
-The project should be designed so that its usefulness increases as more independent contributors, providers, applications, and agents join it.
+The first release is read-only. It should be useful without an agent, a token, a marketplace, a new identity standard, or an execution engine.
 
-The project should not depend on a single company, blockchain, bank, government, custodian, cloud provider, or jurisdiction in order to survive.
+# 2. Principles
 
----
+## 2.1 The user controls the environment
 
-# 1. Manifesto
+The user chooses their client, providers, applications, and permitted actions. Financial data is exportable through documented formats. Optional hosted services must not become hidden dependencies of the core protocol.
 
-## 1.1 The user is the center
+## 2.2 Portability has honest limits
 
-Financial software today is organized around institutions.
+Sumer makes interfaces, software, and user records portable. It does not promise that bank approvals, legal agreements, custody arrangements, account identifiers, or provider eligibility transfer automatically.
 
-A bank gives users a bank interface.  
-A brokerage gives users a brokerage interface.  
-A crypto wallet gives users a crypto interface.  
-A payment application gives users a payment interface.
+Removing an adapter disconnects software. It does not close an account, revoke every upstream credential, or move funds. The client must explain which actions actually occurred.
 
-This architecture is backwards.
+## 2.3 Different assets remain different
 
-The system should instead begin with the user and represent the full financial world around them.
+A dollar deposit, USDC, and a Treasury fund share are distinct instruments. Common valuation does not imply common ownership rights, liquidity, redemption, or settlement behavior.
 
-The primary object is not the bank account.
+## 2.4 Authority is explicit
 
-The primary object is not the wallet.
+Read access is a permission. Execution requires stronger, separately granted authority. Applications and agents receive the minimum capabilities needed, with enforceable limits and revocation.
 
-The primary object is not the blockchain address.
+## 2.5 Sensitive state stays close to the user
 
-The primary object is the **financial identity and financial graph of the user or organization**.
+Local operation is the default. Credentials, account associations, and financial history are sensitive even without private keys. Synchronization and hosted execution are optional deployments with explicit trust boundaries.
 
-Everything else is a resource attached to that graph.
+## 2.6 Open participation is demonstrated
 
----
+The protocol, schemas, conformance tests, and reference implementation are open. A contributor must be able to implement an adapter without permission or dependence on the core team's language choice.
 
-## 1.2 Financial providers should be replaceable
+Choose and publish an explicit open-source license before inviting external contributions. Define ownership of contributions and a minimal security reporting process at the same time.
 
-A provider should be an implementation detail.
+## 2.7 Claims require evidence
 
-A bank, broker, blockchain, custodian, stablecoin issuer, payment rail, exchange, or treasury provider should be able to compete for the user's business without owning the user's entire financial environment.
+An adapter passing conformance tests proves that it follows a contract under those tests. It does not prove the provider is honest, the adapter is uncompromised, or its reported balance is true.
 
-The system should make it progressively easier to replace:
+Every observation carries provenance. Conflicts and uncertainty are represented rather than silently resolved in favor of the newest response.
 
-- banks;
-- payment processors;
-- wallets;
-- custodians;
-- chains;
-- brokers;
-- market makers;
-- KYC providers;
-- FX providers;
-- data providers;
-- treasury products;
-- execution venues.
+## 2.8 Build for continuity
 
-The system should reduce provider lock-in over time.
+Document installation, backup, restore, export, and independent implementation. Users should retain access to their own records if the founding team disappears. Provider availability remains an external dependency that Sumer cannot guarantee.
 
----
+# 3. First user and first proof
 
-## 1.3 No financial ideology should be privileged
+The initial user is an individual who holds Bitcoin and maintains a bank account and wants one reliable view of both. Business ownership, delegated organizational authority, and multi-device autonomous execution are later extensions.
 
-The system is not Bitcoin-only.
+The initial workflow:
 
-It is not Ethereum-first.
+1. Initialize a local profile.
+2. Connect a watch-only Bitcoin resource.
+3. Connect one supported bank data provider with read-only access.
+4. Inspect balances and history, including pending items and revisions.
+5. See stale, unavailable, and conflicting information clearly.
+6. Export the record and restore it into a fresh installation.
 
-It is not stablecoin-first.
+The bank integration must name a concrete provider and supported geography. Before promising delivery, verify its authentication, available scopes, data access, cost, and operating requirements. A CSV import or recorded fixture is useful for development but must be labeled as such; it is not evidence of a live bank connection.
 
-It is not traditional-bank-first.
+Success means the records reconcile against both sources, including failure and revision cases. Merely displaying a portfolio total is insufficient.
 
-It is not DeFi-first.
+# 4. Architecture
 
-It is not anti-bank.
-
-It is not anti-government.
-
-It is not pro-custody or anti-custody.
-
-The system is **pro-choice at the protocol level**.
-
-If a user wants Bitcoin, they should be able to use Bitcoin.
-
-If a user wants USDC on Base, they should be able to use USDC on Base.
-
-If a user wants a traditional bank account, they should be able to connect one.
-
-If a user wants to hold government securities, they should be able to use a provider that offers them.
-
-The architecture should expose differences honestly rather than pretending all financial assets have identical legal, technical, liquidity, custody, or risk properties.
-
----
-
-## 1.4 Open source is structural, not cosmetic
-
-The project is only meaningfully open if:
-
-- the core protocol is open;
-- the reference client is open;
-- the provider interfaces are open;
-- the application interfaces are open;
-- the permission model is open;
-- the governance process is open;
-- the security model is inspectable;
-- alternative clients can exist;
-- alternative providers can exist;
-- independent implementations can exist;
-- users can leave without losing their financial identity or data.
-
-An open-source frontend over a proprietary backend is not enough.
-
----
-
-## 1.5 Regulation belongs at the correct boundary
-
-The system should not pretend that regulation disappears because software is decentralized or open source.
-
-Banks remain responsible for bank regulation.
-
-Brokerages remain responsible for securities regulation.
-
-Custodians remain responsible for custody obligations.
-
-Providers remain responsible for KYC, AML, sanctions, licensing, investor eligibility, and jurisdictional rules where those apply.
-
-The protocol should make these requirements legible and composable.
-
-The core system should not attempt to become the compliance department of the world.
-
----
-
-## 1.6 Users own permissions
-
-Applications and agents should never receive unlimited authority by default.
-
-Every capability should be explicit.
-
-Examples:
-
-- read balance;
-- read transactions;
-- request quote;
-- execute a swap under a certain value;
-- move funds only to approved destinations;
-- rebalance within a policy;
-- withdraw;
-- change permissions;
-- sign transactions;
-- rotate keys.
-
-Permissions should be:
-
-- minimal;
-- inspectable;
-- revocable;
-- time-bounded where useful;
-- value-bounded where useful;
-- asset-bounded where useful;
-- destination-bounded where useful.
-
-The security model should assume that third-party code will occasionally fail or become malicious.
-
----
-
-## 1.7 The system should remain useful if the founding team disappears
-
-A successful protocol should not depend on permanent central leadership.
-
-If the original maintainers vanish:
-
-- user data should still exist;
-- user keys should still work;
-- wallets should still work;
-- providers should still be reachable;
-- adapters should still be forkable;
-- applications should still be forkable;
-- the protocol should still be implementable;
-- the community should still be able to continue development.
-
-The project should be designed for survival beyond its founders.
-
----
-
-## 1.8 Local-first whenever possible
-
-The default architecture should minimize centralized collection of financial data.
-
-Where practical:
-
-- user state lives locally;
-- credentials live locally;
-- permissions live locally;
-- sensitive data is encrypted locally;
-- cloud synchronization is optional;
-- keys are never exposed to applications;
-- adapters request capabilities, not secrets.
-
-Central infrastructure should exist only where required for coordination, indexing, routing, availability, or regulated execution.
-
----
-
-## 1.9 The system should make complexity disappear without hiding reality
-
-Users should not need to understand:
-
-- chain IDs;
-- bridging routes;
-- correspondent banks;
-- payment message formats;
-- RPC providers;
-- settlement windows;
-- smart contract implementations;
-- quote APIs;
-- routing logic.
-
-But the system must remain transparent enough that sophisticated users can inspect:
-
-- execution route;
-- fees;
-- counterparty;
-- settlement risk;
-- custody model;
-- legal wrapper;
-- asset issuer;
-- provider;
-- permissions;
-- source code.
-
-Abstraction should reduce unnecessary complexity, not conceal material risk.
-
----
-
-## 1.10 Build the protocol so the world can extend it
-
-The project's long-term success should be measured by how much useful functionality is created by people who never needed approval from the core maintainers.
-
-A healthy system allows a developer in:
-
-- Brazil to build Pix;
-- Mexico to build SPEI;
-- India to build UPI;
-- Europe to build SEPA modules;
-- Nigeria to integrate local rails;
-- Argentina to build local FX access;
-- any jurisdiction to expose compatible banks, brokers, wallets, or regulated products.
-
-The system should evolve through contribution rather than central planning.
-
----
-
-# 2. Proposed Architecture
-
-## 2.1 System model
-
-The proposed system is composed of three major layers:
-
-1. **Protocol**
-2. **Reference client**
-3. **Ecosystem**
-
-The protocol defines what things are.
-
-The client makes them usable.
-
-The ecosystem makes them abundant.
-
----
-
-## 2.2 Core system diagram
+Start with one local core process, a CLI, a local database, and supervised adapter processes. Avoid a distributed service architecture until a demonstrated deployment need requires it.
 
 ```text
-                          USER / ORGANIZATION
-                                  │
-                                  ▼
-                        Financial Identity
-                                  │
-                                  ▼
-                         Financial Graph
-                                  │
-                  ┌───────────────┼────────────────┐
-                  │               │                │
-                  ▼               ▼                ▼
-             Applications     Intent Engine    Policy Engine
-                  │               │                │
-                  └───────────────┼────────────────┘
-                                  │
-                                  ▼
-                           Resource Layer
-                                  │
-       ┌────────────┬─────────────┼────────────┬─────────────┐
-       │            │             │            │             │
-       ▼            ▼             ▼            ▼             ▼
-    Bitcoin       EVM/Base      Banks       Brokers      Securities
-       │            │             │            │             │
-       ▼            ▼             ▼            ▼             ▼
- Lightning       USDC/ETH       ACH/SEPA      APIs        Treasuries
-                                SPEI/Pix
+User / CLI / future application
+              |
+       Versioned core API
+              |
+      Trusted local runtime
+      |       |          |
+  Resource  Observation   Adapter supervisor
+  catalog   store        and restricted transport
+              |                    |
+        Derived graph       Provider adapters
+                                   |
+                            External providers
+
+Later, before execution:
+Intent -> validated plan -> policy and reservation -> approval
+       -> restricted executor / signer -> operation journal
+       -> provider observations -> reconciliation
 ```
 
----
+The financial graph is a derived view of resources, ownership associations, balances, and events. It is not a requirement for a graph database and does not establish legal ownership by itself.
 
-## 2.3 Financial Identity
+Use a relational local store initially. Keep durable observations and revisions sufficient to explain the current view. Add tables and relationships for demonstrated needs rather than designing a universal ontology in advance.
 
-The identity layer answers:
+# 5. Minimum financial model
 
-- Who is the user?
-- Which devices can act for the user?
-- Which wallets belong to the user?
-- Which legal identities are associated with the user?
-- Which organizations can the user represent?
-- Which credentials has the user received?
-- Which providers have approved the user?
-- Which permissions has the user granted?
+## 5.1 Resources and capabilities
 
-Identity may include:
+A resource identifies a provider-backed account, wallet, or other financial object. Its record includes a stable local identifier, provider identifier, resource kind, relevant ownership association, and supported capability versions.
 
-- passkeys;
-- device keys;
-- recovery methods;
-- wallet addresses;
-- legal identity attestations;
-- business identity attestations;
-- KYC evidence;
-- jurisdiction;
-- provider-specific approvals;
-- reusable credentials.
+The first capability set is:
 
-The identity layer must distinguish between:
-
-- user-owned identity;
-- provider-issued approval;
-- third-party credentials;
-- legal eligibility.
-
----
-
-## 2.4 Financial Graph
-
-The financial graph is the core abstraction.
-
-It represents every financial resource attached to a user or organization.
-
-Example:
-
-```text
-User
-├── Bank Account
-│   ├── USD
-│   ├── ACH
-│   └── Wire
-├── Bitcoin Wallet
-│   ├── BTC
-│   └── Lightning
-├── Base Wallet
-│   ├── ETH
-│   └── USDC
-├── Brokerage Account
-│   ├── Cash
-│   ├── ETFs
-│   └── Treasuries
-└── Treasury Provider
-    └── Government Securities
-```
-
-The graph must support:
-
-- multiple owners;
-- organizations;
-- permissions;
-- account relationships;
-- delegated authority;
-- read-only connections;
-- custodial resources;
-- self-custodied resources;
-- regulated products;
-- programmable resources.
-
----
-
-## 2.5 Resource Model
-
-Every financial resource implements a common capability model.
-
-A conceptual interface:
-
-```ts
-interface FinancialResource {
-  identify(): ResourceIdentity
-  balances(): Balance[]
-  assets(): Asset[]
-  capabilities(): Capability[]
-  history(query): Transaction[]
-  quote(intent): Quote[]
-  execute(intent, authorization): ExecutionResult
-}
-```
-
-No resource is required to implement every capability.
-
-Example capabilities:
-
-```text
-READ_BALANCE
-READ_HISTORY
-RECEIVE
-SEND
-EXCHANGE
-BUY
-SELL
-SUBSCRIBE
-REDEEM
-BORROW
-REPAY
-SIGN
-STAKE
-VOTE
-WITHDRAW
-DEPOSIT
-```
-
-This enables heterogeneous financial systems to participate without pretending they are identical.
-
----
-
-## 2.6 Asset Model
-
-The system must distinguish:
-
-- currencies;
-- cryptocurrencies;
-- stablecoins;
-- securities;
-- tokenized securities;
-- deposits;
-- claims;
-- commodities;
-- fund shares;
-- debt instruments;
-- synthetic assets.
-
-Each asset should contain metadata such as:
-
-```text
-asset_id
-issuer
-network
-currency
-legal_type
-custody_model
-settlement_model
-transferability
-jurisdiction
-risk_metadata
-pricing_sources
-```
-
-The system should never assume that two assets with the same displayed currency are legally equivalent.
-
-For example:
-
-```text
-USD bank deposit
-USDC
-USDT
-tokenized Treasury fund share
-money market fund share
-physical USD cash
-```
-
-may all approximate one dollar economically while having different risks and legal structures.
-
----
-
-## 2.7 Provider Adapters
-
-Providers connect the protocol to real-world systems.
-
-Examples:
-
-```text
-bitcoin-core-adapter
-lightning-adapter
-ethereum-adapter
-base-adapter
-solana-adapter
-plaid-adapter
-open-banking-adapter
-interactive-brokers-adapter
-spei-adapter
-pix-adapter
-sepa-adapter
-treasury-provider-adapter
-```
-
-A provider adapter should declare:
-
-- resources exposed;
-- capabilities;
-- authentication method;
-- custody model;
-- jurisdiction;
-- compliance requirements;
-- permission requirements;
-- limits;
-- execution semantics;
-- settlement semantics;
-- fees;
-- failure modes.
-
----
-
-## 2.8 Application Layer
-
-Applications consume financial resources.
-
-Applications should not need to know the internal implementation details of every provider.
-
-Examples:
-
-- payments;
-- portfolio;
-- payroll;
-- recurring purchases;
-- accounting;
-- FX optimization;
-- treasury management;
-- savings;
-- subscriptions;
-- tax estimation;
-- invoice payments;
-- business expenses;
-- charitable giving.
-
-Applications interact through capabilities.
-
----
-
-## 2.9 Intent Engine
-
-The intent engine translates user goals into execution plans.
-
-Example:
-
-```text
-Intent:
-Send Alice $1,000 USD
-
-Possible routes:
-1. Bank → ACH
-2. USDC Base → Base wallet
-3. USDC Ethereum → bridge → Base
-4. Bitcoin → Lightning
-5. Wise → bank transfer
-```
-
-The engine evaluates routes against policy:
-
-```text
-cost
-speed
-counterparty risk
-settlement certainty
-network risk
-liquidity
-user preference
-tax implications
-jurisdiction
-privacy
-limits
-```
-
-The intent engine may be:
-
-- deterministic;
-- rules-based;
-- agent-assisted;
-- market-based;
-- solver-based.
-
-Execution must remain constrained by permissions.
-
----
-
-## 2.10 Policy Engine
-
-The policy engine defines what applications and agents are allowed to do.
-
-Example:
-
-```text
-Treasury Agent
-
-May:
+- discover resources;
 - read balances;
-- read Treasury quotes;
-- rebalance up to $5,000/day;
-- use only approved providers;
-- maintain at least $20,000 liquid.
+- read history;
+- report connection status and data freshness.
 
-May not:
-- send funds to third parties;
-- change security settings;
-- export keys;
-- use leverage;
-- buy unapproved assets.
-```
+Capabilities have separate request and response schemas. Unsupported operations return an explicit unsupported result. Do not freeze a universal `execute()` method before real execution semantics have been tested against unrelated providers.
 
-Policy should be machine-readable.
+## 5.2 Money and assets
 
----
+Every amount has an exact coefficient and scale, or an equivalently exact representation defined by the schema. Wire amounts use validated decimal strings, never JSON floating-point numbers. Define bounds, rounding rules, and checked arithmetic explicitly.
 
-## 2.11 Permission Model
+An amount always references a canonical asset identifier. Display symbols are labels, not identifiers. Network and contract identifiers distinguish on-chain assets; provider and account context distinguish claims where needed.
 
-Permissions should be capability-based.
+Separate:
 
-Possible dimensions:
+- the instrument's identity and issuer;
+- the position's custody and account relationship;
+- the observed amount;
+- the price used for valuation.
 
-```text
-action
-asset
-resource
-amount
-destination
-frequency
-time period
-provider
-jurisdiction
-application
-agent
-```
+Valuation records include source, quote currency, observation time, and freshness. An estimated portfolio value never silently becomes an executable balance.
 
-Example permission:
+## 5.3 Balances
 
-```json
-{
-  "action": "TRANSFER",
-  "asset": "USDC",
-  "network": "BASE",
-  "max_amount": "500",
-  "period": "DAY",
-  "destinations": ["alice.eth", "vendor_allowlist"],
-  "expires": "2027-01-01"
-}
-```
+Represent provider-reported categories such as available, pending, held, and total only where their meanings are known. Do not assume every provider exposes the same categories or that they always sum identically.
 
----
+Each observation includes provider, resource, source reference where available, observation time, effective time where known, and freshness or completeness information.
 
-## 2.12 Registry Layer
+Unknown is distinct from zero. A failed refresh does not erase the last observation; it marks the displayed state stale or unavailable.
 
-The ecosystem requires registries for discovery.
+## 5.4 History
 
-Possible registries:
+Preserve stable source identifiers, revisions, pagination cursors, and provider status. Pending transactions may change identity or amount when posted; events can arrive late, repeat, or disappear after a correction.
 
-- provider adapters;
-- applications;
-- agents;
-- asset metadata;
-- identity providers;
-- security audits;
-- trust attestations;
-- schemas;
-- intent solvers.
+Preserve the evidence needed to explain revisions without retaining unnecessary sensitive payloads. Define deduplication and cursor resumption in the contract.
 
-The registry should distinguish:
+## 5.5 Reconciliation
 
-```text
-exists
-maintained
-verified
-audited
-recommended
-deprecated
-unsafe
-```
+Record discrepancies between local expectations and provider observations. Define authority per field and provider rather than declaring one universal source of truth.
 
-No single registry should be mandatory forever.
+Reconciliation may produce confirmed, unresolved, or disputed results. An unresolved discrepancy affecting spending must block dependent automatic execution until policy or a human resolves it.
 
----
+# 6. Adapter contract and isolation
 
-## 2.13 Governance
+Adapters are processes communicating over a versioned wire protocol. The initial transport is JSON Lines over standard input/output. One process serves each configured adapter and multiplexes requests; do not create a process for every transaction.
 
-Governance should apply to:
+The wire contract specifies:
 
-- protocol specifications;
-- naming;
-- compatibility rules;
-- module registry standards;
-- security requirements;
-- reference implementations;
-- grant allocation;
-- documentation;
-- upgrade processes.
+- version negotiation and supported capabilities;
+- correlation IDs and structured errors;
+- maximum frame sizes and bounded queues;
+- timeouts, cancellation semantics, and backpressure;
+- logging on stderr, with secret redaction;
+- pagination and, when implemented, subscription cursors and resumption;
+- exact financial values and validation at both boundaries.
 
-Governance should not directly control:
+A Rust implementation and a small non-Rust test adapter must pass the same suite.
 
-- user money;
-- provider compliance decisions;
-- lending decisions;
-- KYC approvals;
-- securities eligibility;
-- private keys.
+Process separation is a crash boundary, not a complete security boundary. Before running untrusted adapters, define and test operating-system restrictions for filesystem access, process inspection, inherited environment, credentials, and network destinations. Until that gate passes, only explicitly trusted adapters may run, and the limitation must be visible.
 
----
+Adapters receive scoped access through the host's credential mechanism where feasible. Some providers require an adapter to hold a bearer credential; document that exposure and its upstream scopes rather than claiming that no adapter ever handles a secret.
 
-# 3. Iterative Growing Pieces
+Adapters never receive wallet private keys. Execution adapters must not have authority that bypasses the policy boundary. If a provider credential inherently grants broader authority, either constrain it upstream, contain access behind a trusted broker, or explicitly reject that integration for unattended execution.
 
-The project should grow by proving one abstraction at a time.
+Signed releases and pinned dependencies improve provenance. Neither establishes that code is safe. Adapter installation and updates are explicit trust decisions.
 
----
+# 7. Execution: requirements before implementation
 
-## Phase 0 — Constitution and Protocol Skeleton
+Execution is a later milestone. The following requirements establish its entry gate, not a mandate to build the engine during the read-only phase.
 
-Goal:
+## 7.1 Intents describe acceptable outcomes
 
-> Make the idea precise enough that multiple independent developers can reason about the same system.
+A payment intent specifies recipient, accepted instruments and destinations, required net receipt, deadline, allowed conversion exposure, and fee limits.
 
-Build:
+“Send Alice USD 100” is incomplete if Alice's accepted delivery methods are unknown. ACH, USDC, and Lightning are candidate routes only when they satisfy the actual recipient requirements.
 
-- manifesto;
-- terminology;
-- resource specification;
-- asset specification;
-- capability specification;
-- provider interface;
-- permission model;
-- initial architecture decision records;
-- threat model;
-- contribution model.
+Resolve mutable destination names before approval. Bind approval to the resolved destination, asset, amount, fees or fee bound, route, and expiry. A changed plan requires fresh authorization.
 
-Success condition:
+## 7.2 Operations have durable identities
 
-Two developers independently implement compatible toy adapters.
+Persist an operation identity and its authorized plan before external submission. Track provider references and evidence as they arrive.
 
----
+Distinguish at least prepared, authorized, submitting, accepted, rejected, and outcome-unknown conditions. Model settlement progress and later returns or reversals separately using typed provider semantics. One universal terminal `success` cannot honestly describe every rail.
 
-## Phase 1 — Read-Only Financial Graph
+A timeout or adapter crash does not prove failure. Before retrying, perform durable operation lookup or provider reconciliation. If the outcome cannot be established, preserve uncertainty and block an automatic duplicate.
 
-Goal:
+Do not promise exactly-once external execution across providers that cannot support it.
 
-> Demonstrate that multiple financial worlds can appear inside one system.
+## 7.3 Policy precedes submission
 
-Initial resources:
+Every action passes deterministic authorization independent of any language model. Grants identify principal, action, resource, asset, destination, amount bounds, duration, and relevant policy version.
 
-- Bitcoin wallet;
-- EVM wallet;
-- Base wallet;
-- bank connection;
-- one investment or Treasury source.
+Limits reserve capacity atomically before concurrent requests can spend it. Define how reservations are consumed, released, or held for unknown outcomes. Recheck relevant authorization immediately before submission.
 
-Features:
+Revocation prevents future authorized submissions; it cannot recall a transaction already accepted externally. The UI and audit record must expose that boundary.
 
-- connect resource;
-- detect balances;
-- normalize assets;
-- show transaction history;
-- show aggregate portfolio;
-- local encrypted state.
+For the first executable release, one local authority owns grants and spending reservations. Multi-device and offline execution require a separate consistency design.
 
-Success condition:
+## 7.4 Approval and signing are trusted operations
 
-A user can see traditional and decentralized assets in one coherent interface.
+The signer validates the exact authorized payload and rejects mismatches. The approval display comes from trusted structured data, not adapter-supplied prose alone.
 
----
+Applications and agents may propose actions. They cannot modify policy, replace an approved destination, or invoke a signer through an alternate path.
 
-## Phase 2 — Provider SDK
+## 7.5 Recovery is specific to the route
 
-Goal:
+Define fees, cancellation windows, partial execution, return behavior, and required human intervention for each supported route. Multi-step routes can leave intermediate assets or exposures.
 
-> Make extension possible without modifying core code.
+A compensating transaction is a new authorized action with its own costs and risks. Do not call it rollback when the original action cannot be undone.
 
-Build:
+# 8. Local data, identity, and deployment
 
-- provider SDK;
-- adapter lifecycle;
-- capability declarations;
-- test harness;
-- local sandbox;
-- example adapter;
-- provider documentation;
-- compatibility test suite.
+Start with a local profile and device authentication. Store only identity information necessary for the current provider connections. Keep provider-issued approval separate from user-controlled identifiers.
 
-Success condition:
+Do not build portable KYC credentials or a global identity graph for the first release. Combining financial relationships in one profile creates sensitive information; minimize disclosure and cross-provider correlation.
 
-A contributor outside the founding team builds a working provider adapter.
+Specify encryption key storage, locked-state behavior, backup encryption, recovery, and deletion. Encryption at rest protects stored data under a defined threat model; it does not protect an unlocked process from a compromised host.
 
-This is the first major proof of openness.
+Test export and restore, including schema migration. Restoring data does not automatically restore external grants or credentials. The client must identify connections requiring reauthorization.
 
----
+Hosted synchronization, always-on agents, and routing services each need a separate deployment design naming the operator, data held, authority exercised, and outage behavior. Provider obligations alone do not establish the operator's legal position. Review the concrete service and jurisdiction before offering execution there.
 
-## Phase 3 — Send Intent
+# 9. Language and storage decisions
 
-Goal:
+Use Rust for the core runtime, policy enforcement, reconciliation, initial CLI, and reference adapters. Its type system supports explicit operation states and financial types, while ownership helps constrain memory and concurrency errors.
 
-> Prove the system can execute across heterogeneous providers.
+Rust does not make arithmetic or financial logic correct automatically. Use checked operations, exact money types, validated inputs, and tests of financial invariants.
 
-Build:
+Third-party adapters may use any language. Compatibility belongs to the wire contract and conformance suite.
 
-- recipient abstraction;
-- send intent;
-- quote interface;
-- route comparison;
-- approval screen;
-- transaction execution;
-- confirmation;
-- failure handling.
+A future browser interface may use TypeScript. TypeScript can represent money exactly when designed appropriately; static types do not replace runtime validation. Avoid a permanent rule requiring every UI and tool to use Rust.
 
-Success condition:
+Start with SQLite for local structured records. Database choice does not supply encryption automatically: select and test the encryption and key-management approach explicitly before the encrypted-state milestone is considered complete. Introduce a server database only when a hosted deployment has an established need.
 
-One intent can be executed through at least two unrelated financial systems.
+Keep the language decision reviewable. Track delivery friction, correctness failures, and external adapter participation. Reconcile any change with existing ADRs and their recorded revisit criteria.
 
-Example:
+# 10. Delivery sequence
+
+## Milestone 0 — Executable read-only contract
+
+Deliver a minimal schema, Rust host, fake adapter in another language, and conformance suite. Fixtures come from Bitcoin and a selected bank data source and include exact large amounts, pending-to-posted revisions, stale balances, duplicate events, and interrupted pagination.
+
+Choose a candidate bank provider now so the contract reflects real constraints. Keep fixtures sanitized and distributable.
+
+Exit: both implementations agree on meaning and error behavior, not merely field names. No execution interface is declared stable.
+
+## Milestone 1 — Bitcoin vertical slice
+
+Connect a watch-only wallet; discover resources; ingest balances and history; persist observations; display them in the CLI; export them.
+
+Exit: results reconcile with the source, restart and refresh preserve correctness, and unavailable data is never rendered as zero. Document the address or extended-public-key privacy exposure to the selected data backend.
+
+## Milestone 2 — Bank vertical slice
+
+Implement one live read-only provider connection. Handle authentication expiry, rate limits, pending and revised records, partial history, and outages.
+
+Exit: one user can inspect bank and Bitcoin records together with provenance and freshness. If live access is unavailable, retain the fixture-based work but report the milestone blocked on provider access; another chain is not a substitute for this proof.
+
+## Milestone 3 — Useful local product and independent extension
+
+Finish encrypted local state, locked-state behavior, export, restore, and migration. Document the adapter contract and contributor workflow. Invite an independent developer to add an adapter; EVM/Base is a useful candidate for testing token identity and precision.
+
+Exit: the initial user can use the product routinely, restore into a fresh installation, and connect an external adapter without modifying core code. A core-team fake adapter proves language independence; an outside contributor proves developer usability.
+
+## Milestone 4 — Authorization and operation semantics
+
+Implement grants, restrictions, durable operation records, reservations, exact-plan approval, signer separation, and the required isolation boundary. Model two unrelated execution providers using sandboxes or controlled fixtures.
+
+Exit: adversarial tests demonstrate rejection of revoked authority, changed destinations, concurrent overspending, stale data, duplicate submission, and malicious signing requests. Crash-after-acceptance leaves a recoverable or explicitly unknown outcome.
+
+No live money movement is part of passing this milestone.
+
+## Milestone 5 — One approved send, then a second rail
+
+Enable one narrowly scoped live payment workflow only after its provider integration, operational responsibilities, and security review are complete. Require human approval and explicit limits. Add a second unrelated rail and revise the abstraction where their semantics differ.
+
+Exit: both routes satisfy a fully specified recipient outcome and reconcile correctly through acceptance, settlement, and any supported return behavior. Do not add bridging or solver competition to manufacture route diversity.
+
+## Milestone 6 — Constrained unattended operation
+
+Allow one useful automated workflow using the same authorization and execution APIs. Introduce an agent only where it improves that workflow.
+
+Exit: the agent can propose and execute within granted limits but cannot change those limits, bypass approval thresholds, or conceal uncertainty. Test prompt injection through provider descriptions, transaction memos, and tool results.
+
+# 11. Development method
+
+Each change starts with a concrete user behavior or observed failure. State the affected boundary, important invariants, and acceptance evidence. Build one working slice, then refine the contract from what it revealed.
+
+Keep ADRs for consequential choices. Use RFCs for changes that need cross-implementation agreement; routine fixes do not require a committee.
+
+Maintain three distinct kinds of evidence:
+
+- conformance: implementations follow the protocol;
+- security: authority and isolation boundaries resist abuse;
+- reconciliation: financial observations and operations match available external evidence.
+
+Use property tests and fuzzing for parsing, exact arithmetic, state transitions, and permissions. Use restart and replay tests where persistence affects correctness. Test denied and ambiguous paths, not just successful calls.
+
+A failure should leave the smallest durable artifact that prevents recurrence: a regression case, corrected invariant, migration check, or concise decision record. Avoid accumulating rules that cannot be enforced or explained.
+
+# 12. Agents and maintainers
+
+Agents assist with implementation, tests, investigation, and documentation. Roles are assigned when a task benefits from them; nine permanent agent services are not an architectural prerequisite.
+
+Keep build-time development agents separate from runtime financial agents. Neither receives production secrets by default. Runtime agents remain untrusted callers of the same constrained interfaces available to applications.
+
+Sensitive changes require review independent of their author and meaningful verification. Agreement between models does not establish safety. Human maintainers remain accountable for releases, security response, and consequential decisions.
+
+Project specifications, executable contracts, and accepted ADRs belong in the repository so contributors can reproduce decisions. Sumer's session continuity, review outcomes, and durable project state are recorded through the Metis CLI under `projects/sumer` and its sub-slugs. Never write directly to the memory database.
+
+# 13. Minimal repository
 
 ```text
-Send $100
-→ ACH
-→ USDC on Base
+sumer/
+  README.md
+  LICENSE
+  CONTRIBUTING.md
+  SECURITY.md
+  constitution/FOUNDING_PLAN.md
+  spec/                 # Implemented or actively tested contracts
+  adr/                  # Consequential decisions
+  core/                 # Local runtime and persistence
+  cli/                  # First reference client
+  adapters/             # Reference provider integrations
+  conformance/          # Language-independent fixtures and expectations
+  tests/                # Integration, recovery, and adversarial cases
+  docs/                 # Setup, export, recovery, contributor guide
 ```
 
----
+Add applications, registries, solvers, and hosted services when the corresponding work begins. Empty directories do not prove an architecture.
 
-## Phase 4 — Permission System
+# 14. Later expansion
 
-Goal:
+After the initial contracts survive real use, Sumer can add business permissions, payment applications, treasury workflows, regional providers, optional synchronization, portable credentials, independent clients, and competing routing services.
 
-> Make third-party applications and agents safe enough to exist.
+Each extension must identify a real user, a concrete provider or implementation, a trust boundary, and evidence that the existing abstraction is sufficient or needs revision.
 
-Build:
+Regional rails require accessible provider relationships and operational support; geography cannot be reduced to code alone. Adapter maintenance, provider access charges, security review, and incident response need named owners and a sustainable funding model before promising broad coverage.
 
-- capability grants;
-- scoped permissions;
-- revocation;
-- transaction limits;
-- destination allowlists;
-- expiration;
-- human approval;
-- audit log;
-- simulation.
+Registries and governance should grow around actual independent contributors. An open specification and an export path remain required even if the project offers paid hosting or support.
 
-Success condition:
+# 15. Standard for progress
 
-An external application can perform useful actions without receiving unrestricted access.
+Measure progress by what users and independent developers can safely do:
 
----
+- Can a user understand and restore their financial record?
+- Can two unrelated providers fit without hiding material differences?
+- Can a third party implement the contract in another language?
+- Can stale or malicious information be contained?
+- Can a crash leave an operation uncertain without causing a duplicate payment?
+- Can an application do useful work without unrestricted authority?
+- Can another team continue the software without the founders?
 
-## Phase 5 — Application SDK
-
-Goal:
-
-> Move from provider extensibility to application extensibility.
-
-Build:
-
-- application SDK;
-- financial graph query API;
-- intent API;
-- permission request API;
-- UI extension model;
-- local application sandbox.
-
-Example applications:
-
-- recurring BTC purchase;
-- savings sweeps;
-- treasury optimizer;
-- subscription manager;
-- expense categorizer.
-
-Success condition:
-
-An independent developer builds an application that works across multiple providers.
-
----
-
-## Phase 6 — Agent Runtime
-
-Goal:
-
-> Allow autonomous software to operate within user-defined financial policies.
-
-Build:
-
-- agent identity;
-- agent permissions;
-- policy enforcement;
-- planning;
-- execution simulation;
-- approval thresholds;
-- audit trail;
-- rollback or compensating actions where possible.
-
-Success condition:
-
-An agent can perform a constrained financial workflow safely without arbitrary access.
-
----
-
-## Phase 7 — Global Rail Expansion
-
-Goal:
-
-> Turn geography into adapters.
-
-Community additions:
-
-```text
-ACH
-RTP
-FedNow
-SPEI
-Pix
-SEPA
-Faster Payments
-UPI
-Interac
-Lightning
-Solana
-local brokerages
-regional wallets
-```
-
-Success condition:
-
-Multiple regional communities maintain their own integrations.
-
----
-
-## Phase 8 — Solver and Routing Ecosystem
-
-Goal:
-
-> Allow providers to compete to satisfy financial intents.
-
-Build:
-
-- quote protocol;
-- route scoring;
-- solver interface;
-- execution guarantees;
-- slippage rules;
-- settlement verification;
-- reputation;
-- failure penalties.
-
-Success condition:
-
-Multiple independent solvers compete to execute the same intent.
-
----
-
-## Phase 9 — Portable Identity and Credentials
-
-Goal:
-
-> Reduce duplicated onboarding while respecting provider-specific regulatory obligations.
-
-Build:
-
-- credential storage;
-- reusable attestations;
-- identity proofs;
-- provider approval records;
-- selective disclosure;
-- consent.
-
-Success condition:
-
-A user can reuse identity evidence across multiple integrations without centralized identity ownership.
-
----
-
-## Phase 10 — Independent Clients
-
-Goal:
-
-> Prove the protocol is larger than the reference implementation.
-
-Success condition:
-
-At least one major independent client can use the same providers, applications, identities, and financial graph.
-
-At that point the project has become a protocol ecosystem rather than a product.
-
----
-
-# 4. Systematic Building Approach
-
-## 4.1 Build contracts before features
-
-Every new capability should begin with:
-
-1. problem statement;
-2. threat model;
-3. protocol interface;
-4. invariants;
-5. compatibility tests;
-6. reference implementation;
-7. documentation;
-8. adversarial tests.
-
-Do not begin with UI.
-
----
-
-## 4.2 Every feature must identify its layer
-
-Every proposal must state whether it changes:
-
-```text
-protocol
-resource
-provider adapter
-application
-intent
-policy
-identity
-registry
-reference client
-agent runtime
-```
-
-This prevents architecture from collapsing into an unstructured codebase.
-
----
-
-## 4.3 Invariants before implementation
-
-Core invariants should include:
-
-### Security
-
-- no application receives private keys;
-- permissions default to denied;
-- execution requires explicit capability;
-- revoked permissions cannot execute;
-- modules cannot silently escalate privileges.
-
-### Portability
-
-- providers can be removed;
-- resources can be exported;
-- clients can be replaced;
-- protocols remain documented independently of implementations.
-
-### Interoperability
-
-- compatibility is testable;
-- implementations must declare supported protocol version;
-- adapters must expose capability metadata.
-
-### Transparency
-
-- fees are visible;
-- provider is visible;
-- route is inspectable;
-- custody model is visible;
-- asset issuer is discoverable.
-
----
-
-## 4.4 Build one vertical slice at a time
-
-A vertical slice means completing a small capability across all necessary layers.
-
-Example:
-
-```text
-Connect Bitcoin
-↓
-Resource discovery
-↓
-Balance normalization
-↓
-Financial graph
-↓
-Client display
-↓
-Tests
-↓
-Docs
-```
-
-Do not build five half-complete layers simultaneously.
-
----
-
-## 4.5 Separate protocol maturity from implementation maturity
-
-A protocol can be:
-
-```text
-experimental
-draft
-candidate
-stable
-deprecated
-```
-
-An implementation can independently be:
-
-```text
-prototype
-alpha
-beta
-production
-unsupported
-```
-
-Do not confuse a working demo with a stable protocol.
-
----
-
-## 4.6 Architecture Decision Records
-
-Major decisions should be recorded permanently.
-
-Each ADR should contain:
-
-```text
-Context
-Decision
-Alternatives considered
-Consequences
-Security implications
-Migration path
-Reversibility
-```
-
-Agents and humans should treat ADRs as part of the project's memory.
-
----
-
-## 4.7 Request for Comment process
-
-Significant protocol changes should use RFCs.
-
-An RFC should contain:
-
-```text
-Summary
-Motivation
-Specification
-Examples
-Security considerations
-Compatibility
-Migration
-Alternatives
-Open questions
-```
-
-Agents may draft RFCs.
-
-Humans and agents may review them.
-
-Protocol changes should never occur through undocumented implementation drift.
-
----
-
-## 4.8 Compatibility test suites are first-class infrastructure
-
-The most valuable artifact in a protocol project is often not the reference implementation.
-
-It is the test suite that tells independent implementations whether they are compatible.
-
-Every interface should eventually have:
-
-- fixtures;
-- conformance tests;
-- adversarial tests;
-- property-based tests;
-- fuzz tests;
-- replay tests.
-
----
-
-# 5. Development Loop and Antifragility
-
-The project should become stronger as it encounters failures.
-
-The development loop should therefore deliberately convert every failure into permanent system knowledge.
-
----
-
-## 5.1 Core loop
-
-```text
-Observe
-  ↓
-Propose
-  ↓
-Model
-  ↓
-Threat-model
-  ↓
-Implement
-  ↓
-Test
-  ↓
-Attack
-  ↓
-Deploy experimentally
-  ↓
-Observe failure
-  ↓
-Encode lesson
-  ↓
-Improve protocol / tests / tooling
-  ↓
-Repeat
-```
-
----
-
-## 5.2 Every failure must leave a scar
-
-When something fails, the response should not stop at fixing the bug.
-
-The system should determine:
-
-1. Why was this failure possible?
-2. Which assumption was wrong?
-3. Which invariant was missing?
-4. Which test would have caught it?
-5. Which monitoring signal would have exposed it sooner?
-6. Which documentation allowed misunderstanding?
-7. Which permission was too broad?
-8. Which dependency was too trusted?
-9. Which protocol ambiguity enabled the failure?
-
-Then add permanent artifacts:
-
-```text
-regression test
-new invariant
-new ADR
-new lint rule
-new security rule
-new fixture
-new monitoring condition
-new documentation
-new compatibility case
-```
-
-A repaired failure should make the same class of failure harder across the entire ecosystem.
-
----
-
-## 5.3 Diversity produces resilience
-
-The system should encourage:
-
-- multiple provider implementations;
-- multiple clients;
-- multiple RPC providers;
-- multiple pricing sources;
-- multiple execution solvers;
-- multiple identity providers;
-- multiple maintainers;
-- multiple jurisdictions.
-
-Redundancy is not waste.
-
-In an open financial system, diversity prevents single points of failure.
-
----
-
-## 5.4 Forkability is a resilience mechanism
-
-The project should remain easy to fork.
-
-This means:
-
-- reproducible builds;
-- clear dependencies;
-- portable configuration;
-- open schemas;
-- migration tools;
-- documented deployment;
-- no secret server dependency in the core protocol.
-
-The credible ability to fork constrains bad governance.
-
----
-
-## 5.5 Progressive decentralization
-
-Do not decentralize prematurely.
-
-Early phases may need strong technical leadership.
-
-Over time, decentralize:
-
-```text
-implementation
-maintenance
-registries
-governance
-testing
-security review
-roadmap
-funding
-regional integrations
-```
-
-Decentralization should follow demonstrated capability.
-
----
-
-## 5.6 Antifragility score
-
-Every major subsystem can be evaluated against questions such as:
-
-```text
-Can one provider failure break it?
-Can one maintainer disappearance break it?
-Can one cloud outage break it?
-Can one jurisdiction break it?
-Can one compromised plugin steal everything?
-Can one bad protocol upgrade corrupt state?
-Can users migrate away?
-Can another team reimplement it?
-Can agents verify it independently?
-```
-
-The goal is not zero failure.
-
-The goal is making failures increasingly local, visible, recoverable, and informative.
-
----
-
-# 6. Agent-Driven Buildout
-
-Agents should not merely write code.
-
-Agents should become structured participants in the project's architecture, testing, governance, security, documentation, and maintenance.
-
-The project should be designed from the beginning as a collaboration between:
-
-- humans;
-- autonomous agents;
-- specialized development agents;
-- security agents;
-- research agents;
-- test agents;
-- documentation agents;
-- governance agents.
-
----
-
-## 6.1 Agent Constitution
-
-Every project agent must inherit the principles defined in:
-
-1. the Manifesto;
-2. the Architecture;
-3. the Iterative Growth Plan;
-4. the Systematic Building Approach;
-5. the Antifragile Development Loop.
-
-Agents must not optimize locally in ways that violate these higher-level constraints.
-
-Decision hierarchy:
-
-```text
-Manifesto
-  ↓
-Protocol invariants
-  ↓
-Architecture
-  ↓
-RFCs / ADRs
-  ↓
-Current milestone
-  ↓
-Issue
-  ↓
-Implementation
-```
-
-When a lower-level instruction conflicts with a higher-level principle, the agent should escalate rather than silently violate the architecture.
-
----
-
-## 6.2 Agent Roles
-
-### Research Agent
-
-Responsibilities:
-
-- monitor new financial infrastructure;
-- track relevant protocols;
-- identify new rails;
-- identify new wallet standards;
-- identify new open banking systems;
-- track regulations;
-- compare provider capabilities;
-- draft research notes;
-- propose RFCs.
-
-Output:
-
-```text
-research/
-```
-
----
-
-### Protocol Architect Agent
-
-Responsibilities:
-
-- maintain protocol coherence;
-- review new interfaces;
-- detect abstraction leaks;
-- review compatibility;
-- propose schemas;
-- maintain ADRs;
-- ensure new features fit the system model.
-
-Output:
-
-```text
-spec/
-adr/
-rfc/
-```
-
----
-
-### Implementation Agent
-
-Responsibilities:
-
-- implement approved specifications;
-- maintain reference code;
-- create adapters;
-- fix defects;
-- improve developer experience.
-
-Output:
-
-```text
-core/
-sdk/
-plugins/
-client/
-```
-
----
-
-### Test Agent
-
-Responsibilities:
-
-- derive tests from protocol invariants;
-- generate compatibility tests;
-- create edge cases;
-- fuzz interfaces;
-- test migration;
-- replay incidents.
-
-Output:
-
-```text
-tests/
-conformance/
-fixtures/
-```
-
----
-
-### Adversarial Security Agent
-
-Responsibilities:
-
-- assume components are malicious;
-- test permission boundaries;
-- search for privilege escalation;
-- test compromised providers;
-- simulate malicious plugins;
-- simulate dependency compromise;
-- attack agent workflows;
-- inspect key-management surfaces.
-
-Output:
-
-```text
-security/
-threat-models/
-incidents/
-```
-
----
-
-### Documentation Agent
-
-Responsibilities:
-
-- keep specifications readable;
-- update documentation from code changes;
-- produce examples;
-- produce contributor guides;
-- create migration notes;
-- detect stale documentation.
-
-Output:
-
-```text
-docs/
-examples/
-```
-
----
-
-### Maintainer Agent
-
-Responsibilities:
-
-- triage issues;
-- detect duplicates;
-- identify abandoned modules;
-- track version drift;
-- suggest dependency upgrades;
-- monitor compatibility failures.
-
----
-
-### Governance Agent
-
-Responsibilities:
-
-- summarize RFC debates;
-- identify unresolved tradeoffs;
-- detect contradictions;
-- maintain proposal status;
-- generate neutral decision summaries;
-- preserve institutional memory.
-
-Agents should not unilaterally decide governance outcomes.
-
----
-
-## 6.3 Agent Issue Loop
-
-Every issue can follow:
-
-```text
-Issue submitted
-    ↓
-Research Agent enriches context
-    ↓
-Architect Agent classifies affected layer
-    ↓
-Security Agent identifies threat implications
-    ↓
-Implementation Agent proposes patch
-    ↓
-Test Agent produces failure cases
-    ↓
-Implementation Agent iterates
-    ↓
-Documentation Agent updates docs
-    ↓
-Independent Review Agent evaluates
-    ↓
-Human/community merge or reject
-```
-
-This loop can become increasingly automated.
-
----
-
-## 6.4 Agents should consume project memory
-
-Agents must read structured project context before acting.
-
-Recommended structure:
-
-```text
-/constitution
-  MANIFESTO.md
-
-/spec
-  RESOURCE.md
-  ASSET.md
-  INTENT.md
-  PERMISSIONS.md
-  IDENTITY.md
-
-/adr
-/rfc
-/security
-/incidents
-/conformance
-/roadmap
-```
-
-This repository is the shared memory of the project.
-
-Agents should not rely on hidden conversational memory for architectural truth.
-
----
-
-## 6.5 Machine-readable project rules
-
-Key principles should also exist in structured form.
-
-Example:
-
-```yaml
-invariants:
-  private_keys_exposed_to_plugins: false
-  permissions_default: deny
-  provider_lock_in: prohibited
-  protocol_requires_reference_client: false
-  alternative_clients_allowed: true
-  user_data_exportable: true
-  provider_specific_logic_in_core: prohibited
-```
-
-Agents can validate pull requests against these invariants.
-
----
-
-## 6.6 Agent-generated RFCs
-
-When an agent identifies a potentially valuable feature, it should not immediately implement it.
-
-It should create:
-
-```text
-RFC
-↓
-problem
-↓
-proposed abstraction
-↓
-compatibility impact
-↓
-security impact
-↓
-alternatives
-↓
-prototype
-```
-
-This keeps agents from turning the codebase into a collection of locally sensible but globally incoherent features.
-
----
-
-## 6.7 Agent swarm model
-
-Larger tasks can be decomposed.
-
-Example: "Add Pix"
-
-```text
-Research Agent
-→ studies Pix
-
-Protocol Agent
-→ maps Pix to existing capabilities
-
-Adapter Agent
-→ builds provider implementation
-
-Security Agent
-→ evaluates authentication and fraud surfaces
-
-Test Agent
-→ creates conformance suite
-
-Documentation Agent
-→ creates integration guide
-
-Review Agent
-→ checks architectural compliance
-```
-
-No single agent needs to own the entire task.
-
----
-
-## 6.8 Agents improve agents
-
-The agent system itself should use the antifragile loop.
-
-When an agent makes a mistake:
-
-```text
-bad code
-bad assumption
-security miss
-incorrect architecture
-stale dependency
-weak test
-```
-
-the system should update:
-
-```text
-agent instructions
-evaluation dataset
-lint rules
-test suites
-project memory
-prompt templates
-review checklists
-```
-
-Agent failures therefore improve future agent behavior.
-
----
-
-## 6.9 Reputation for agents and contributors
-
-Over time, maintain structured reputation around:
-
-- protocol accuracy;
-- security findings;
-- adapter reliability;
-- code quality;
-- review quality;
-- documentation quality;
-- incident response;
-- conformance.
-
-Reputation should inform review requirements, not create permanent authority.
-
----
-
-## 6.10 Human role
-
-Humans remain essential for:
-
-- values;
-- legitimacy;
-- governance;
-- legal judgment;
-- difficult tradeoffs;
-- social trust;
-- resolving ambiguity;
-- assigning responsibility;
-- choosing long-term direction.
-
-Agents expand the project's ability to think, test, build, and maintain.
-
-They should not become an unaccountable governing class.
-
----
-
-# 7. Repository Structure
-
-A possible initial repository:
-
-```text
-open-financial-system/
-│
-├── MANIFESTO.md
-├── ROADMAP.md
-├── CONTRIBUTING.md
-├── SECURITY.md
-│
-├── constitution/
-│   ├── principles.yaml
-│   └── governance.md
-│
-├── spec/
-│   ├── resource.md
-│   ├── asset.md
-│   ├── capability.md
-│   ├── identity.md
-│   ├── intent.md
-│   ├── permissions.md
-│   └── registry.md
-│
-├── adr/
-├── rfc/
-├── incidents/
-├── security/
-│
-├── core/
-├── sdk/
-├── client/
-│
-├── plugins/
-│   ├── bitcoin/
-│   ├── evm/
-│   ├── base/
-│   └── open-banking/
-│
-├── apps/
-├── agents/
-│
-├── conformance/
-├── fixtures/
-├── examples/
-└── docs/
-```
-
----
-
-# 8. First Six Milestones
-
-## Milestone 1 — Make the constitution real
-
-Deliver:
-
-- manifesto;
-- architecture;
-- glossary;
-- invariants;
-- repository;
-- contribution process.
-
----
-
-## Milestone 2 — Define the protocol core
-
-Deliver:
-
-- resource spec;
-- asset spec;
-- capability spec;
-- provider interface;
-- reference test fixtures.
-
----
-
-## Milestone 3 — Prove the financial graph
-
-Deliver adapters for:
-
-- Bitcoin;
-- EVM/Base;
-- bank connection.
-
-Read-only is enough.
-
----
-
-## Milestone 4 — Prove external extensibility
-
-Publish SDK.
-
-Have someone outside the core team build a fourth adapter.
-
-This is the first critical project milestone.
-
----
-
-## Milestone 5 — Execute one universal intent
-
-Implement:
-
-```text
-SEND(value, recipient)
-```
-
-Support at least two independent routes.
-
----
-
-## Milestone 6 — Introduce safe autonomous action
-
-Implement:
-
-- permissions;
-- application sandbox;
-- agent identity;
-- policy engine;
-- audit log.
-
-Then allow the first agent-managed financial workflow.
-
----
-
-# 9. Long-Term Direction
-
-The endpoint is not a single application.
-
-The endpoint is a shared financial protocol ecosystem.
-
-A mature version of the system could allow:
-
-```text
-USER
-│
-├── chooses client
-├── chooses custody
-├── chooses providers
-├── chooses networks
-├── chooses assets
-├── chooses applications
-├── chooses agents
-└── chooses policies
-```
-
-while the protocol ensures these components can work together.
-
-The system succeeds when the sentence:
-
-> "Which bank do you use?"
-
-becomes less important than:
-
-> "Which financial environment do you run?"
-
----
-
-# 10. Final Principle
-
-The project should continuously move power upward:
-
-```text
-from provider
-to protocol
-
-from protocol
-to user
-
-from central team
-to ecosystem
-
-from hidden infrastructure
-to open interfaces
-
-from one implementation
-to many
-
-from fragile dependencies
-to replaceable components
-
-from manual maintenance
-to agent-assisted maintenance
-
-from closed financial products
-to composable financial capabilities
-```
-
-The project is not trying to predict the future financial system.
-
-It is trying to build an architecture capable of **absorbing whatever the future financial system becomes**.
-
-That is the standard against which every major decision should be judged.
+Sumer earns its scope one reliable capability at a time. The long-term ambition stays broad; the next implementation remains concrete.
