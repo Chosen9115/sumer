@@ -51,7 +51,7 @@ Quality score is out of 10; 8.5 is the floor. Score is Linus's, not the PR Lead'
 
 ### Metis — the brain (survives compaction)
 
-    METIS=/home/camego/Documents/coba-twin/repos/metis/.venv/bin/metis
+    METIS=$(cat .metis-bin)   # machine-local path, gitignored
 
 Entity slug: **`projects/sumer`** (topic pages: `projects/sumer/<topic>`).
 
