@@ -10,7 +10,7 @@ use std::hash::{Hash, Hasher};
 use num_bigint::{BigInt, Sign};
 use proptest::prelude::*;
 
-use sumer_money::{Amount, AssetId, MoneyError, MAX_DIGITS, MAX_SCALE};
+use sumer_money::{Amount, AssetId, MoneyError, MAX_DIGITS, MAX_INPUT_LEN, MAX_SCALE};
 
 // =====================================================================
 // Small shared helpers
@@ -277,6 +277,10 @@ proptest! {
         // rescale to common_scale before summing, mirroring "rescale then add"
         let va = va * pow10(common_scale - scale_a);
         let vb = vb * pow10(common_scale - scale_b);
+        // `va` IS `a` rescaled to the common scale, which is exactly the
+        // coefficient `sum.sub(&b)` must reconstruct. Capture its width before
+        // `va` is consumed.
+        let back_digits = va.magnitude().to_str_radix(10).len();
         let total = va + vb;
 
         let total_negative = total.sign() == Sign::Minus;
@@ -289,8 +293,23 @@ proptest! {
             let expected_str = format_canonical(total_negative, &magnitude_result, common_scale);
             prop_assert_eq!(sum.to_string(), expected_str);
 
-            let back = must_ok(sum.sub(&b));
-            prop_assert_eq!(back, a);
+            // Reconstructing `a` happens at the common scale, which can need
+            // more digits than `a` itself did — e.g. a 128-digit `a` plus a
+            // near-cancelling scale-1 `b` sums to "0.1", and inverting that
+            // needs 129 digits. Overflow there is CORRECT, so assert against
+            // the same bound the forward direction uses rather than demanding
+            // success. (Found by adversarial review; random operands almost
+            // never generate the cancellation that triggers it.)
+            match sum.sub(&b) {
+                Ok(back) => {
+                    prop_assert!(back_digits <= MAX_DIGITS);
+                    prop_assert_eq!(back, a);
+                }
+                Err(e) => {
+                    prop_assert!(back_digits > MAX_DIGITS);
+                    prop_assert_eq!(e, MoneyError::CoefficientOverflow);
+                }
+            }
         } else {
             prop_assert_eq!(actual, Err(MoneyError::CoefficientOverflow));
         }
@@ -448,11 +467,12 @@ fn malformed_non_ascii_digits() -> impl Strategy<Value = (String, MoneyError)> {
 }
 
 fn malformed_over_long() -> impl Strategy<Value = (String, MoneyError)> {
-    (193usize..=300usize).prop_map(|len| ("9".repeat(len), MoneyError::InputTooLong { len }))
+    (MAX_INPUT_LEN.saturating_add(1)..=300usize)
+        .prop_map(|len| ("9".repeat(len), MoneyError::InputTooLong { len }))
 }
 
 fn malformed_over_scale() -> impl Strategy<Value = (String, MoneyError)> {
-    (39usize..=90usize).prop_map(|scale| {
+    (usize::from(MAX_SCALE).saturating_add(1)..=90usize).prop_map(|scale| {
         (
             format!("0.{}", "1".repeat(scale)),
             MoneyError::ScaleTooLarge { scale },
@@ -461,7 +481,7 @@ fn malformed_over_scale() -> impl Strategy<Value = (String, MoneyError)> {
 }
 
 fn malformed_too_many_digits() -> impl Strategy<Value = (String, MoneyError)> {
-    (129usize..=192usize)
+    (MAX_DIGITS.saturating_add(1)..=MAX_INPUT_LEN)
         .prop_map(|digits| ("9".repeat(digits), MoneyError::TooManyDigits { digits }))
 }
 
@@ -596,17 +616,18 @@ proptest! {
         let a = must_ok(asset_amount("usd", &a_str));
         let b = must_ok(asset_amount("usd", &b_str));
 
-        if let Ok(sum) = a.add(&b) {
-            prop_assert!(asset_amount("usd", &sum.to_string()).is_ok());
-            let json = serde_json::to_string(&sum);
-            prop_assert!(json.is_ok());
-            if let Ok(j) = json {
-                let back: Result<Amount, _> = serde_json::from_str(&j);
-                prop_assert!(back.is_ok());
-            }
-        }
-        if let Ok(diff) = a.sub(&b) {
-            prop_assert!(asset_amount("usd", &diff.to_string()).is_ok());
+        // Round-tripping must preserve the VALUE, not merely parse. Asserting
+        // only `is_ok()` would be satisfied by a serializer that emitted "0"
+        // for every amount.
+        for result in [a.add(&b), a.sub(&b), Ok(a.neg())] {
+            let Ok(value) = result else { continue };
+
+            let reparsed = must_ok(asset_amount("usd", &value.to_string()));
+            prop_assert!(reparsed.same_repr(&value));
+
+            let json = must_ok(serde_json::to_string(&value));
+            let back: Amount = must_ok(serde_json::from_str(&json));
+            prop_assert!(back.same_repr(&value));
         }
     }
 }

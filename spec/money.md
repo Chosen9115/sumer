@@ -52,10 +52,26 @@ not assumed. The fix in every affected language forces plain notation explicitly
 |---|---|---|
 | Python | `str(Decimal(...))` | `format(d, 'f')` |
 | Java | `BigDecimal.toString()` | `bigDecimal.toPlainString()` |
-| Go | `big.Float.String()` | `f.Text('f', -1)` |
-| Go | — | `shopspring/decimal`'s `.String()` is already plain; safe as-is |
+| Go | `big.Float` **entirely** | `shopspring/decimal`'s `.String()` — already plain |
 | JavaScript | `Number`, `JSON.stringify(n)` | decimal.js: `d.toFixed()` (never round-trip through `Number`) |
 | Rust | — | `sumer_money::Amount`'s `Display` is plain by construction |
+
+### Go: `big.Float` is not an exact money type
+
+Do not reach for `big.Float` at all, and do not use `Text('f', -1)` to "fix" it.
+`big.Float` defaults to a 64-bit mantissa, so it rounds on the way *in*, before any
+formatting happens:
+
+```go
+a, _ := new(big.Float).SetString("18446744073709551616")
+b, _ := new(big.Float).SetString("18446744073709551617")
+// a and b are now the same value. Every formatter prints them identically.
+```
+
+Plain notation cannot recover precision that parsing already discarded. Use
+`shopspring/decimal`, or `big.Int` with an explicit scale you carry yourself.
+This matters here: a `uint256` token balance is 78 digits and `big.Float` mangles
+it silently.
 
 `toString()`/`String()`/`str()` on an arbitrary-precision decimal type is a
 "shortest round-trippable representation" function, not a "grammar-conformant
@@ -104,14 +120,22 @@ explicit, versioned contract, not a relaxation of this one.
 | asset id > 128 bytes | `AssetIdTooLong { len }` |
 | asset id with a byte outside `0x21..=0x7E` | `AssetIdInvalidByte { at }` |
 | arithmetic result exceeding 128 digits | `CoefficientOverflow` |
-
-`MissingFractionDigits` and `MissingIntegerPart` mean the input was **truncated** —
-a required part was absent because the string ended. When a byte is present but is
-not the byte the grammar requires, the error names that byte's offset instead, because
-an offset is what an implementer can act on. `MissingFractionDigits` therefore fires
-only for a string ending in `.`.
-
 | `add`/`sub`/`cmp_same_asset` across two different assets | `AssetMismatch` |
+
+**Truncation errors versus wrong-byte errors.** `MissingIntegerPart` means no integer
+digit was found where the grammar requires one — either the string ended (`""` after a
+sign, `"-"`) or a decimal point appeared first (`"."`, `".5"`, `"-."`). A decimal point
+is called out by name because it is the one non-digit byte that names a *specific*
+mistake rather than a random one; any other non-digit there is `InvalidByte { at }`.
+
+`MissingFractionDigits` is truncation only: it fires for a string ending in `.` and
+nothing else. If a byte follows the point but is not a digit, the error names that
+byte's offset instead, because an offset is what an implementer can act on.
+
+**Bound precedence.** When an input violates more than one bound, the error reported is
+the first violated in this order: byte length, then significant digits, then scale. An
+implementation that reports them in a different order is non-conforming — two adapters
+must reject the same input with the same error.
 
 Every rejection is a named variant. No panic, ever, on any input to a public
 function — malformed input is an ordinary `Err`, not an exceptional condition.

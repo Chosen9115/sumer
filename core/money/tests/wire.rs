@@ -224,32 +224,25 @@ fn rejection_table_input_too_long_checked_before_parsing() {
 
 #[test]
 fn rejection_table_asset_id() {
-    assert_eq!(must_err_asset(AssetId::new("")), MoneyError::AssetIdEmpty);
+    assert_eq!(must_err(AssetId::new("")), MoneyError::AssetIdEmpty);
 
     let long = "a".repeat(129);
     assert_eq!(
-        must_err_asset(AssetId::new(&long)),
+        must_err(AssetId::new(&long)),
         MoneyError::AssetIdTooLong { len: 129 }
     );
 
     // space (0x20) is below the printable range 0x21..=0x7E
     assert_eq!(
-        must_err_asset(AssetId::new("bad id")),
+        must_err(AssetId::new("bad id")),
         MoneyError::AssetIdInvalidByte { at: 3 }
     );
 
     // DEL (0x7F) is above the printable range
     assert_eq!(
-        must_err_asset(AssetId::new("id\u{7F}")),
+        must_err(AssetId::new("id\u{7F}")),
         MoneyError::AssetIdInvalidByte { at: 2 }
     );
-}
-
-fn must_err_asset(r: Result<AssetId, MoneyError>) -> MoneyError {
-    match r {
-        Err(e) => e,
-        Ok(v) => panic!("expected Err, got Ok({v:?})"),
-    }
 }
 
 // ---------------------------------------------------------------------
@@ -331,4 +324,66 @@ fn zero_preserves_scale_from_the_operands() {
     assert!(sum.is_zero());
     assert_eq!(sum.scale(), 1);
     assert_eq!(sum.to_string(), "0.0");
+}
+
+// =====================================================================
+// Regressions from the PR 1 adversarial review. Each of these passed
+// before the fix, which is why they are pinned here as fixed cases.
+// =====================================================================
+
+/// A derived `Deserialize` also accepts a positional array, because serde
+/// generates a `visit_seq` and `deny_unknown_fields` does not suppress it.
+/// That would let a Rust adapter accept frames another language's adapter
+/// rejects — a wire-contract split, not a cosmetic difference.
+#[test]
+fn rejects_positional_json_array() {
+    let err = serde_json::from_str::<Amount>(r#"["usd","1.00"]"#);
+    assert!(
+        err.is_err(),
+        "a positional array is not the documented wire shape"
+    );
+}
+
+#[test]
+fn rejects_duplicate_and_missing_fields() {
+    assert!(serde_json::from_str::<Amount>(r#"{"asset":"usd"}"#).is_err());
+    assert!(serde_json::from_str::<Amount>(r#"{"amount":"1.00"}"#).is_err());
+    assert!(
+        serde_json::from_str::<Amount>(r#"{"asset":"usd","amount":"1.0","amount":"2.0"}"#).is_err()
+    );
+}
+
+/// Bound precedence is normative: length, then digits, then scale. An input
+/// violating two bounds must report the same error in every implementation.
+#[test]
+fn digit_bound_is_reported_before_scale_bound() {
+    let asset = must_ok(AssetId::new("usd"));
+    let s = format!("{}.{}", "9".repeat(90), "9".repeat(39)); // 129 digits, scale 39
+    assert_eq!(
+        Amount::parse(asset, &s),
+        Err(MoneyError::TooManyDigits { digits: 129 })
+    );
+}
+
+/// Inverting an addition happens at the COMMON scale, which can need more
+/// digits than either operand did. Overflow there is correct behaviour.
+/// Random operands essentially never produce the cancellation that reaches
+/// this, so it is pinned explicitly.
+#[test]
+fn inverting_a_near_cancelling_sum_overflows_correctly() {
+    let asset = must_ok(AssetId::new("usd"));
+    let a = must_ok(Amount::parse(
+        asset.clone(),
+        &format!("1{}", "0".repeat(127)),
+    ));
+    let b = must_ok(Amount::parse(
+        asset.clone(),
+        &format!("-{}.9", "9".repeat(127)),
+    ));
+
+    let sum = must_ok(a.add(&b));
+    assert_eq!(sum.to_string(), "0.1");
+
+    // Reconstructing `a` at scale 1 needs 129 digits.
+    assert_eq!(sum.sub(&b), Err(MoneyError::CoefficientOverflow));
 }
