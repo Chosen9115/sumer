@@ -1,0 +1,22 @@
+{
+  "fixture": "pending_to_posted",
+  "assertions": [
+    "A2",
+    "A6"
+  ],
+  "covers": [
+    "A6"
+  ],
+  "why": "Both history pages come back with an empty observations array and a perfectly healthy status: 'report success' with nothing behind it. A6 is the live-set floor, and it is the only assertion that fires on absence rather than on content.",
+  "adapter": null,
+  "patch": [
+    {
+      "path": "/script/runs/0/on/history.read/0/do/0/body/observations",
+      "value": []
+    },
+    {
+      "path": "/script/runs/0/on/history.read/1/do/0/body/observations",
+      "value": []
+    }
+  ]
+}

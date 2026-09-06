@@ -1,0 +1,14 @@
+{
+  "fixture": "duplicate_events",
+  "assertions": [
+    "A2",
+    "A9"
+  ],
+  "covers": [
+    "A2",
+    "A9"
+  ],
+  "why": "The second process invocation hands out the same two local_ids attached to each other's records. The bare SET of ids is identical across the two runs, which is what the old A9 compared and why it saw nothing; the record-to-id association is not.",
+  "adapter": "ids_swapped_second_invocation.py",
+  "patch": []
+}

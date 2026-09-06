@@ -1,0 +1,27 @@
+{
+  "fixture": "interrupted_pagination",
+  "assertions": [
+    "A5",
+    "A10"
+  ],
+  "covers": [
+    "A10"
+  ],
+  "why": "The oversized observation is emitted ONLY by the resuming process, never by the uninterrupted one. When the raw size measurement ran over a single execution, a fixture could put its violation in any other run and never be measured; every execution is measured now, and this is the mutant that says so.",
+  "adapter": null,
+  "patch": [
+    {
+      "path": "/script/runs/2/on/history.read/1/do/0/pad",
+      "value": [
+        {
+          "path": [
+            "observations",
+            0,
+            "description"
+          ],
+          "bytes": 70000
+        }
+      ]
+    }
+  ]
+}

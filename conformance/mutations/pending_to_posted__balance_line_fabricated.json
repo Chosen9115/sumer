@@ -1,0 +1,41 @@
+{
+  "fixture": "pending_to_posted",
+  "assertions": [
+    "A1"
+  ],
+  "why": "A second balance line the provider never reported, in a category nothing else in the model can contradict. Only counting the balances catches an invented category -- a per-entry 'is what I declared present?' loop never asks the other direction.",
+  "adapter": null,
+  "patch": [
+    {
+      "path": "/script/runs/0/on/balances.read/0/do/0/body/observations",
+      "value": [
+        {
+          "resource_id": "checking-1",
+          "category": "available",
+          "canonical_hint": "available",
+          "amount": {
+            "asset": "USD",
+            "amount": "957.63"
+          },
+          "provenance": {
+            "provider_id": "acct_checking_1",
+            "observed_at": "2026-09-01T00:00:00Z"
+          }
+        },
+        {
+          "resource_id": "checking-1",
+          "category": "promotional_credit",
+          "canonical_hint": null,
+          "amount": {
+            "asset": "USD",
+            "amount": "250.00"
+          },
+          "provenance": {
+            "provider_id": "acct_checking_1",
+            "observed_at": "2026-09-01T00:00:00Z"
+          }
+        }
+      ]
+    }
+  ]
+}

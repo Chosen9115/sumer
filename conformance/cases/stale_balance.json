@@ -1,0 +1,322 @@
+{
+  "case": "stale_balance",
+  "script": {
+    "runs": [
+      {
+        "label": "default",
+        "on": {
+          "resources.list": [
+            {
+              "do": [
+                {
+                  "op": "reply_ok",
+                  "body": {
+                    "resources": [
+                      {
+                        "resource_id": "checking-2",
+                        "provider_id": "acct_checking_2",
+                        "kind": "bank_checking",
+                        "label": "Example checking account (fixture placeholder)"
+                      },
+                      {
+                        "resource_id": "checking-3",
+                        "provider_id": "acct_checking_3",
+                        "kind": "bank_checking",
+                        "label": "Second example checking account, used only for the invalid-received_at trap"
+                      }
+                    ]
+                  }
+                }
+              ],
+              "consume": false
+            }
+          ],
+          "balances.read": [
+            {
+              "when": {
+                "resource_ids": [
+                  "checking-2",
+                  "checking-3"
+                ]
+              },
+              "do": [
+                {
+                  "op": "reply_ok",
+                  "body": {
+                    "observations": [
+                      {
+                        "resource_id": "checking-2",
+                        "category": "available",
+                        "canonical_hint": "available",
+                        "amount": {
+                          "asset": "USD",
+                          "amount": "300.00"
+                        },
+                        "provenance": {
+                          "provider_id": "acct_checking_2",
+                          "observed_at": "2026-08-20T00:00:00Z"
+                        }
+                      },
+                      {
+                        "resource_id": "checking-3",
+                        "category": "available",
+                        "canonical_hint": "available",
+                        "amount": {
+                          "asset": "USD",
+                          "amount": "88.00"
+                        },
+                        "provenance": {
+                          "provider_id": "acct_checking_3",
+                          "observed_at": "2026-09-03T00:00:00Z"
+                        }
+                      }
+                    ],
+                    "statuses": [
+                      {
+                        "resource_id": "checking-2",
+                        "outcome": {
+                          "stale": {
+                            "as_of": "2026-08-20T00:00:00Z"
+                          }
+                        }
+                      },
+                      {
+                        "resource_id": "checking-3"
+                      }
+                    ]
+                  }
+                }
+              ]
+            },
+            {
+              "when": {
+                "resource_ids": [
+                  "checking-3"
+                ]
+              },
+              "do": [
+                {
+                  "op": "reply_ok",
+                  "body": {
+                    "observations": [
+                      {
+                        "resource_id": "checking-3",
+                        "category": "available",
+                        "canonical_hint": "available",
+                        "amount": {
+                          "asset": "USD",
+                          "amount": "88.00"
+                        },
+                        "provenance": {
+                          "provider_id": "acct_checking_3",
+                          "observed_at": "2026-09-03T00:00:00Z",
+                          "received_at": "2026-09-03T00:00:01Z"
+                        }
+                      }
+                    ],
+                    "statuses": [
+                      {
+                        "resource_id": "checking-3"
+                      }
+                    ]
+                  }
+                }
+              ]
+            }
+          ],
+          "history.read": [
+            {
+              "when": {
+                "resources": [
+                  {
+                    "resource_id": "checking-2"
+                  }
+                ]
+              },
+              "do": [
+                {
+                  "op": "reply_ok",
+                  "body": {
+                    "observations": [],
+                    "statuses": [
+                      {
+                        "resource_id": "checking-2",
+                        "page": {
+                          "cursor_resumable": "batch_restart",
+                          "next": null
+                        }
+                      }
+                    ]
+                  }
+                }
+              ]
+            },
+            {
+              "when": {
+                "resources": [
+                  {
+                    "resource_id": "checking-3"
+                  }
+                ]
+              },
+              "do": [
+                {
+                  "op": "reply_ok",
+                  "body": {
+                    "observations": [],
+                    "statuses": [
+                      {
+                        "resource_id": "checking-3",
+                        "page": {
+                          "cursor_resumable": "batch_restart",
+                          "next": null
+                        }
+                      }
+                    ]
+                  }
+                }
+              ]
+            }
+          ],
+          "status.read": [
+            {
+              "when": {
+                "resource_ids": [
+                  "checking-2",
+                  "checking-3"
+                ]
+              },
+              "do": [
+                {
+                  "op": "reply_ok",
+                  "body": {
+                    "statuses": [
+                      {
+                        "resource_id": "checking-2",
+                        "outcome": {
+                          "stale": {
+                            "as_of": "2026-08-20T00:00:00Z"
+                          }
+                        },
+                        "strong_auth_expires_at": "2026-12-05T00:00:00Z",
+                        "history_start": "2024-01-01T00:00:00Z"
+                      },
+                      {
+                        "resource_id": "checking-3",
+                        "outcome": {
+                          "fetched": {
+                            "page_empty": false
+                          }
+                        },
+                        "credential_expires_at": "2027-09-01T00:00:00Z",
+                        "strong_auth_expires_at": "2026-10-05T00:00:00Z"
+                      }
+                    ]
+                  }
+                }
+              ]
+            }
+          ]
+        },
+        "provenance": {
+          "adapter_id": "fake-adapter",
+          "surface": "checking",
+          "completeness": "complete"
+        }
+      }
+    ]
+  },
+  "expect": {
+    "assertions": [
+      "A3",
+      "A4",
+      "A7"
+    ],
+    "resources": [
+      {
+        "resource_id": "checking-2",
+        "kind": "bank_checking"
+      },
+      {
+        "resource_id": "checking-3",
+        "kind": "bank_checking"
+      }
+    ],
+    "ledger": {
+      "checking-2": {
+        "balances": [
+          {
+            "category": "available",
+            "canonical_hint": "available",
+            "amount": {
+              "asset": "USD",
+              "amount": "300.00"
+            }
+          }
+        ],
+        "history": []
+      },
+      "checking-3": {
+        "balances": [
+          {
+            "category": "available",
+            "canonical_hint": "available",
+            "amount": {
+              "asset": "USD",
+              "amount": "88.00"
+            }
+          }
+        ],
+        "history": []
+      }
+    },
+    "live": {
+      "checking-2": [],
+      "checking-3": []
+    },
+    "provenance": {
+      "checking-2": {
+        "staleness": "cached",
+        "completeness": "complete"
+      },
+      "checking-3": {
+        "staleness": "live",
+        "completeness": "complete"
+      }
+    },
+    "statuses": {
+      "checking-2": {
+        "outcome": {
+          "stale": {
+            "as_of": "2026-08-20T00:00:00Z"
+          }
+        }
+      },
+      "checking-3": {
+        "outcome": {
+          "fetched": {
+            "page_empty": false
+          }
+        }
+      }
+    },
+    "status_read": {
+      "checking-2": {
+        "credential_expires_at": null,
+        "strong_auth_expires_at": "2026-12-05T00:00:00Z",
+        "history_start": "2024-01-01T00:00:00Z"
+      },
+      "checking-3": {
+        "credential_expires_at": "2027-09-01T00:00:00Z",
+        "strong_auth_expires_at": "2026-10-05T00:00:00Z",
+        "history_start": null
+      }
+    },
+    "envelope_errors": {
+      "checking-3_balances_read": {
+        "code": "invalid_request"
+      }
+    },
+    "notes": "checking-2 is the legitimate stale-cache case, and its two halves are asserted separately. The ADAPTER's claim rides in the status outcome stale{as_of:2026-08-20T00:00:00Z}, which expect.statuses asserts survives to the caller -- a host that silently drops the stale flag because the amount decoded fine fails A3's spirit and A7. expect.provenance.checking-2 then asserts staleness:'cached'. That is NOT the adapter's claim being echoed: the wire structurally forbids an adapter from sending staleness at all, and the host DERIVES it from the resource's status outcome in the same reply -- stale{as_of} yields Cached, unavailable/gone yield Unavailable, everything else Live (Linus's ruling; see spec/observation.md section 1). The runner reads and asserts this field; it used to delete the key before comparing, which made the expectation dead JSON that read as coverage. A host that hardcodes Live for everything, or that lets an adapter influence the value, fails here. Both resources are read in ONE batched balances.read, and expect.provenance names both: checking-2 comes back 'cached' and checking-3 'live' out of the SAME reply, which is what makes staleness a per-resource derivation rather than a per-reply stamp -- a host that blanket-stamped the batch from the first status entry it saw would fail on one of the two whichever way it guessed.\\n\\nchecking-3 is then read a SECOND time, alone, and THAT reply is the ADVERSARIAL half. It is LITERAL, not simulated: the scripted reply's provenance object actually carries a 'received_at' field, exactly the field spec/observation.md says the adapter MUST omit. A conforming host's deserializer must reject the WHOLE reply with envelope err.code=invalid_request BEFORE ever looking at the amount inside it -- a host whose Provenance struct just silently ignores an unrecognised field (no deny_unknown_fields, or a hand-rolled parser that only reads the keys it expects) will instead accept 88.00 as checking-3's live balance and fail this case invisibly. checking-3's own status.read afterward must still succeed (A4 pairing) -- the invalid_request on the balances.read leg must not kill the connection or block checking-3's status.read. Neither account has any history: expect.ledger declares both history sequences EMPTY and expect.live declares both live sets empty (spelling them out is redundant with the rule that an absent sequence asserts empty, and kept because it reads as the claim it is) -- an adapter that answers a stale account's history.read with invented rows is an orphan the sequence comparison reports, and one that answers it with an envelope error fails the read outright. STATUS.READ CARRIES TWO INDEPENDENT CLOCKS (spec/observation.md section 7), and this fixture makes them differ on purpose: checking-2 is a Wise-shaped credential that never expires until it is revoked (credential_expires_at ABSENT, asserted as null -- unknown, never an epoch or a far-future placeholder) while its strong-authentication session lapses on a fixed schedule (strong_auth_expires_at 2026-12-05); checking-3 has both, a year apart. An implementation that collapses the two into one field cannot tell 'reconnect this credential' from 're-run this authentication step', and would pass unnoticed if the fixture had given them the same value -- so it does not. history_start is asserted both ways too: checking-2 promises history back to 2024-01-01, checking-3 promises nothing at all and must therefore report NO history_start; rendering that unknown as a date (an epoch, say) fails, the same rule as a null balance amount."
+  }
+}

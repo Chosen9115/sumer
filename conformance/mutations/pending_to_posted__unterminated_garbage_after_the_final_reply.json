@@ -1,0 +1,38 @@
+{
+  "fixture": "pending_to_posted",
+  "assertions": [
+    "A11"
+  ],
+  "covers": [
+    "A11",
+    "UnterminatedFrame"
+  ],
+  "why": "The same trailing garbage as pending_to_posted__garbage_after_the_final_reply, with the terminating newline removed -- and that one byte was the whole difference between a caught violation and a green run. With the LF, the decoder frames the bytes and reports NotJson; without it, the bytes sit in the decoder as an in-progress frame, the reader loop returned at stdout EOF without ever looking at them, supervise latched Crashed(0), and finish() accepted an ordinary exit. Both existing checks on trailing garbage (the Rust test and the sibling mutant) supplied an LF, so the missing end-of-stream check was invisible to both. Framing is now finalized at EOF: leftover bytes are UnterminatedFrame.",
+  "adapter": null,
+  "patch": [
+    {
+      "path": "/script/runs/0/on/status.read/0/do",
+      "value": [
+        {
+          "op": "reply_ok",
+          "body": {
+            "statuses": [
+              {
+                "resource_id": "checking-1",
+                "outcome": {
+                  "fetched": {
+                    "page_empty": false
+                  }
+                }
+              }
+            ]
+          }
+        },
+        {
+          "op": "stdout_raw",
+          "text": "} not a frame, and not the answer to anything"
+        }
+      ]
+    }
+  ]
+}

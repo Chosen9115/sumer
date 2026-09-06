@@ -1,0 +1,22 @@
+{
+  "fixture": "oversized_observation",
+  "assertions": [
+    "A2",
+    "A7"
+  ],
+  "covers": [
+    "A10"
+  ],
+  "why": "The history reply's outcome stops being stale{as_of} and becomes a plain fetched -- the shape a degrade that overwrites the resource's freshness produces. Two things answer, and BOTH are the point. A7: expect.statuses names outcome stale{as_of} AND degraded{local_id,bytes} on the same entry, and no entry carries the stale one any more. A2: the host derives staleness per resource from that resource's own outcome, so all three surviving observations are now stamped `live` where expect.ledger declares `cached`. That second half exists only because staleness is compared in ledger entries; strip it back out and this mutant produces {A7} alone and the battery goes red, which is the whole reason it is written down as a pair. Staleness cannot be flipped for ONE observation of the three: it is a per-resource derivation from one status, so the smallest real break is this one.",
+  "adapter": null,
+  "patch": [
+    {
+      "path": "/script/runs/0/on/history.read/0/do/0/body/statuses/0/outcome",
+      "value": {
+        "fetched": {
+          "page_empty": false
+        }
+      }
+    }
+  ]
+}

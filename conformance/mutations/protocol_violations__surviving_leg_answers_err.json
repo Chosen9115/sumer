@@ -1,0 +1,21 @@
+{
+  "fixture": "protocol_violations",
+  "assertions": [
+    "A4"
+  ],
+  "covers": [
+    "A4"
+  ],
+  "why": "history.read(res-b) -- a leg the fixture requires to SUCCEED on the connection that is about to be killed -- answers with an envelope error instead. A4's other half is that the ops around a failure keep working; nothing structural forces that check, so it is exactly where a hollow assertion would hide.",
+  "adapter": null,
+  "patch": [
+    {
+      "path": "/script/runs/1/on/history.read/1/do/0/op",
+      "value": "reply_err"
+    },
+    {
+      "path": "/script/runs/1/on/history.read/1/do/0/code",
+      "value": "internal"
+    }
+  ]
+}

@@ -1,0 +1,26 @@
+{
+  "fixture": "unsupported_op",
+  "assertions": [
+    "A4"
+  ],
+  "covers": [
+    "A4"
+  ],
+  "why": "The adapter grows a rule for the undeclared op and answers it with a cheerful ok. An op no capability declares must come back as an envelope err -- neither a success nor a closed connection -- and this is the mutation that proves the probe is reading the reply rather than merely surviving it.",
+  "adapter": null,
+  "patch": [
+    {
+      "path": "/script/runs/0/on/execute",
+      "value": [
+        {
+          "do": [
+            {
+              "op": "reply_ok",
+              "body": {}
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}

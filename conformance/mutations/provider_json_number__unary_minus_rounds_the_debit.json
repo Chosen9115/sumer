@@ -1,0 +1,17 @@
+{
+  "fixture": "provider_json_number",
+  "assertions": [
+    "A1"
+  ],
+  "covers": [
+    "A1"
+  ],
+  "why": "The 31-significant-digit debit arrives already rounded to 28 digits -- exactly what Python's default decimal context does to `-d`, losing the cents off a 12-quadrillion-dollar debit with no float in sight and no error raised. Only comparing the digits, not the magnitude, can see it.",
+  "adapter": null,
+  "patch": [
+    {
+      "path": "/script/runs/0/on/balances.read/0/do/0/provider_payload_json",
+      "value": "{\"balances\": {\"token_balance_wei\": 115792089237316195423570985008687907853269984665640564039457584007913129639935, \"token_balance_wei_float\": 115792089237316195423570985008687907853269984665640564039457584007913129639935.0, \"precise_fraction\": 123456789012345678.987654321, \"high_precision_debit_unsigned\": 12345678901234567890123456790}}"
+    }
+  ]
+}

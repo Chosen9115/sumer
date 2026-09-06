@@ -1,0 +1,9 @@
+target
+artifacts
+# libFuzzer writes newly-discovered inputs straight into corpus/<target>/
+# alongside the seed files, so the whole directory can't be gitignored
+# wholesale: that would also hide the checked-in seed corpus itself. Ignore
+# everything corpus/ gains at runtime, then carve the seed directory back
+# out so its contents (and only its contents) are tracked.
+corpus/*
+!corpus/codec/

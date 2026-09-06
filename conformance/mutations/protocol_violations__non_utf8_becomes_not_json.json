@@ -1,0 +1,21 @@
+{
+  "fixture": "protocol_violations",
+  "assertions": [
+    "A11"
+  ],
+  "covers": [
+    "NonUtf8"
+  ],
+  "why": "The mirror image: the invalid-UTF-8 line becomes plain ASCII garbage. Both kinds kill the connection, so only a comparison of the KIND can tell these two runs apart -- and that comparison is discipline, not structure.",
+  "adapter": null,
+  "patch": [
+    {
+      "path": "/script/runs/5/on/balances.read/0/do/0/op",
+      "value": "stdout_raw"
+    },
+    {
+      "path": "/script/runs/5/on/balances.read/0/do/0/text",
+      "value": "this is not a JSON frame at all\n"
+    }
+  ]
+}

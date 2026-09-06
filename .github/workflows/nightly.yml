@@ -36,12 +36,21 @@ jobs:
           toolchain: stable
           components: rustfmt, clippy
 
+      # The framer's fuzz target (core/wire/fuzz/) needs a nightly
+      # toolchain for `-Zsanitizer=address`; it is its own separate cargo
+      # workspace precisely so this doesn't touch the main workspace's
+      # (stable) toolchain -- every invocation below selects it explicitly
+      # with `+nightly` rather than changing the job's default.
+      - name: Install nightly Rust
+        uses: dtolnay/rust-toolchain@nightly
+
       - name: Cache cargo
         uses: Swatinem/rust-cache@v2
 
-      # Runs fmt/clippy/test as one step so a failure anywhere records which
-      # sub-step failed (FAILED_STEP) and keeps a full log (nightly.log) for
-      # the failure-report step below to read. Stays silent on success.
+      # Runs fmt/clippy/test/fuzz as one step so a failure anywhere records
+      # which sub-step failed (FAILED_STEP) and keeps a full log
+      # (nightly.log) for the failure-report step below to read. Stays
+      # silent on success.
       - name: Run full suite
         run: |
           set -o pipefail
@@ -58,6 +67,14 @@ jobs:
             cargo clippy --all-targets --all-features -- -D warnings
           run_step "cargo test --locked --all-features" \
             cargo test --locked --all-features
+          run_step "install cargo-fuzz" cargo install cargo-fuzz
+          # `core/wire/fuzz` is its own workspace (see its Cargo.toml), so
+          # cargo-fuzz -- which looks for a `fuzz/` directory under the
+          # crate it is invoked from -- runs from `core/wire`, not the repo
+          # root. The seed corpus lives at `core/wire/fuzz/corpus/codec/`
+          # and is picked up automatically; no path argument needed.
+          run_step "cargo fuzz run codec -- -max_total_time=120" \
+            bash -c "cd core/wire && cargo +nightly fuzz run codec -- -max_total_time=120"
 
       # Only reached when the step above failed. Completely silent otherwise:
       # no issue, no comment, no step runs.

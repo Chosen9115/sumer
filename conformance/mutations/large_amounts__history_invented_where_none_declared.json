@@ -1,0 +1,38 @@
+{
+  "fixture": "large_amounts",
+  "assertions": [
+    "A2"
+  ],
+  "covers": [
+    "A2"
+  ],
+  "why": "wallet-btc's history.read answers with a row the provider never had, on a fixture whose expect.ledger SPELLS NO `history` KEY for that resource at all. This is the proof that an absent sequence asserts EMPTY rather than going unchecked: nothing else in the fixture mentions history, so if absence meant 'do not compare' this adapter would invent a whole history unchallenged. The row is TOMBSTONED on purpose, and that is the whole point -- it folds to nothing, so expect.live's empty set is still satisfied and cannot answer for the invented record. The only thing that can object is the union of declared and emitted keys in exec.rs::assert_execution comparing this sequence against a declared length of zero. Stop unioning and this mutant survives in silence.",
+  "adapter": null,
+  "patch": [
+    {
+      "path": "/script/runs/0/on/history.read/1/do/0/body/observations",
+      "value": [
+        {
+          "resource_id": "wallet-btc",
+          "local_id": "wallet-btc:invented_1",
+          "provider_id": "invented_1",
+          "state": "tombstoned",
+          "surface": "onchain",
+          "posting": "posted",
+          "amount": {
+            "asset": "sat",
+            "amount": "1000"
+          },
+          "raw_sign": "provider_positive",
+          "description": "A TOMBSTONED TRANSACTION THE PROVIDER NEVER REPORTED (fixture placeholder)",
+          "provider_extra": {},
+          "provenance": {
+            "provider_id": "invented_1",
+            "observed_at": "2026-09-01T10:00:00Z"
+          },
+          "tombstone_reason": "reorged_out"
+        }
+      ]
+    }
+  ]
+}

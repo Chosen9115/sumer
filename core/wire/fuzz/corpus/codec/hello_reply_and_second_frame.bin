@@ -1,0 +1,2 @@
+{"id":0,"ok":{"protocol":"1","adapter_id":"a","adapter_version":"0.1","capabilities":["balances.read"],"local_id_derivation":"a@1","max_in_flight":1}}
+{"id":1,"op":"balances.read","params":{"resource_ids":["acct1"]}}

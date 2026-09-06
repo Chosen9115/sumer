@@ -1,0 +1,207 @@
+{
+  "fixture": "pending_to_posted",
+  "assertions": [
+    "A1"
+  ],
+  "covers": [
+    "A1"
+  ],
+  "why": "A second resource the provider never had, fully scripted so it answers the whole crawl cleanly with empty pages. It contradicts nothing: no balance is wrong, no observation is missing, no id is impure, and every per-entry check the suite makes passes. Only COUNTING what resources.list returned can see it -- the same reason the balances list is compared by count. That count mismatch is tagged A1, not `setup`: fabricating an account is a fidelity violation by the adapter, and `setup` is reserved for a fixture of ours that is malformed.",
+  "adapter": null,
+  "patch": [
+    {
+      "path": "/script/runs/0/on/resources.list/0/do/0/body/resources",
+      "value": [
+        {
+          "resource_id": "checking-1",
+          "provider_id": "acct_checking_1",
+          "kind": "bank_checking",
+          "label": "Example checking account (fixture placeholder)"
+        },
+        {
+          "resource_id": "ghost-1",
+          "provider_id": "acct_ghost_1",
+          "kind": "bank_checking",
+          "label": "An account the provider never had (fixture placeholder)"
+        }
+      ]
+    },
+    {
+      "path": "/script/runs/0/on/balances.read/0/when/resource_ids",
+      "value": [
+        "checking-1",
+        "ghost-1"
+      ]
+    },
+    {
+      "path": "/script/runs/0/on/balances.read/0/do/0/body/statuses",
+      "value": [
+        {
+          "resource_id": "checking-1"
+        },
+        {
+          "resource_id": "ghost-1"
+        }
+      ]
+    },
+    {
+      "path": "/script/runs/0/on/history.read",
+      "value": [
+        {
+          "when": {
+            "resources": [
+              {
+                "resource_id": "checking-1"
+              }
+            ]
+          },
+          "do": [
+            {
+              "op": "reply_ok",
+              "body": {
+                "observations": [
+                  {
+                    "resource_id": "checking-1",
+                    "local_id": "checking-1:pend_abc",
+                    "provider_id": "pend_abc",
+                    "state": "active",
+                    "surface": "checking",
+                    "posting": "pending",
+                    "amount": {
+                      "asset": "USD",
+                      "amount": "42.00"
+                    },
+                    "raw_sign": "provider_negative",
+                    "description": "EXAMPLE MERCHANT PURCHASE (fixture placeholder)",
+                    "provider_extra": {},
+                    "provenance": {
+                      "provider_id": "pend_abc",
+                      "observed_at": "2026-09-01T09:00:00Z"
+                    }
+                  }
+                ],
+                "statuses": [
+                  {
+                    "resource_id": "checking-1",
+                    "page": {
+                      "cursor_resumable": "batch_restart",
+                      "next": {
+                        "kind": "cursor",
+                        "cursor": "checking-1:page2"
+                      }
+                    }
+                  }
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "when": {
+            "resources": [
+              {
+                "resource_id": "checking-1",
+                "page": {
+                  "kind": "cursor",
+                  "cursor": "checking-1:page2"
+                }
+              }
+            ]
+          },
+          "do": [
+            {
+              "op": "reply_ok",
+              "body": {
+                "observations": [
+                  {
+                    "resource_id": "checking-1",
+                    "local_id": "checking-1:pend_abc",
+                    "provider_id": "post_xyz",
+                    "supersedes_provider_id": "pend_abc",
+                    "state": "active",
+                    "surface": "checking",
+                    "posting": "posted",
+                    "amount": {
+                      "asset": "USD",
+                      "amount": "42.37"
+                    },
+                    "raw_sign": "provider_negative",
+                    "description": "EXAMPLE MERCHANT PURCHASE (fixture placeholder)",
+                    "provider_extra": {},
+                    "provenance": {
+                      "provider_id": "post_xyz",
+                      "observed_at": "2026-09-02T09:00:00Z"
+                    }
+                  }
+                ],
+                "statuses": [
+                  {
+                    "resource_id": "checking-1",
+                    "page": {
+                      "cursor_resumable": "batch_restart",
+                      "next": null
+                    }
+                  }
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "when": {
+            "resources": [
+              {
+                "resource_id": "ghost-1"
+              }
+            ]
+          },
+          "do": [
+            {
+              "op": "reply_ok",
+              "body": {
+                "observations": [],
+                "statuses": [
+                  {
+                    "resource_id": "ghost-1",
+                    "page": {
+                      "cursor_resumable": "batch_restart",
+                      "next": null
+                    }
+                  }
+                ]
+              }
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "path": "/script/runs/0/on/status.read/0/when/resource_ids",
+      "value": [
+        "checking-1",
+        "ghost-1"
+      ]
+    },
+    {
+      "path": "/script/runs/0/on/status.read/0/do/0/body/statuses",
+      "value": [
+        {
+          "resource_id": "checking-1",
+          "outcome": {
+            "fetched": {
+              "page_empty": false
+            }
+          }
+        },
+        {
+          "resource_id": "ghost-1",
+          "outcome": {
+            "fetched": {
+              "page_empty": true
+            }
+          }
+        }
+      ]
+    }
+  ]
+}

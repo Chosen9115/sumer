@@ -1,0 +1,17 @@
+{
+  "fixture": "stale_balance",
+  "assertions": [
+    "A7"
+  ],
+  "covers": [
+    "A7"
+  ],
+  "why": "checking-3's status.read gains a history_start of 1970-01-01: the provider promised nothing about how far back its history goes, and the adapter answers with the epoch instead of saying nothing. Unknown is never a date and never a zero; a fixture spells that as null, and a runner that treated null as 'don't care' would accept this.",
+  "adapter": null,
+  "patch": [
+    {
+      "path": "/script/runs/0/on/status.read/0/do/0/body/statuses/1/history_start",
+      "value": "1970-01-01T00:00:00Z"
+    }
+  ]
+}

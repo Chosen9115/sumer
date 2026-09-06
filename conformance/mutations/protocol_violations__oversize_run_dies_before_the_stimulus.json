@@ -1,0 +1,17 @@
+{
+  "fixture": "protocol_violations",
+  "assertions": [
+    "A11"
+  ],
+  "covers": [
+    "PreHelloOutput"
+  ],
+  "why": "The oversize run writes garbage before its hello, so it dies at spawn and the oversized frame is never requested and never sent. What this mutant guards is the ATTRIBUTION: the run's fixture expects OversizeFrame, and crediting that expectation to a run which aborted on a prerequisite would let a coverage claim be paid for by a stimulus nobody ever sent. The kind this run establishes is the one the host actually reported on the way down -- PreHelloOutput -- and a declaration of OversizeFrame here must not type-check as coverage.",
+  "adapter": null,
+  "patch": [
+    {
+      "path": "/script/runs/3/pre_hello_stdout",
+      "value": "garbage-before-the-hello-on-the-run-that-tests-oversized-frames\n"
+    }
+  ]
+}

@@ -1,0 +1,21 @@
+{
+  "fixture": "protocol_violations",
+  "assertions": [
+    "A11"
+  ],
+  "covers": [
+    "DuplicateId"
+  ],
+  "why": "The replayed resources.list frame is replaced by a line on stderr, so the already-answered id is never answered twice. DuplicateId is an UNSOLICITED frame -- nothing the host awaits carries it -- so the assertion that it landed is the one most easily made vacuous.",
+  "adapter": null,
+  "patch": [
+    {
+      "path": "/script/runs/2/on/resources.list/0/do/1/op",
+      "value": "stderr"
+    },
+    {
+      "path": "/script/runs/2/on/resources.list/0/do/1/text",
+      "value": "the duplicate frame this run exists to send is not being sent\n"
+    }
+  ]
+}

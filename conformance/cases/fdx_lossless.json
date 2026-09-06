@@ -1,0 +1,399 @@
+{
+  "case": "fdx_lossless",
+  "script": {
+    "runs": [
+      {
+        "label": "default",
+        "on": {
+          "resources.list": [
+            {
+              "do": [
+                {
+                  "op": "reply_ok",
+                  "body": {
+                    "resources": [
+                      {
+                        "resource_id": "fdx-checking-1",
+                        "provider_id": "acct-sample-0001",
+                        "kind": "bank_checking",
+                        "label": "Sample Checking (fixture placeholder)",
+                        "provider_extra": {
+                          "fdx_accountType": "CHECKING",
+                          "fdx_accountCategory": "DEPOSIT_ACCOUNT",
+                          "fdx_nickname": "Sample Checking (fixture placeholder)",
+                          "fdx_accountNumberDisplay": "XXXX0000"
+                        }
+                      }
+                    ]
+                  }
+                }
+              ]
+            }
+          ],
+          "status.read": [
+            {
+              "when": {
+                "resource_ids": [
+                  "fdx-checking-1"
+                ]
+              },
+              "do": [
+                {
+                  "op": "reply_ok",
+                  "body": {
+                    "statuses": [
+                      {
+                        "resource_id": "fdx-checking-1",
+                        "outcome": {
+                          "fetched": {
+                            "page_empty": false
+                          }
+                        }
+                      }
+                    ]
+                  }
+                }
+              ]
+            }
+          ],
+          "balances.read": [
+            {
+              "when": {
+                "resource_ids": [
+                  "fdx-checking-1"
+                ]
+              },
+              "do": [
+                {
+                  "op": "reply_with_decimal_amounts",
+                  "provider_payload_json": "{\"account\": {\"accountId\": \"acct-sample-0001\", \"accountType\": \"CHECKING\", \"accountCategory\": \"DEPOSIT_ACCOUNT\", \"nickname\": \"Sample Checking (fixture placeholder)\", \"accountNumberDisplay\": \"XXXX0000\", \"currency\": {\"currencyCode\": \"USD\"}, \"currentBalance\": 1234.56, \"availableBalance\": 1200.00}, \"transactions\": [{\"transactionId\": \"txn-0001\", \"amount\": 42.50, \"description\": \"SAMPLE MERCHANT PURCHASE (fixture placeholder)\", \"status\": \"PENDING\", \"debitCreditMemo\": \"DEBIT\", \"transactionTimestamp\": \"2026-09-01T10:00:00Z\"}, {\"transactionId\": \"txn-0002\", \"amount\": 1500.00, \"description\": \"SAMPLE PAYROLL DEPOSIT (fixture placeholder)\", \"status\": \"POSTED\", \"debitCreditMemo\": \"CREDIT\", \"postedTimestamp\": \"2026-08-31T09:00:00Z\", \"transactionTimestamp\": \"2026-08-31T09:00:00Z\"}, {\"transactionId\": \"txn-0003\", \"amount\": 75.00, \"description\": \"SAMPLE CARD AUTHORIZATION HOLD (fixture placeholder)\", \"status\": \"AUTHORIZATION\", \"debitCreditMemo\": \"DEBIT\", \"transactionTimestamp\": \"2026-09-03T11:00:00Z\"}]}",
+                  "amounts": [
+                    {
+                      "payload_path": [
+                        "account",
+                        "currentBalance"
+                      ],
+                      "asset": "USD",
+                      "insert_into": [
+                        "observations",
+                        0,
+                        "amount"
+                      ]
+                    },
+                    {
+                      "payload_path": [
+                        "account",
+                        "availableBalance"
+                      ],
+                      "asset": "USD",
+                      "insert_into": [
+                        "observations",
+                        1,
+                        "amount"
+                      ]
+                    }
+                  ],
+                  "body": {
+                    "observations": [
+                      {
+                        "resource_id": "fdx-checking-1",
+                        "category": "currentBalance",
+                        "canonical_hint": "total",
+                        "amount": null,
+                        "provenance": {
+                          "provider_id": "acct-sample-0001",
+                          "observed_at": "2026-09-01T12:00:00Z"
+                        }
+                      },
+                      {
+                        "resource_id": "fdx-checking-1",
+                        "category": "availableBalance",
+                        "canonical_hint": "available",
+                        "amount": null,
+                        "provenance": {
+                          "provider_id": "acct-sample-0001",
+                          "observed_at": "2026-09-01T12:00:00Z"
+                        }
+                      }
+                    ],
+                    "statuses": [
+                      {
+                        "resource_id": "fdx-checking-1"
+                      }
+                    ]
+                  }
+                }
+              ]
+            }
+          ],
+          "history.read": [
+            {
+              "when": {
+                "resources": [
+                  {
+                    "resource_id": "fdx-checking-1"
+                  }
+                ]
+              },
+              "do": [
+                {
+                  "op": "reply_with_decimal_amounts",
+                  "provider_payload_json": "{\"account\": {\"accountId\": \"acct-sample-0001\", \"accountType\": \"CHECKING\", \"accountCategory\": \"DEPOSIT_ACCOUNT\", \"nickname\": \"Sample Checking (fixture placeholder)\", \"accountNumberDisplay\": \"XXXX0000\", \"currency\": {\"currencyCode\": \"USD\"}, \"currentBalance\": 1234.56, \"availableBalance\": 1200.00}, \"transactions\": [{\"transactionId\": \"txn-0001\", \"amount\": 42.50, \"description\": \"SAMPLE MERCHANT PURCHASE (fixture placeholder)\", \"status\": \"PENDING\", \"debitCreditMemo\": \"DEBIT\", \"transactionTimestamp\": \"2026-09-01T10:00:00Z\"}, {\"transactionId\": \"txn-0002\", \"amount\": 1500.00, \"description\": \"SAMPLE PAYROLL DEPOSIT (fixture placeholder)\", \"status\": \"POSTED\", \"debitCreditMemo\": \"CREDIT\", \"postedTimestamp\": \"2026-08-31T09:00:00Z\", \"transactionTimestamp\": \"2026-08-31T09:00:00Z\"}, {\"transactionId\": \"txn-0003\", \"amount\": 75.00, \"description\": \"SAMPLE CARD AUTHORIZATION HOLD (fixture placeholder)\", \"status\": \"AUTHORIZATION\", \"debitCreditMemo\": \"DEBIT\", \"transactionTimestamp\": \"2026-09-03T11:00:00Z\"}]}",
+                  "amounts": [
+                    {
+                      "payload_path": [
+                        "transactions",
+                        0,
+                        "amount"
+                      ],
+                      "asset": "USD",
+                      "negate": true,
+                      "insert_into": [
+                        "observations",
+                        0,
+                        "amount"
+                      ]
+                    },
+                    {
+                      "payload_path": [
+                        "transactions",
+                        1,
+                        "amount"
+                      ],
+                      "asset": "USD",
+                      "insert_into": [
+                        "observations",
+                        1,
+                        "amount"
+                      ]
+                    },
+                    {
+                      "payload_path": [
+                        "transactions",
+                        2,
+                        "amount"
+                      ],
+                      "asset": "USD",
+                      "negate": true,
+                      "insert_into": [
+                        "observations",
+                        2,
+                        "amount"
+                      ]
+                    }
+                  ],
+                  "body": {
+                    "observations": [
+                      {
+                        "resource_id": "fdx-checking-1",
+                        "local_id": "fdx-checking-1:txn-0001",
+                        "provider_id": "txn-0001",
+                        "state": "active",
+                        "surface": "fdx",
+                        "posting": "pending",
+                        "amount": null,
+                        "raw_sign": "provider_negative",
+                        "description": "SAMPLE MERCHANT PURCHASE (fixture placeholder)",
+                        "provider_extra": {
+                          "fdx_status": "PENDING",
+                          "fdx_debitCreditMemo": "DEBIT",
+                          "fdx_amount_unsigned": "42.50",
+                          "fdx_transactionTimestamp": "2026-09-01T10:00:00Z"
+                        },
+                        "provenance": {
+                          "provider_id": "txn-0001",
+                          "observed_at": "2026-09-01T10:00:00Z"
+                        }
+                      },
+                      {
+                        "resource_id": "fdx-checking-1",
+                        "local_id": "fdx-checking-1:txn-0002",
+                        "provider_id": "txn-0002",
+                        "state": "active",
+                        "surface": "fdx",
+                        "posting": "posted",
+                        "amount": null,
+                        "raw_sign": "provider_negative",
+                        "description": "SAMPLE PAYROLL DEPOSIT (fixture placeholder)",
+                        "provider_extra": {
+                          "fdx_status": "POSTED",
+                          "fdx_debitCreditMemo": "CREDIT",
+                          "fdx_amount_unsigned": "1500.00",
+                          "fdx_postedTimestamp": "2026-08-31T09:00:00Z",
+                          "fdx_transactionTimestamp": "2026-08-31T09:00:00Z"
+                        },
+                        "provenance": {
+                          "provider_id": "txn-0002",
+                          "observed_at": "2026-08-31T09:00:00Z"
+                        }
+                      },
+                      {
+                        "resource_id": "fdx-checking-1",
+                        "local_id": "fdx-checking-1:txn-0003",
+                        "provider_id": "txn-0003",
+                        "state": "active",
+                        "surface": "fdx",
+                        "posting": "unknown",
+                        "amount": null,
+                        "raw_sign": "provider_negative",
+                        "description": "SAMPLE CARD AUTHORIZATION HOLD (fixture placeholder)",
+                        "provider_extra": {
+                          "fdx_status": "AUTHORIZATION",
+                          "fdx_debitCreditMemo": "DEBIT",
+                          "fdx_amount_unsigned": "75.00",
+                          "fdx_transactionTimestamp": "2026-09-03T11:00:00Z"
+                        },
+                        "provenance": {
+                          "provider_id": "txn-0003",
+                          "observed_at": "2026-09-03T11:00:00Z"
+                        }
+                      }
+                    ],
+                    "statuses": [
+                      {
+                        "resource_id": "fdx-checking-1",
+                        "page": {
+                          "cursor_resumable": "exact",
+                          "next": null
+                        }
+                      }
+                    ]
+                  }
+                }
+              ]
+            }
+          ]
+        },
+        "provenance": {
+          "adapter_id": "fake-adapter",
+          "surface": "fdx",
+          "completeness": "complete"
+        }
+      }
+    ]
+  },
+  "expect": {
+    "assertions": [
+      "A1"
+    ],
+    "resources": [
+      {
+        "resource_id": "fdx-checking-1",
+        "kind": "bank_checking",
+        "provider_extra": {
+          "fdx_accountType": "CHECKING",
+          "fdx_accountCategory": "DEPOSIT_ACCOUNT",
+          "fdx_nickname": "Sample Checking (fixture placeholder)",
+          "fdx_accountNumberDisplay": "XXXX0000"
+        }
+      }
+    ],
+    "ledger": {
+      "fdx-checking-1": {
+        "balances": [
+          {
+            "category": "currentBalance",
+            "canonical_hint": "total",
+            "amount": {
+              "asset": "USD",
+              "amount": "1234.56"
+            }
+          },
+          {
+            "category": "availableBalance",
+            "canonical_hint": "available",
+            "amount": {
+              "asset": "USD",
+              "amount": "1200.00"
+            }
+          }
+        ],
+        "history": [
+          {
+            "local_id": "fdx-checking-1:txn-0001",
+            "provider_id": "txn-0001",
+            "state": "active",
+            "surface": "fdx",
+            "posting": "pending",
+            "raw_sign": "provider_negative",
+            "amount": {
+              "asset": "USD",
+              "amount": "-42.50"
+            },
+            "provider_extra": {
+              "fdx_status": "PENDING",
+              "fdx_debitCreditMemo": "DEBIT",
+              "fdx_amount_unsigned": "42.50",
+              "fdx_transactionTimestamp": "2026-09-01T10:00:00Z"
+            }
+          },
+          {
+            "local_id": "fdx-checking-1:txn-0002",
+            "provider_id": "txn-0002",
+            "state": "active",
+            "surface": "fdx",
+            "posting": "posted",
+            "raw_sign": "provider_negative",
+            "amount": {
+              "asset": "USD",
+              "amount": "1500.00"
+            },
+            "provider_extra": {
+              "fdx_status": "POSTED",
+              "fdx_debitCreditMemo": "CREDIT",
+              "fdx_amount_unsigned": "1500.00",
+              "fdx_postedTimestamp": "2026-08-31T09:00:00Z",
+              "fdx_transactionTimestamp": "2026-08-31T09:00:00Z"
+            }
+          },
+          {
+            "local_id": "fdx-checking-1:txn-0003",
+            "provider_id": "txn-0003",
+            "state": "active",
+            "surface": "fdx",
+            "posting": "unknown",
+            "raw_sign": "provider_negative",
+            "amount": {
+              "asset": "USD",
+              "amount": "-75.00"
+            },
+            "provider_extra": {
+              "fdx_status": "AUTHORIZATION",
+              "fdx_debitCreditMemo": "DEBIT",
+              "fdx_amount_unsigned": "75.00",
+              "fdx_transactionTimestamp": "2026-09-03T11:00:00Z"
+            }
+          }
+        ]
+      }
+    },
+    "live": {
+      "fdx-checking-1": [
+        "fdx-checking-1:txn-0001",
+        "fdx-checking-1:txn-0002",
+        "fdx-checking-1:txn-0003"
+      ]
+    },
+    "fdx_field_map": {
+      "source": "plaid/core-exchange, branch mj-add-corex-6.4, versions/6.4/corex.yaml (info.version: 6.4.0), commit 5b1c4c6daf7bb4bdb84d13e67917023278b8366c, fetched via `gh api repos/plaid/core-exchange/contents/versions/6.4/corex.yaml?ref=mj-add-corex-6.4` -- the AccountDescriptor, DepositAccountDescriptor, DepositAccount, Transaction, and DepositTransaction schema objects, plus the shared Currency type they reference. Superseded a first draft built from Plaid's browsable 6.3 reference docs; the 6.3 draft had invented three fields the real 6.4 schema does not have on these objects -- see the three removed rows below and spec/fdx-6.4-mapping.md.",
+      "account.accountId": "resources.list observation.provider_id, and status.read/balances.read/history.read observation.resource_id is a Sumer-assigned local mapping (fdx-checking-1) of it",
+      "account.accountType": "provider_extra.fdx_accountType on the resources.list observation (Sumer's resource 'kind' is a coarse-grained mapping: bank_checking)",
+      "account.accountCategory": "provider_extra.fdx_accountCategory on the resources.list observation",
+      "account.nickname": "provider_extra.fdx_nickname on the resources.list observation",
+      "account.accountNumberDisplay": "provider_extra.fdx_accountNumberDisplay on the resources.list observation (already a display-masked placeholder in FDX itself)",
+      "account.currency.currencyCode": "the 'asset' field of both balance AmountWires (USD)",
+      "account.currentBalance": "balances.read observation category=currentBalance, canonical_hint=total, amount",
+      "account.availableBalance": "balances.read observation category=availableBalance, canonical_hint=available, amount",
+      "transactions[].transactionId": "history observation.provider_id, and the tail of local_id",
+      "transactions[].amount": "provider_extra.fdx_amount_unsigned (the untouched FDX absolute value, as a decimal string) AND the signed history observation.amount (see debitCreditMemo mapping below) -- both are kept so no information is lost by the DEBIT/CREDIT-to-sign normalization",
+      "transactions[].debitCreditMemo": "provider_extra.fdx_debitCreditMemo (verbatim) AND the sign of observation.amount (DEBIT -> negative, CREDIT -> positive; observation.raw_sign is fixed at provider_negative for this adapter, meaning: once normalized, a negative amount means a debit)",
+      "transactions[].description": "history observation.description, verbatim, plain text",
+      "transactions[].status": "provider_extra.fdx_status (verbatim, one of PENDING/POSTED/AUTHORIZATION/MEMO) AND observation.posting (PENDING->pending, POSTED->posted, AUTHORIZATION and MEMO->unknown, since Sumer's posting enum only has three states -- txn-0003 exercises the AUTHORIZATION->unknown leg so the LOSSY column has no silent case)",
+      "transactions[].transactionTimestamp": "provenance.observed_at when postedTimestamp is absent (txn-0001, txn-0003); provider_extra.fdx_transactionTimestamp always",
+      "transactions[].postedTimestamp": "provenance.observed_at when present (txn-0002); provider_extra.fdx_postedTimestamp",
+      "_removed_from_6.3_draft": "account.balanceAsOf, transactions[].accountId, and transactions[].currency all appeared in an earlier draft of this payload sourced from Plaid's browsable 6.3 docs. None exist on 6.4's DepositAccount/Transaction schema objects: balanceAsOf is real in 6.4 but only on InvestmentAccount (not DepositAccount); Transaction carries no accountId at all (the account is scoped by the request path, /accounts/{accountId}/transactions, not repeated per-transaction); Transaction carries no currency field (only foreignCurrency, paired with foreignAmount, for the foreign-amount case this fixture does not exercise). All three were removed from the payload rather than kept as 6.3-only fields, per Ruling A6: 6.4 wins.",
+      "balances.read observation.provenance.observed_at": "NOT an FDX-sourced mapping: 6.4's DepositAccount has no per-balance timestamp field (unlike InvestmentAccount's balanceAsOf). Provenance.observed_at is adapter-claimed evidence (spec/observation.md section 1), so this adapter stamps its own fetch-time clock reading here -- there is no source field to lose, so this is not a Lossy entry."
+    },
+    "notes": "Every FDX field named in fdx_field_map lands somewhere named there -- either as a first-class Sumer field or, for anything without a Sumer equivalent (account type/category/nickname/masked number, the untouched unsigned amount, the raw debitCreditMemo and status strings), verbatim in provider_extra with an fdx_-prefixed key so it is visibly provenance rather than a Sumer concept. That claim is now MACHINE-CHECKED in both directions: the runner scans every provider_extra.<key> the map names and requires it to have arrived on the wire (nothing is silently dropped), and requires every provider_extra key that DID arrive to be named by the map (nothing arrives undocumented). The direction that catches an undocumented key reads every provider_extra the adapter emitted ANYWHERE -- the resources.list descriptor and every observation in expect.ledger's sequences, not only the records that survived folding -- so a key smuggled in on a row that is later superseded or tombstoned is still a key that arrived undocumented. expect.ledger additionally pins each provider_extra's full contents EXACTLY -- key sets and values both -- so a dropped or mangled value fails as loudly as a dropped key, and pins the three transactions' ORDER, which a live-set membership list could not: the AUTHORIZATION row arriving before the POSTED one is a different history, and the same three keys. spec/fdx-6.4-mapping.md's LOSSY column, gated by this fixture, is therefore empty for every row this fixture covers because the suite says so, not because the prose does. The prose in each fdx_field_map value stays documentation: the runner reads the provider_extra.<key> targets out of it and nothing else."
+  }
+}

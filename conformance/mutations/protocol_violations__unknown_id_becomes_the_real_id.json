@@ -1,0 +1,17 @@
+{
+  "fixture": "protocol_violations",
+  "assertions": [
+    "A11"
+  ],
+  "covers": [
+    "UnknownId"
+  ],
+  "why": "The final status.read is answered with the requester's own id instead of u64::MAX, so no id is ever unknown and nothing kills the connection. A host that only checked 'did the reply arrive' rather than 'is this an id I issued' passes the unmutated fixture and this one alike.",
+  "adapter": null,
+  "patch": [
+    {
+      "path": "/script/runs/1/on/status.read/0/do/0/op",
+      "value": "reply_ok"
+    }
+  ]
+}

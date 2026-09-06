@@ -1,0 +1,170 @@
+{
+  "case": "null_category",
+  "script": {
+    "runs": [
+      {
+        "label": "default",
+        "on": {
+          "resources.list": [
+            {
+              "do": [
+                {
+                  "op": "reply_ok",
+                  "body": {
+                    "resources": [
+                      {
+                        "resource_id": "checking-4",
+                        "provider_id": "acct_checking_4",
+                        "kind": "bank_checking",
+                        "label": "Example checking account (fixture placeholder)"
+                      }
+                    ]
+                  }
+                }
+              ]
+            }
+          ],
+          "balances.read": [
+            {
+              "when": {
+                "resource_ids": [
+                  "checking-4"
+                ]
+              },
+              "do": [
+                {
+                  "op": "reply_ok",
+                  "body": {
+                    "observations": [
+                      {
+                        "resource_id": "checking-4",
+                        "category": "held",
+                        "canonical_hint": "held",
+                        "amount": null,
+                        "provenance": {
+                          "completeness": "partial"
+                        }
+                      },
+                      {
+                        "resource_id": "checking-4",
+                        "category": "available",
+                        "canonical_hint": "available",
+                        "amount": {
+                          "asset": "USD",
+                          "amount": "612.44"
+                        },
+                        "provenance": {
+                          "completeness": "complete"
+                        }
+                      }
+                    ],
+                    "statuses": [
+                      {
+                        "resource_id": "checking-4"
+                      }
+                    ]
+                  }
+                }
+              ]
+            }
+          ],
+          "history.read": [
+            {
+              "when": {
+                "resources": [
+                  {
+                    "resource_id": "checking-4"
+                  }
+                ]
+              },
+              "do": [
+                {
+                  "op": "reply_ok",
+                  "body": {
+                    "observations": [],
+                    "statuses": [
+                      {
+                        "resource_id": "checking-4",
+                        "page": {
+                          "cursor_resumable": "batch_restart",
+                          "next": null
+                        }
+                      }
+                    ]
+                  }
+                }
+              ]
+            }
+          ],
+          "status.read": [
+            {
+              "when": {
+                "resource_ids": [
+                  "checking-4"
+                ]
+              },
+              "do": [
+                {
+                  "op": "reply_ok",
+                  "body": {
+                    "statuses": [
+                      {
+                        "resource_id": "checking-4",
+                        "outcome": {
+                          "fetched": {
+                            "page_empty": false
+                          }
+                        }
+                      }
+                    ]
+                  }
+                }
+              ]
+            }
+          ]
+        },
+        "provenance": {
+          "adapter_id": "fake-adapter",
+          "provider_id": "acct_checking_4",
+          "surface": "checking",
+          "observed_at": "2026-09-01T00:00:00Z"
+        }
+      }
+    ]
+  },
+  "expect": {
+    "assertions": [
+      "A3"
+    ],
+    "resources": [
+      {
+        "resource_id": "checking-4",
+        "kind": "bank_checking"
+      }
+    ],
+    "ledger": {
+      "checking-4": {
+        "balances": [
+          {
+            "category": "held",
+            "canonical_hint": "held",
+            "amount": null
+          },
+          {
+            "category": "available",
+            "canonical_hint": "available",
+            "amount": {
+              "asset": "USD",
+              "amount": "612.44"
+            }
+          }
+        ],
+        "history": []
+      }
+    },
+    "live": {
+      "checking-4": []
+    },
+    "notes": "Exactly one category (held) is null -- UNKNOWN, never zero -- and exactly one (available) carries an asserted non-null value. A host that emits null for every category (or defaults an absent/unparseable amount to null across the board) passes a naive 'is amount ever null' check but fails here because 'available' MUST come through as exactly 612.44, not null and not 0.00. Conversely a host that treats every category as a plain number and coerces the null 'held' entry to 0 (Unknown != zero, spec/wire.md c) also fails. As an ordered ledger the sequence is also an order claim: held (unknown) BEFORE available (612.44), exactly two lines, nothing else. History and live set are empty and declared so."
+  }
+}

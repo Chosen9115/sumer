@@ -1,0 +1,171 @@
+{
+  "case": "unsupported_op",
+  "script": {
+    "runs": [
+      {
+        "label": "default",
+        "on": {
+          "resources.list": [
+            {
+              "do": [
+                {
+                  "op": "reply_ok",
+                  "body": {
+                    "resources": [
+                      {
+                        "resource_id": "checking-5",
+                        "provider_id": "acct_checking_5",
+                        "kind": "bank_checking",
+                        "label": "Example checking account (fixture placeholder)"
+                      }
+                    ]
+                  }
+                }
+              ],
+              "consume": false
+            }
+          ],
+          "balances.read": [
+            {
+              "when": {
+                "resource_ids": [
+                  "checking-5"
+                ]
+              },
+              "do": [
+                {
+                  "op": "reply_ok",
+                  "body": {
+                    "observations": [
+                      {
+                        "resource_id": "checking-5",
+                        "category": "available",
+                        "canonical_hint": "available",
+                        "amount": {
+                          "asset": "USD",
+                          "amount": "10.00"
+                        },
+                        "provenance": {
+                          "adapter_id": "fake-adapter",
+                          "provider_id": "acct_checking_5",
+                          "surface": "checking",
+                          "observed_at": "2026-09-01T00:00:00Z",
+                          "completeness": "complete"
+                        }
+                      }
+                    ],
+                    "statuses": [
+                      {
+                        "resource_id": "checking-5"
+                      }
+                    ]
+                  }
+                }
+              ]
+            }
+          ],
+          "history.read": [
+            {
+              "when": {
+                "resources": [
+                  {
+                    "resource_id": "checking-5"
+                  }
+                ]
+              },
+              "do": [
+                {
+                  "op": "reply_ok",
+                  "body": {
+                    "observations": [],
+                    "statuses": [
+                      {
+                        "resource_id": "checking-5",
+                        "page": {
+                          "cursor_resumable": "batch_restart",
+                          "next": null
+                        }
+                      }
+                    ]
+                  }
+                }
+              ]
+            }
+          ],
+          "status.read": [
+            {
+              "when": {
+                "resource_ids": [
+                  "checking-5"
+                ]
+              },
+              "do": [
+                {
+                  "op": "reply_ok",
+                  "body": {
+                    "statuses": [
+                      {
+                        "resource_id": "checking-5",
+                        "outcome": {
+                          "fetched": {
+                            "page_empty": false
+                          }
+                        }
+                      }
+                    ]
+                  }
+                }
+              ]
+            }
+          ]
+        }
+      }
+    ]
+  },
+  "expect": {
+    "assertions": [
+      "A4"
+    ],
+    "resources": [
+      {
+        "resource_id": "checking-5",
+        "kind": "bank_checking"
+      }
+    ],
+    "ledger": {
+      "checking-5": {
+        "balances": [
+          {
+            "category": "available",
+            "canonical_hint": "available",
+            "amount": {
+              "asset": "USD",
+              "amount": "10.00"
+            }
+          }
+        ],
+        "history": []
+      }
+    },
+    "live": {
+      "checking-5": []
+    },
+    "probe": {
+      "op": "execute",
+      "params": {},
+      "expected_err": {
+        "code": "unsupported",
+        "detail": {
+          "op": "execute"
+        }
+      }
+    },
+    "must_still_succeed": [
+      "resources.list",
+      "balances.read(checking-5)",
+      "history.read(checking-5)",
+      "status.read(checking-5)"
+    ],
+    "notes": "fake_adapter.py declares no rule for ANY op outside the four capabilities plus hello, so it needs no special scripting for 'execute' specifically -- its generic fallback (see handle() in fake_adapter.py) already answers any undeclared op with err.code=unsupported, detail.op=<the op name>, and never exits or closes the connection. The interesting part of this case is entirely on the RUNNER side: the conformance runner must actually SEND a request for an op the fixture's declared capabilities do not include (this fixture names 'execute' as the probe in expect.probe, since M4's execute() is explicitly out of scope per the frozen contract's section on what PR2 is deliberately not building) at some point interleaved with the normal crawl, and confirm the connection survives to complete the crawl on both sides of the probe -- otherwise a host that kills the connection on ANY unrecognised op, or one that never issues an op outside its own hard-coded four, would both trivially 'pass' a case that never actually sends the probe. The probe is issued BEFORE every read in the crawl, so expect.ledger is the post-probe evidence: 'the connection survived' is not a boolean here, it is the balance line arriving with the right money and the (deliberately empty) history sequence arriving empty rather than not at all. expect.live is empty because this account has no events -- declared empty, not derived, so an adapter that invents one is an orphan the fold reports rather than a difference nobody looks for."
+  }
+}

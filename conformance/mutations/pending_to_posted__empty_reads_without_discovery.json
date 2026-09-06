@@ -1,0 +1,7 @@
+{
+  "fixture": "pending_to_posted",
+  "assertions": [],
+  "why": "The adapter returns empty observation arrays on any connection whose reads begin WITHOUT a resources.list -- the exact trick that passed the suite when a separate 'wire pass' re-issued reads on a fresh process. There is now one recorded connection and every execution opens with discovery, so this adapter is behaviourally identical to the honest one and must provoke nothing. It is kept as the guard on that: reintroduce a second, distinguishable pass and this mutant stops being silent. Its ability to fire at all is checked directly by `the_equivalent_mutants_could_still_fire` in tests/mutations.rs, which drives this wrapper over exactly such a connection and requires it to diverge from the honest adapter -- a guard nobody can fire is dead weight, so it is fired.",
+  "adapter": "empty_without_discovery.py",
+  "patch": []
+}

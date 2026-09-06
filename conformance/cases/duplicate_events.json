@@ -1,0 +1,262 @@
+{
+  "case": "duplicate_events",
+  "script": {
+    "runs": [
+      {
+        "label": "default",
+        "on": {
+          "resources.list": [
+            {
+              "do": [
+                {
+                  "op": "reply_ok",
+                  "body": {
+                    "resources": [
+                      {
+                        "resource_id": "wallet-multi",
+                        "provider_id": "0xEXAMPLEMULTISURFACEWALLET",
+                        "kind": "onchain_wallet",
+                        "label": "Example wallet observed via two independent surfaces (fixture placeholder)"
+                      }
+                    ]
+                  }
+                }
+              ]
+            }
+          ],
+          "balances.read": [
+            {
+              "when": {
+                "resource_ids": [
+                  "wallet-multi"
+                ]
+              },
+              "do": [
+                {
+                  "op": "reply_ok",
+                  "body": {
+                    "observations": [
+                      {
+                        "resource_id": "wallet-multi",
+                        "category": "available",
+                        "canonical_hint": "available",
+                        "amount": {
+                          "asset": "sat",
+                          "amount": "300000"
+                        },
+                        "provenance": {
+                          "provider_id": "0xEXAMPLEMULTISURFACEWALLET",
+                          "surface": "primary",
+                          "observed_at": "2026-09-01T00:00:00Z"
+                        }
+                      }
+                    ],
+                    "statuses": [
+                      {
+                        "resource_id": "wallet-multi"
+                      }
+                    ]
+                  }
+                }
+              ]
+            }
+          ],
+          "history.read": [
+            {
+              "when": {
+                "resources": [
+                  {
+                    "resource_id": "wallet-multi"
+                  }
+                ]
+              },
+              "do": [
+                {
+                  "op": "reply_ok",
+                  "body": {
+                    "observations": [
+                      {
+                        "resource_id": "wallet-multi",
+                        "local_id": "wallet-multi:primary:tx_123",
+                        "provider_id": "tx_123",
+                        "state": "active",
+                        "surface": "primary",
+                        "posting": "posted",
+                        "amount": {
+                          "asset": "sat",
+                          "amount": "100000"
+                        },
+                        "raw_sign": "provider_positive",
+                        "description": "EXAMPLE TRANSFER SEEN ON PRIMARY SURFACE (fixture placeholder)",
+                        "provider_extra": {},
+                        "provenance": {
+                          "provider_id": "tx_123",
+                          "surface": "primary",
+                          "observed_at": "2026-09-01T10:00:00Z"
+                        }
+                      },
+                      {
+                        "resource_id": "wallet-multi",
+                        "local_id": "wallet-multi:secondary:tx_123",
+                        "provider_id": "tx_123",
+                        "state": "active",
+                        "surface": "secondary",
+                        "posting": "posted",
+                        "amount": {
+                          "asset": "sat",
+                          "amount": "200000"
+                        },
+                        "raw_sign": "provider_positive",
+                        "description": "EXAMPLE UNRELATED TRANSFER SEEN ON SECONDARY SURFACE, SAME provider_id BY COINCIDENCE (fixture placeholder)",
+                        "provider_extra": {},
+                        "provenance": {
+                          "provider_id": "tx_123",
+                          "surface": "secondary",
+                          "observed_at": "2026-09-01T10:00:05Z"
+                        }
+                      },
+                      {
+                        "resource_id": "wallet-multi",
+                        "local_id": "wallet-multi:primary:tx_123",
+                        "provider_id": "tx_123",
+                        "state": "active",
+                        "surface": "primary",
+                        "posting": "posted",
+                        "amount": {
+                          "asset": "sat",
+                          "amount": "100000"
+                        },
+                        "raw_sign": "provider_positive",
+                        "description": "EXAMPLE TRANSFER SEEN ON PRIMARY SURFACE (fixture placeholder)",
+                        "provider_extra": {},
+                        "provenance": {
+                          "provider_id": "tx_123",
+                          "surface": "primary",
+                          "observed_at": "2026-09-01T10:05:00Z"
+                        }
+                      }
+                    ],
+                    "statuses": [
+                      {
+                        "resource_id": "wallet-multi",
+                        "page": {
+                          "cursor_resumable": "exact",
+                          "next": null
+                        }
+                      }
+                    ]
+                  }
+                }
+              ]
+            }
+          ],
+          "status.read": [
+            {
+              "when": {
+                "resource_ids": [
+                  "wallet-multi"
+                ]
+              },
+              "do": [
+                {
+                  "op": "reply_ok",
+                  "body": {
+                    "statuses": [
+                      {
+                        "resource_id": "wallet-multi",
+                        "outcome": {
+                          "fetched": {
+                            "page_empty": false
+                          }
+                        }
+                      }
+                    ]
+                  }
+                }
+              ]
+            }
+          ]
+        },
+        "provenance": {
+          "adapter_id": "fake-adapter",
+          "completeness": "complete"
+        }
+      }
+    ]
+  },
+  "expect": {
+    "assertions": [
+      "A2",
+      "A8",
+      "A9"
+    ],
+    "resources": [
+      {
+        "resource_id": "wallet-multi",
+        "kind": "onchain_wallet"
+      }
+    ],
+    "ledger": {
+      "wallet-multi": {
+        "balances": [
+          {
+            "category": "available",
+            "canonical_hint": "available",
+            "amount": {
+              "asset": "sat",
+              "amount": "300000"
+            }
+          }
+        ],
+        "history": [
+          {
+            "local_id": "wallet-multi:primary:tx_123",
+            "provider_id": "tx_123",
+            "state": "active",
+            "surface": "primary",
+            "posting": "posted",
+            "amount": {
+              "asset": "sat",
+              "amount": "100000"
+            },
+            "raw_sign": "provider_positive",
+            "provider_extra": {}
+          },
+          {
+            "local_id": "wallet-multi:secondary:tx_123",
+            "provider_id": "tx_123",
+            "state": "active",
+            "surface": "secondary",
+            "posting": "posted",
+            "amount": {
+              "asset": "sat",
+              "amount": "200000"
+            },
+            "raw_sign": "provider_positive",
+            "provider_extra": {}
+          },
+          {
+            "local_id": "wallet-multi:primary:tx_123",
+            "provider_id": "tx_123",
+            "state": "active",
+            "surface": "primary",
+            "posting": "posted",
+            "amount": {
+              "asset": "sat",
+              "amount": "100000"
+            },
+            "raw_sign": "provider_positive",
+            "provider_extra": {}
+          }
+        ]
+      }
+    },
+    "live": {
+      "wallet-multi": [
+        "wallet-multi:primary:tx_123",
+        "wallet-multi:secondary:tx_123"
+      ]
+    },
+    "notes": "The forbidden-rule guard: provider_id 'tx_123' appears on TWO DIFFERENT SURFACES ('primary' and 'secondary') naming two UNRELATED events (100000 sat vs 200000 sat) -- a coincidence the fixture makes deliberate. A host that dedups by provider_id alone (spec/wire.md c: 'DEDUP BY provider_id ALONE IS FORBIDDEN') collapses these into one event, and expect.live -- DECLARED as two entries, not derived by folding this ledger -- says so. The correct key is local_id, which already encodes the surface.\n\nThe third history entry is wallet-multi:primary:tx_123 AGAIN, byte-identical: an idempotent provider re-send inside one page. The ledger is a SEQUENCE, so all three arrivals are declared in arrival order and the re-send is retained (A8) rather than collapsed -- while the live set still holds exactly one entry for that local_id, since both arrivals describe the same state. Sequence equality is also what makes the second-run id swap visible: swapping the two local_ids leaves the id SET, the counts and the live set all identical, and only the id-to-record association in this ordered sequence contradicts it (A9)."
+  }
+}

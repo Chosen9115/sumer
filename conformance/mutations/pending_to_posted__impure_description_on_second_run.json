@@ -1,0 +1,9 @@
+{
+  "fixture": "pending_to_posted",
+  "assertions": [
+    "A9"
+  ],
+  "why": "The second process invocation attaches a different description to the same local_id. The ids are identical, the live set is identical, and expect.ledger never names description -- so only A9's record-to-id association over the whole history can see it. This is the mutation a bare id-set comparison was blind to.",
+  "adapter": "impure_second_invocation.py",
+  "patch": []
+}

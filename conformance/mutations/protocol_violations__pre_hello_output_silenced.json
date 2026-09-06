@@ -1,0 +1,17 @@
+{
+  "fixture": "protocol_violations",
+  "assertions": [
+    "A11"
+  ],
+  "covers": [
+    "PreHelloOutput"
+  ],
+  "why": "The adapter stops writing its banner before the hello reply, so the spawn succeeds. PreHelloOutput is the one violation detected during the handshake itself; if that detection is ever softened, the only evidence is a spawn that no longer fails.",
+  "adapter": null,
+  "patch": [
+    {
+      "path": "/script/runs/0/pre_hello_stdout",
+      "value": null
+    }
+  ]
+}
