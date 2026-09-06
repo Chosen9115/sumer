@@ -1,0 +1,109 @@
+name: Nightly
+
+# Scheduled workflows always run against the default branch (main), so no
+# extra ref filtering is needed here.
+on:
+  schedule:
+    - cron: "0 7 * * *"
+  workflow_dispatch: {}
+
+permissions:
+  issues: write
+  contents: read
+  # Needed to look up the last successful nightly run via `gh run list`, so
+  # the failure issue can report the commit range since that run.
+  actions: read
+
+concurrency:
+  group: nightly-${{ github.workflow }}
+  cancel-in-progress: true
+
+jobs:
+  nightly:
+    name: full suite (main)
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Install stable Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: stable
+          components: rustfmt, clippy
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+
+      # Runs fmt/clippy/test as one step so a failure anywhere records which
+      # sub-step failed (FAILED_STEP) and keeps a full log (nightly.log) for
+      # the failure-report step below to read. Stays silent on success.
+      - name: Run full suite
+        run: |
+          set -o pipefail
+          run_step() {
+            name="$1"; shift
+            echo "=== $name ===" | tee -a nightly.log
+            if ! "$@" 2>&1 | tee -a nightly.log; then
+              echo "FAILED_STEP=$name" >> "$GITHUB_ENV"
+              exit 1
+            fi
+          }
+          run_step "cargo fmt --all --check" cargo fmt --all --check
+          run_step "cargo clippy --all-targets --all-features -- -D warnings" \
+            cargo clippy --all-targets --all-features -- -D warnings
+          run_step "cargo test --locked --all-features" \
+            cargo test --locked --all-features
+
+      # Only reached when the step above failed. Completely silent otherwise:
+      # no issue, no comment, no step runs.
+      - name: Report failure as a GitHub issue
+        if: failure()
+        run: |
+          set -euo pipefail
+
+          FAILED_STEP="${FAILED_STEP:-unknown step}"
+          LOG_TAIL=$(tail -n 200 nightly.log 2>/dev/null || echo "(no log captured)")
+
+          LAST_SUCCESS_SHA=$(gh run list --workflow=nightly.yml --branch=main \
+            --status=success --limit=1 --json headSha --jq '.[0].headSha' || true)
+          if [ -n "${LAST_SUCCESS_SHA:-}" ]; then
+            COMMIT_RANGE=$(git log --oneline "${LAST_SUCCESS_SHA}..HEAD")
+          else
+            COMMIT_RANGE="(no prior successful nightly run found; showing last 20 commits)
+          $(git log --oneline -20)"
+          fi
+
+          # Built with plain echo (not a heredoc) since this script is itself
+          # indented inside a YAML block scalar, and an indented heredoc
+          # terminator does not match under `set -e` bash rules.
+          {
+            echo "Nightly CI failed on \`main\`."
+            echo
+            echo "**Failing step:** ${FAILED_STEP}"
+            echo "**Run:** ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
+            echo
+            echo "### Log tail (last 200 lines)"
+            echo '```'
+            echo "${LOG_TAIL}"
+            echo '```'
+            echo
+            echo "### Commits since last successful nightly run"
+            echo '```'
+            echo "${COMMIT_RANGE}"
+            echo '```'
+          } > issue_body.md
+
+          # One open ci-failure issue tracks the ongoing incident; further
+          # failures comment on it instead of opening duplicates.
+          EXISTING=$(gh issue list --label ci-failure --state open --limit 1 --json number --jq '.[0].number' || true)
+          if [ -n "${EXISTING:-}" ]; then
+            gh issue comment "${EXISTING}" --body-file issue_body.md
+          else
+            gh issue create --title "Nightly CI failure on main" \
+              --label ci-failure --body-file issue_body.md
+          fi

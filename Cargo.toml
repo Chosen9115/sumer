@@ -1,0 +1,29 @@
+[workspace]
+resolver = "2"
+members = ["core/money"]
+
+[workspace.package]
+edition = "2021"
+license = "Apache-2.0"
+repository = "https://github.com/Chosen9115/sumer"
+
+[workspace.dependencies]
+num-bigint = "0.4"
+serde = { version = "1", features = ["derive"] }
+thiserror = "2"
+proptest = "1"
+serde_json = "1"
+
+[workspace.lints.clippy]
+# No f32/f64 arithmetic anywhere near money (API contract hard rule 1).
+float_arithmetic = "deny"
+# `as` casts include the float-to-int/int-to-float casts rule 1 forbids, plus
+# other lossy numeric truncation on amounts/scales.
+as_conversions = "deny"
+# Money code must return MoneyError on every bad input, never panic (contract:
+# "never a panic, never Ok" in the rejection table).
+unwrap_used = "deny"
+expect_used = "deny"
+
+[profile.release]
+overflow-checks = true
