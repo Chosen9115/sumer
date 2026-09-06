@@ -1,0 +1,193 @@
+{
+  "case": "null_category",
+  "script": {
+    "runs": [
+      {
+        "label": "default",
+        "hello": {
+          "protocol": "1",
+          "adapter_id": "fake-adapter",
+          "adapter_version": "0.1.0",
+          "capabilities": [
+            "resources.list",
+            "balances.read",
+            "history.read",
+            "status.read"
+          ],
+          "local_id_derivation": "fixture-literal@1",
+          "max_in_flight": 1
+        },
+        "on": {
+          "resources.list": [
+            {
+              "do": [
+                {
+                  "op": "reply_ok",
+                  "body": {
+                    "resources": [
+                      {
+                        "resource_id": "checking-4",
+                        "provider_id": "acct_checking_4",
+                        "kind": "bank_checking",
+                        "label": "Example checking account (fixture placeholder)"
+                      }
+                    ]
+                  }
+                }
+              ]
+            }
+          ],
+          "balances.read": [
+            {
+              "when": {
+                "resource_ids": [
+                  "checking-4"
+                ]
+              },
+              "do": [
+                {
+                  "op": "reply_ok",
+                  "body": {
+                    "observations": [
+                      {
+                        "resource_id": "checking-4",
+                        "category": "held",
+                        "canonical_hint": "held",
+                        "amount": null,
+                        "provenance": {
+                          "adapter_id": "fake-adapter",
+                          "provider_id": "acct_checking_4",
+                          "surface": "checking",
+                          "observed_at": "2026-09-01T00:00:00Z",
+                          "completeness": "partial"
+                        }
+                      },
+                      {
+                        "resource_id": "checking-4",
+                        "category": "available",
+                        "canonical_hint": "available",
+                        "amount": {
+                          "asset": "USD",
+                          "amount": "612.44"
+                        },
+                        "provenance": {
+                          "adapter_id": "fake-adapter",
+                          "provider_id": "acct_checking_4",
+                          "surface": "checking",
+                          "observed_at": "2026-09-01T00:00:00Z",
+                          "completeness": "complete"
+                        }
+                      }
+                    ],
+                    "statuses": [
+                      {
+                        "resource_id": "checking-4",
+                        "outcome": {
+                          "fetched": {
+                            "page_empty": false
+                          }
+                        }
+                      }
+                    ]
+                  }
+                }
+              ]
+            }
+          ],
+          "history.read": [
+            {
+              "when": {
+                "resources": [
+                  {
+                    "resource_id": "checking-4",
+                    "page": {
+                      "kind": "cursor",
+                      "cursor": ""
+                    }
+                  }
+                ]
+              },
+              "do": [
+                {
+                  "op": "reply_ok",
+                  "body": {
+                    "observations": [],
+                    "statuses": [
+                      {
+                        "resource_id": "checking-4",
+                        "outcome": {
+                          "fetched": {
+                            "page_empty": true
+                          }
+                        },
+                        "page": {
+                          "cursor_resumable": "batch_restart",
+                          "next": null
+                        }
+                      }
+                    ]
+                  }
+                }
+              ]
+            }
+          ],
+          "status.read": [
+            {
+              "when": {
+                "resource_ids": [
+                  "checking-4"
+                ]
+              },
+              "do": [
+                {
+                  "op": "reply_ok",
+                  "body": {
+                    "statuses": [
+                      {
+                        "resource_id": "checking-4",
+                        "outcome": {
+                          "fetched": {
+                            "page_empty": false
+                          }
+                        }
+                      }
+                    ]
+                  }
+                }
+              ]
+            }
+          ]
+        }
+      }
+    ]
+  },
+  "expect": {
+    "assertions": [
+      "A3"
+    ],
+    "resources": [
+      {
+        "resource_id": "checking-4",
+        "kind": "bank_checking"
+      }
+    ],
+    "balances": {
+      "checking-4": [
+        {
+          "category": "held",
+          "canonical_hint": "held",
+          "amount": null
+        },
+        {
+          "category": "available",
+          "canonical_hint": "available",
+          "amount": {
+            "asset": "USD",
+            "amount": "612.44"
+          }
+        }
+      ]
+    },
+    "notes": "Exactly one category (held) is null -- UNKNOWN, never zero -- and exactly one (available) carries an asserted non-null value. A host that emits null for every category (or defaults an absent/unparseable amount to null across the board) passes a naive 'is amount ever null' check but fails here because 'available' MUST come through as exactly 612.44, not null and not 0.00. Conversely a host that treats every category as a plain number and coerces the null 'held' entry to 0 (Unknown != zero, spec/wire.md c) also fails."
+  }
+}

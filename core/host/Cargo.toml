@@ -1,0 +1,22 @@
+[package]
+name = "sumer-host"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+sumer-wire = { path = "../wire" }
+sumer-money = { path = "../money" }
+tokio = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+[dev-dependencies]
+# Only the test binaries need an actual runtime and the `#[tokio::test]`
+# macro -- the library itself never starts one (see the workspace-level
+# justification in the root Cargo.toml).
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }

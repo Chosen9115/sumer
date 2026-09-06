@@ -1,0 +1,602 @@
+{
+  "case": "protocol_violations",
+  "conformance_hints": {
+    "deadline_ms": 300,
+    "why": "run index 1 (survivable_then_kill) sleeps 600ms on one request to force a host-side timeout/tombstone before replying anyway. The frozen contract's DEFAULT deadline is 30s (spec/wire.md constants) and defines no mechanism for a fixture to request a shorter per-connection deadline for testing. This field is ADVISORY ONLY -- not part of the frozen wire contract -- and the runner is free to ignore it, in which case this scenario needs a real ~30s+ sleep to exercise honestly."
+  },
+  "script": {
+    "runs": [
+      {
+        "label": "pre_hello_kill",
+        "pre_hello_stdout": "not-json-garbage-written-before-any-hello-reply\n",
+        "hello": {
+          "protocol": "1",
+          "adapter_id": "fake-adapter",
+          "adapter_version": "0.1.0",
+          "capabilities": [
+            "resources.list",
+            "balances.read",
+            "history.read",
+            "status.read"
+          ],
+          "local_id_derivation": "fixture-literal@1",
+          "max_in_flight": 1
+        },
+        "on": {}
+      },
+      {
+        "label": "survivable_then_kill",
+        "hello": {
+          "protocol": "1",
+          "adapter_id": "fake-adapter",
+          "adapter_version": "0.1.0",
+          "capabilities": [
+            "resources.list",
+            "balances.read",
+            "history.read",
+            "status.read"
+          ],
+          "local_id_derivation": "fixture-literal@1",
+          "max_in_flight": 2
+        },
+        "on": {
+          "resources.list": [
+            {
+              "do": [
+                {
+                  "op": "reply_ok",
+                  "body": {
+                    "resources": [
+                      {
+                        "resource_id": "res-a",
+                        "provider_id": "provider_res_a",
+                        "kind": "bank_checking",
+                        "label": "Example resource A (fixture placeholder)"
+                      },
+                      {
+                        "resource_id": "res-b",
+                        "provider_id": "provider_res_b",
+                        "kind": "bank_checking",
+                        "label": "Example resource B (fixture placeholder)"
+                      }
+                    ]
+                  }
+                }
+              ]
+            }
+          ],
+          "balances.read": [
+            {
+              "when": {
+                "resource_ids": [
+                  "res-a"
+                ]
+              },
+              "do": [
+                {
+                  "op": "sleep_ms",
+                  "ms": 600
+                },
+                {
+                  "op": "reply_ok",
+                  "body": {
+                    "observations": [
+                      {
+                        "resource_id": "res-a",
+                        "category": "available",
+                        "canonical_hint": "available",
+                        "amount": {
+                          "asset": "USD",
+                          "amount": "1.00"
+                        },
+                        "provenance": {
+                          "adapter_id": "fake-adapter",
+                          "provider_id": "provider_res_a",
+                          "surface": "checking",
+                          "observed_at": "2026-09-01T00:00:00Z",
+                          "completeness": "complete"
+                        }
+                      }
+                    ],
+                    "statuses": [
+                      {
+                        "resource_id": "res-a",
+                        "outcome": {
+                          "fetched": {
+                            "page_empty": false
+                          }
+                        }
+                      }
+                    ]
+                  }
+                }
+              ]
+            },
+            {
+              "when": {
+                "resource_ids": [
+                  "res-b"
+                ]
+              },
+              "do": [
+                {
+                  "op": "reply_ok",
+                  "body": {
+                    "observations": [
+                      {
+                        "resource_id": "res-b",
+                        "category": "available",
+                        "canonical_hint": "available",
+                        "amount": {
+                          "asset": "USD",
+                          "amount": "2.00"
+                        },
+                        "provenance": {
+                          "adapter_id": "fake-adapter",
+                          "provider_id": "provider_res_b",
+                          "surface": "checking",
+                          "observed_at": "2026-09-01T00:00:00Z",
+                          "completeness": "complete"
+                        }
+                      }
+                    ],
+                    "statuses": [
+                      {
+                        "resource_id": "res-b",
+                        "outcome": {
+                          "fetched": {
+                            "page_empty": false
+                          }
+                        }
+                      }
+                    ]
+                  }
+                }
+              ]
+            }
+          ],
+          "history.read": [
+            {
+              "when": {
+                "resources": [
+                  {
+                    "resource_id": "res-a",
+                    "page": {
+                      "kind": "cursor",
+                      "cursor": ""
+                    }
+                  }
+                ]
+              },
+              "do": [
+                {
+                  "op": "defer"
+                }
+              ]
+            },
+            {
+              "when": {
+                "resources": [
+                  {
+                    "resource_id": "res-b",
+                    "page": {
+                      "kind": "cursor",
+                      "cursor": ""
+                    }
+                  }
+                ]
+              },
+              "do": [
+                {
+                  "op": "reply_ok",
+                  "body": {
+                    "observations": [],
+                    "statuses": [
+                      {
+                        "resource_id": "res-b",
+                        "outcome": {
+                          "fetched": {
+                            "page_empty": true
+                          }
+                        },
+                        "page": {
+                          "cursor_resumable": "exact",
+                          "next": null
+                        }
+                      }
+                    ]
+                  }
+                },
+                {
+                  "op": "reply_deferred",
+                  "which": "oldest",
+                  "body": {
+                    "observations": [],
+                    "statuses": [
+                      {
+                        "resource_id": "res-a",
+                        "outcome": {
+                          "fetched": {
+                            "page_empty": true
+                          }
+                        },
+                        "page": {
+                          "cursor_resumable": "exact",
+                          "next": null
+                        }
+                      }
+                    ]
+                  }
+                }
+              ]
+            }
+          ],
+          "status.read": [
+            {
+              "when": {
+                "resource_ids": [
+                  "res-a",
+                  "res-b"
+                ]
+              },
+              "do": [
+                {
+                  "op": "reply_ok_id",
+                  "id": 18446744073709551615,
+                  "body": {
+                    "statuses": [
+                      {
+                        "resource_id": "res-a",
+                        "outcome": {
+                          "fetched": {
+                            "page_empty": false
+                          }
+                        }
+                      },
+                      {
+                        "resource_id": "res-b",
+                        "outcome": {
+                          "fetched": {
+                            "page_empty": false
+                          }
+                        }
+                      }
+                    ]
+                  }
+                }
+              ]
+            }
+          ]
+        }
+      },
+      {
+        "label": "duplicate_kill",
+        "hello": {
+          "protocol": "1",
+          "adapter_id": "fake-adapter",
+          "adapter_version": "0.1.0",
+          "capabilities": [
+            "resources.list",
+            "balances.read",
+            "history.read",
+            "status.read"
+          ],
+          "local_id_derivation": "fixture-literal@1",
+          "max_in_flight": 1
+        },
+        "on": {
+          "resources.list": [
+            {
+              "do": [
+                {
+                  "op": "reply_ok",
+                  "body": {
+                    "resources": [
+                      {
+                        "resource_id": "res-a",
+                        "provider_id": "provider_res_a",
+                        "kind": "bank_checking",
+                        "label": "Example resource A (fixture placeholder)"
+                      }
+                    ]
+                  }
+                },
+                {
+                  "op": "replay_last_reply"
+                }
+              ]
+            }
+          ]
+        }
+      },
+      {
+        "label": "oversize_frame_kill",
+        "hello": {
+          "protocol": "1",
+          "adapter_id": "fake-adapter",
+          "adapter_version": "0.1.0",
+          "capabilities": [
+            "resources.list",
+            "balances.read",
+            "history.read",
+            "status.read"
+          ],
+          "local_id_derivation": "fixture-literal@1",
+          "max_in_flight": 1
+        },
+        "on": {
+          "resources.list": [
+            {
+              "do": [
+                {
+                  "op": "reply_ok",
+                  "body": {
+                    "resources": [
+                      {
+                        "resource_id": "res-a",
+                        "provider_id": "provider_res_a",
+                        "kind": "bank_checking",
+                        "label": "Example resource A (fixture placeholder)"
+                      }
+                    ]
+                  }
+                }
+              ]
+            }
+          ],
+          "balances.read": [
+            {
+              "when": {
+                "resource_ids": [
+                  "res-a"
+                ]
+              },
+              "do": [
+                {
+                  "op": "reply_ok_padded",
+                  "pad_bytes": 1200000,
+                  "pad_path": [
+                    "observations",
+                    0,
+                    "provenance",
+                    "observed_at"
+                  ],
+                  "body": {
+                    "observations": [
+                      {
+                        "resource_id": "res-a",
+                        "category": "available",
+                        "canonical_hint": "available",
+                        "amount": {
+                          "asset": "USD",
+                          "amount": "1.00"
+                        },
+                        "provenance": {
+                          "adapter_id": "fake-adapter",
+                          "provider_id": "provider_res_a",
+                          "surface": "checking",
+                          "observed_at": "<PAD>",
+                          "completeness": "complete"
+                        }
+                      }
+                    ],
+                    "statuses": [
+                      {
+                        "resource_id": "res-a",
+                        "outcome": {
+                          "fetched": {
+                            "page_empty": false
+                          }
+                        }
+                      }
+                    ]
+                  }
+                }
+              ]
+            }
+          ]
+        }
+      },
+      {
+        "label": "garbage_kill",
+        "hello": {
+          "protocol": "1",
+          "adapter_id": "fake-adapter",
+          "adapter_version": "0.1.0",
+          "capabilities": [
+            "resources.list",
+            "balances.read",
+            "history.read",
+            "status.read"
+          ],
+          "local_id_derivation": "fixture-literal@1",
+          "max_in_flight": 1
+        },
+        "on": {
+          "resources.list": [
+            {
+              "do": [
+                {
+                  "op": "reply_ok",
+                  "body": {
+                    "resources": [
+                      {
+                        "resource_id": "res-a",
+                        "provider_id": "provider_res_a",
+                        "kind": "bank_checking",
+                        "label": "Example resource A (fixture placeholder)"
+                      }
+                    ]
+                  }
+                }
+              ]
+            }
+          ],
+          "balances.read": [
+            {
+              "when": {
+                "resource_ids": [
+                  "res-a"
+                ]
+              },
+              "do": [
+                {
+                  "op": "stdout_raw",
+                  "text": "this is not a JSON frame at all\n"
+                }
+              ]
+            }
+          ]
+        }
+      },
+      {
+        "label": "non_utf8_kill",
+        "hello": {
+          "protocol": "1",
+          "adapter_id": "fake-adapter",
+          "adapter_version": "0.1.0",
+          "capabilities": [
+            "resources.list",
+            "balances.read",
+            "history.read",
+            "status.read"
+          ],
+          "local_id_derivation": "fixture-literal@1",
+          "max_in_flight": 1
+        },
+        "on": {
+          "resources.list": [
+            {
+              "do": [
+                {
+                  "op": "reply_ok",
+                  "body": {
+                    "resources": [
+                      {
+                        "resource_id": "res-a",
+                        "provider_id": "provider_res_a",
+                        "kind": "bank_checking",
+                        "label": "Example resource A (fixture placeholder)"
+                      }
+                    ]
+                  }
+                }
+              ]
+            }
+          ],
+          "balances.read": [
+            {
+              "when": {
+                "resource_ids": [
+                  "res-a"
+                ]
+              },
+              "do": [
+                {
+                  "op": "stdout_raw_bytes",
+                  "bytes": [
+                    123,
+                    34,
+                    105,
+                    100,
+                    34,
+                    58,
+                    255,
+                    254,
+                    10
+                  ]
+                }
+              ]
+            }
+          ]
+        }
+      }
+    ]
+  },
+  "expect": {
+    "assertions": [
+      "A4",
+      "A11"
+    ],
+    "run_selector_env": "SUMER_FIXTURE_RUN",
+    "runs": [
+      {
+        "index": 0,
+        "label": "pre_hello_kill",
+        "outcome": {
+          "protocol_violation": {
+            "kind": "PreHelloOutput"
+          }
+        },
+        "notes": "garbage is written before ANY hello reply and before the adapter even reads the hello request. No other request in this run ever gets a legitimate answer."
+      },
+      {
+        "index": 1,
+        "label": "survivable_then_kill",
+        "outcome": {
+          "protocol_violation": {
+            "kind": "UnknownId"
+          }
+        },
+        "must_succeed_before_kill": [
+          "resources.list",
+          "balances.read(res-b)",
+          "history.read(res-a)",
+          "history.read(res-b)"
+        ],
+        "tombstoned_discarded": {
+          "request": "balances.read(res-a)",
+          "detail": "the adapter sleeps 600ms (see conformance_hints.deadline_ms=300) then replies anyway; the host must have already tombstoned the id on timeout, DISCARD this late reply silently, and the connection must survive."
+        },
+        "out_of_order_tolerated": {
+          "detail": "history.read(res-a) is deferred (max_in_flight:2 lets both res-a and res-b requests be in flight); history.read(res-b) is answered first, then the deferred res-a reply is sent second -- the host must correlate by id, not arrival order."
+        },
+        "final_violation": {
+          "request": "status.read(res-a,res-b)",
+          "detail": "the adapter replies with id 18446744073709551615 (u64::MAX), which no reasonable host counter will ever have issued -- ProtocolViolation::UnknownId, KILLS the process."
+        }
+      },
+      {
+        "index": 2,
+        "label": "duplicate_kill",
+        "outcome": {
+          "protocol_violation": {
+            "kind": "DuplicateId"
+          }
+        },
+        "notes": "resources.list is answered once, then the exact same {id,ok} frame is replayed byte-for-byte -- a reply to an ALREADY-ANSWERED id. ProtocolViolation::DuplicateId, KILLS the process."
+      },
+      {
+        "index": 3,
+        "label": "oversize_frame_kill",
+        "outcome": {
+          "protocol_violation": {
+            "kind": "OversizeFrame"
+          }
+        },
+        "notes": "resources.list succeeds normally; the balances.read reply is a syntactically valid, correctly-shaped reply whose line exceeds MAX_FRAME_BYTES=1_048_576 (counted before the LF) purely via a padded provenance.observed_at field. A host that only rejects frames that also fail to parse as JSON, rather than checking raw byte length independently of validity, fails this."
+      },
+      {
+        "index": 4,
+        "label": "garbage_kill",
+        "outcome": {
+          "protocol_violation": {
+            "kind": "NotJson"
+          }
+        },
+        "notes": "resources.list succeeds; the balances.read 'reply' is plain non-JSON text."
+      },
+      {
+        "index": 5,
+        "label": "non_utf8_kill",
+        "outcome": {
+          "protocol_violation": {
+            "kind": "NonUtf8"
+          }
+        },
+        "notes": "resources.list succeeds; the balances.read 'reply' line contains the invalid UTF-8 byte sequence 0xFF 0xFE."
+      }
+    ],
+    "notes": "Six independent process runs, selected by SUMER_FIXTURE_RUN=0..5. This is the one fixture in the suite that needs more than one spawn of the SAME argv, because two of A11's three sub-assertions are fatal (the process cannot continue afterward) and PreHelloOutput specifically must be the very first thing that happens -- no single continuous connection can exercise all of PreHelloOutput, UnknownId, and DuplicateId. See adapters/fake/README.md for why script.runs[] + SUMER_FIXTURE_RUN exists; it is NOT part of the frozen wire contract, and the conformance runner must be written to iterate these six indices for this case specifically."
+  }
+}

@@ -1,0 +1,355 @@
+{
+  "case": "reorg_vanish",
+  "script": {
+    "runs": [
+      {
+        "label": "default",
+        "hello": {
+          "protocol": "1",
+          "adapter_id": "fake-adapter",
+          "adapter_version": "0.1.0",
+          "capabilities": [
+            "resources.list",
+            "balances.read",
+            "history.read",
+            "status.read"
+          ],
+          "local_id_derivation": "fixture-literal@1",
+          "max_in_flight": 1
+        },
+        "on": {
+          "resources.list": [
+            {
+              "do": [
+                {
+                  "op": "reply_ok",
+                  "body": {
+                    "resources": [
+                      {
+                        "resource_id": "wallet-btc",
+                        "provider_id": "bc1qexamplefixtureplaceholderaddress",
+                        "kind": "onchain_wallet",
+                        "label": "Example BTC wallet (fixture placeholder)"
+                      }
+                    ]
+                  }
+                }
+              ]
+            }
+          ],
+          "balances.read": [
+            {
+              "when": {
+                "resource_ids": [
+                  "wallet-btc"
+                ]
+              },
+              "do": [
+                {
+                  "op": "reply_ok",
+                  "body": {
+                    "observations": [
+                      {
+                        "resource_id": "wallet-btc",
+                        "category": "confirmed_balance",
+                        "canonical_hint": "confirmed",
+                        "amount": {
+                          "asset": "sat",
+                          "amount": "5000000"
+                        },
+                        "provenance": {
+                          "adapter_id": "fake-adapter",
+                          "provider_id": "bc1qexamplefixtureplaceholderaddress",
+                          "surface": "onchain",
+                          "observed_at": "2026-09-03T00:00:00Z",
+                          "completeness": "complete"
+                        }
+                      }
+                    ],
+                    "statuses": [
+                      {
+                        "resource_id": "wallet-btc",
+                        "outcome": {
+                          "fetched": {
+                            "page_empty": false
+                          }
+                        }
+                      }
+                    ]
+                  }
+                }
+              ]
+            }
+          ],
+          "history.read": [
+            {
+              "when": {
+                "resources": [
+                  {
+                    "resource_id": "wallet-btc",
+                    "page": {
+                      "kind": "cursor",
+                      "cursor": ""
+                    }
+                  }
+                ]
+              },
+              "do": [
+                {
+                  "op": "reply_ok",
+                  "body": {
+                    "observations": [
+                      {
+                        "resource_id": "wallet-btc",
+                        "local_id": "wallet-btc:txid_reorg_1",
+                        "provider_id": "txid_reorg_1",
+                        "state": "active",
+                        "surface": "onchain",
+                        "posting": "pending",
+                        "amount": {
+                          "asset": "sat",
+                          "amount": "5000000"
+                        },
+                        "raw_sign": "provider_positive",
+                        "description": "EXAMPLE INBOUND TRANSFER (fixture placeholder)",
+                        "provider_extra": {},
+                        "provenance": {
+                          "adapter_id": "fake-adapter",
+                          "provider_id": "txid_reorg_1",
+                          "surface": "onchain",
+                          "observed_at": "2026-09-01T10:00:00Z",
+                          "completeness": "complete"
+                        }
+                      }
+                    ],
+                    "statuses": [
+                      {
+                        "resource_id": "wallet-btc",
+                        "outcome": {
+                          "fetched": {
+                            "page_empty": false
+                          }
+                        },
+                        "page": {
+                          "cursor_resumable": "exact",
+                          "next": {
+                            "kind": "cursor",
+                            "cursor": "wallet-btc:h100"
+                          }
+                        }
+                      }
+                    ]
+                  }
+                }
+              ]
+            },
+            {
+              "when": {
+                "resources": [
+                  {
+                    "resource_id": "wallet-btc",
+                    "page": {
+                      "kind": "cursor",
+                      "cursor": "wallet-btc:h100"
+                    }
+                  }
+                ]
+              },
+              "do": [
+                {
+                  "op": "reply_ok",
+                  "body": {
+                    "observations": [
+                      {
+                        "resource_id": "wallet-btc",
+                        "local_id": "wallet-btc:txid_reorg_1",
+                        "provider_id": "txid_reorg_1",
+                        "state": "tombstoned",
+                        "tombstone_reason": "reorged_out",
+                        "surface": "onchain",
+                        "posting": "pending",
+                        "amount": {
+                          "asset": "sat",
+                          "amount": "5000000"
+                        },
+                        "raw_sign": "provider_positive",
+                        "description": "EXAMPLE INBOUND TRANSFER (fixture placeholder)",
+                        "provider_extra": {},
+                        "provenance": {
+                          "adapter_id": "fake-adapter",
+                          "provider_id": "txid_reorg_1",
+                          "surface": "onchain",
+                          "observed_at": "2026-09-01T10:05:00Z",
+                          "completeness": "complete"
+                        }
+                      }
+                    ],
+                    "statuses": [
+                      {
+                        "resource_id": "wallet-btc",
+                        "outcome": {
+                          "fetched": {
+                            "page_empty": false
+                          }
+                        },
+                        "page": {
+                          "cursor_resumable": "exact",
+                          "next": {
+                            "kind": "cursor",
+                            "cursor": "wallet-btc:h101"
+                          }
+                        }
+                      }
+                    ]
+                  }
+                }
+              ]
+            },
+            {
+              "when": {
+                "resources": [
+                  {
+                    "resource_id": "wallet-btc",
+                    "page": {
+                      "kind": "cursor",
+                      "cursor": "wallet-btc:h101"
+                    }
+                  }
+                ]
+              },
+              "do": [
+                {
+                  "op": "reply_ok",
+                  "body": {
+                    "observations": [
+                      {
+                        "resource_id": "wallet-btc",
+                        "local_id": "wallet-btc:txid_reorg_1",
+                        "provider_id": "txid_reorg_1",
+                        "state": "active",
+                        "surface": "onchain",
+                        "posting": "posted",
+                        "amount": {
+                          "asset": "sat",
+                          "amount": "5000000"
+                        },
+                        "raw_sign": "provider_positive",
+                        "description": "EXAMPLE INBOUND TRANSFER (fixture placeholder)",
+                        "provider_extra": {},
+                        "provenance": {
+                          "adapter_id": "fake-adapter",
+                          "provider_id": "txid_reorg_1",
+                          "surface": "onchain",
+                          "observed_at": "2026-09-03T00:00:00Z",
+                          "completeness": "complete"
+                        }
+                      }
+                    ],
+                    "statuses": [
+                      {
+                        "resource_id": "wallet-btc",
+                        "outcome": {
+                          "fetched": {
+                            "page_empty": false
+                          }
+                        },
+                        "page": {
+                          "cursor_resumable": "exact",
+                          "next": null
+                        }
+                      }
+                    ]
+                  }
+                }
+              ]
+            }
+          ],
+          "status.read": [
+            {
+              "when": {
+                "resource_ids": [
+                  "wallet-btc"
+                ]
+              },
+              "do": [
+                {
+                  "op": "reply_ok",
+                  "body": {
+                    "statuses": [
+                      {
+                        "resource_id": "wallet-btc",
+                        "outcome": {
+                          "fetched": {
+                            "page_empty": false
+                          }
+                        }
+                      }
+                    ]
+                  }
+                }
+              ]
+            }
+          ]
+        }
+      }
+    ]
+  },
+  "expect": {
+    "assertions": [
+      "A2",
+      "A8"
+    ],
+    "resources": [
+      {
+        "resource_id": "wallet-btc",
+        "kind": "onchain_wallet"
+      }
+    ],
+    "history_live_set": {
+      "wallet-btc": [
+        {
+          "local_id": "wallet-btc:txid_reorg_1",
+          "state": "active",
+          "posting": "posted",
+          "amount": {
+            "asset": "sat",
+            "amount": "5000000"
+          },
+          "raw_sign": "provider_positive"
+        }
+      ]
+    },
+    "chains": {
+      "wallet-btc:txid_reorg_1": [
+        {
+          "state": "active",
+          "posting": "pending",
+          "tombstone_reason": null,
+          "amount": {
+            "asset": "sat",
+            "amount": "5000000"
+          }
+        },
+        {
+          "state": "tombstoned",
+          "posting": "pending",
+          "tombstone_reason": "reorged_out",
+          "amount": {
+            "asset": "sat",
+            "amount": "5000000"
+          }
+        },
+        {
+          "state": "active",
+          "posting": "posted",
+          "tombstone_reason": null,
+          "amount": {
+            "asset": "sat",
+            "amount": "5000000"
+          }
+        }
+      ]
+    },
+    "notes": "This is the centrepiece case: ONE local_id (wallet-btc:txid_reorg_1) goes active(pending) -> TOMBSTONED(reorged_out) -> active(posted). Tombstone is NOT terminal -- expect.chains lists all three arrivals in order. A host that treats state:tombstoned as a permanent deletion, or that only retains the final observation, fails A8 even if its final live set (A2) happens to look right. The final live-set entry keeps the SAME local_id throughout (unlike pending_to_posted.json, where posting creates a new local_id) -- that is deliberate: bank pending->posted forks identity, bitcoin re-mining does not, and the fold must handle both under one model per spec/wire.md."
+  }
+}

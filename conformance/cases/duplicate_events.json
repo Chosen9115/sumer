@@ -1,0 +1,286 @@
+{
+  "case": "duplicate_events",
+  "script": {
+    "runs": [
+      {
+        "label": "default",
+        "hello": {
+          "protocol": "1",
+          "adapter_id": "fake-adapter",
+          "adapter_version": "0.1.0",
+          "capabilities": [
+            "resources.list",
+            "balances.read",
+            "history.read",
+            "status.read"
+          ],
+          "local_id_derivation": "fixture-literal@1",
+          "max_in_flight": 1
+        },
+        "on": {
+          "resources.list": [
+            {
+              "do": [
+                {
+                  "op": "reply_ok",
+                  "body": {
+                    "resources": [
+                      {
+                        "resource_id": "wallet-multi",
+                        "provider_id": "0xEXAMPLEMULTISURFACEWALLET",
+                        "kind": "onchain_wallet",
+                        "label": "Example wallet observed via two independent surfaces (fixture placeholder)"
+                      }
+                    ]
+                  }
+                }
+              ]
+            }
+          ],
+          "balances.read": [
+            {
+              "when": {
+                "resource_ids": [
+                  "wallet-multi"
+                ]
+              },
+              "do": [
+                {
+                  "op": "reply_ok",
+                  "body": {
+                    "observations": [
+                      {
+                        "resource_id": "wallet-multi",
+                        "category": "available",
+                        "canonical_hint": "available",
+                        "amount": {
+                          "asset": "sat",
+                          "amount": "300000"
+                        },
+                        "provenance": {
+                          "adapter_id": "fake-adapter",
+                          "provider_id": "0xEXAMPLEMULTISURFACEWALLET",
+                          "surface": "primary",
+                          "observed_at": "2026-09-01T00:00:00Z",
+                          "completeness": "complete"
+                        }
+                      }
+                    ],
+                    "statuses": [
+                      {
+                        "resource_id": "wallet-multi",
+                        "outcome": {
+                          "fetched": {
+                            "page_empty": false
+                          }
+                        }
+                      }
+                    ]
+                  }
+                }
+              ]
+            }
+          ],
+          "history.read": [
+            {
+              "when": {
+                "resources": [
+                  {
+                    "resource_id": "wallet-multi",
+                    "page": {
+                      "kind": "cursor",
+                      "cursor": ""
+                    }
+                  }
+                ]
+              },
+              "do": [
+                {
+                  "op": "reply_ok",
+                  "body": {
+                    "observations": [
+                      {
+                        "resource_id": "wallet-multi",
+                        "local_id": "wallet-multi:primary:tx_123",
+                        "provider_id": "tx_123",
+                        "state": "active",
+                        "surface": "primary",
+                        "posting": "posted",
+                        "amount": {
+                          "asset": "sat",
+                          "amount": "100000"
+                        },
+                        "raw_sign": "provider_positive",
+                        "description": "EXAMPLE TRANSFER SEEN ON PRIMARY SURFACE (fixture placeholder)",
+                        "provider_extra": {},
+                        "provenance": {
+                          "adapter_id": "fake-adapter",
+                          "provider_id": "tx_123",
+                          "surface": "primary",
+                          "observed_at": "2026-09-01T10:00:00Z",
+                          "completeness": "complete"
+                        }
+                      },
+                      {
+                        "resource_id": "wallet-multi",
+                        "local_id": "wallet-multi:secondary:tx_123",
+                        "provider_id": "tx_123",
+                        "state": "active",
+                        "surface": "secondary",
+                        "posting": "posted",
+                        "amount": {
+                          "asset": "sat",
+                          "amount": "200000"
+                        },
+                        "raw_sign": "provider_positive",
+                        "description": "EXAMPLE UNRELATED TRANSFER SEEN ON SECONDARY SURFACE, SAME provider_id BY COINCIDENCE (fixture placeholder)",
+                        "provider_extra": {},
+                        "provenance": {
+                          "adapter_id": "fake-adapter",
+                          "provider_id": "tx_123",
+                          "surface": "secondary",
+                          "observed_at": "2026-09-01T10:00:05Z",
+                          "completeness": "complete"
+                        }
+                      },
+                      {
+                        "resource_id": "wallet-multi",
+                        "local_id": "wallet-multi:primary:tx_123",
+                        "provider_id": "tx_123",
+                        "state": "active",
+                        "surface": "primary",
+                        "posting": "posted",
+                        "amount": {
+                          "asset": "sat",
+                          "amount": "100000"
+                        },
+                        "raw_sign": "provider_positive",
+                        "description": "EXAMPLE TRANSFER SEEN ON PRIMARY SURFACE (fixture placeholder)",
+                        "provider_extra": {},
+                        "provenance": {
+                          "adapter_id": "fake-adapter",
+                          "provider_id": "tx_123",
+                          "surface": "primary",
+                          "observed_at": "2026-09-01T10:05:00Z",
+                          "completeness": "complete"
+                        }
+                      }
+                    ],
+                    "statuses": [
+                      {
+                        "resource_id": "wallet-multi",
+                        "outcome": {
+                          "fetched": {
+                            "page_empty": false
+                          }
+                        },
+                        "page": {
+                          "cursor_resumable": "exact",
+                          "next": null
+                        }
+                      }
+                    ]
+                  }
+                }
+              ]
+            }
+          ],
+          "status.read": [
+            {
+              "when": {
+                "resource_ids": [
+                  "wallet-multi"
+                ]
+              },
+              "do": [
+                {
+                  "op": "reply_ok",
+                  "body": {
+                    "statuses": [
+                      {
+                        "resource_id": "wallet-multi",
+                        "outcome": {
+                          "fetched": {
+                            "page_empty": false
+                          }
+                        }
+                      }
+                    ]
+                  }
+                }
+              ]
+            }
+          ]
+        }
+      }
+    ]
+  },
+  "expect": {
+    "assertions": [
+      "A2",
+      "A8"
+    ],
+    "resources": [
+      {
+        "resource_id": "wallet-multi",
+        "kind": "onchain_wallet"
+      }
+    ],
+    "history_live_set": {
+      "wallet-multi": [
+        {
+          "local_id": "wallet-multi:primary:tx_123",
+          "state": "active",
+          "posting": "posted",
+          "amount": {
+            "asset": "sat",
+            "amount": "100000"
+          }
+        },
+        {
+          "local_id": "wallet-multi:secondary:tx_123",
+          "state": "active",
+          "posting": "posted",
+          "amount": {
+            "asset": "sat",
+            "amount": "200000"
+          }
+        }
+      ]
+    },
+    "chains": {
+      "wallet-multi:primary:tx_123": [
+        {
+          "provider_id": "tx_123",
+          "surface": "primary",
+          "amount": {
+            "asset": "sat",
+            "amount": "100000"
+          }
+        },
+        {
+          "provider_id": "tx_123",
+          "surface": "primary",
+          "amount": {
+            "asset": "sat",
+            "amount": "100000"
+          }
+        }
+      ],
+      "wallet-multi:secondary:tx_123": [
+        {
+          "provider_id": "tx_123",
+          "surface": "secondary",
+          "amount": {
+            "asset": "sat",
+            "amount": "200000"
+          }
+        }
+      ]
+    },
+    "live_set_size": {
+      "wallet-multi": 2
+    },
+    "notes": "The forbidden-rule guard: provider_id 'tx_123' appears on TWO DIFFERENT SURFACES ('primary' and 'secondary') naming two UNRELATED events (100000 sat vs 200000 sat) -- a coincidence the fixture makes deliberate. A host that dedups by provider_id alone (spec/wire.md c: 'DEDUP BY provider_id ALONE IS FORBIDDEN') collapses these into one event and reports a live set of size 1 (whichever observation arrived last wins), losing 100000 or 200000 sat's worth of history. The correct key is local_id, which already encodes the surface, so the live set has exactly 2 entries. Separately, wallet-multi:primary:tx_123 is ALSO emitted twice, byte-identically, simulating an idempotent provider re-send within the same page -- expect.chains lists both arrivals (A8: arrival order and count are retained even when content is unchanged), while the live set (A2) still shows exactly one live entry for that local_id since both arrivals describe the same final state."
+  }
+}

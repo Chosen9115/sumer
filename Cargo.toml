@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["core/money"]
+members = ["core/money", "core/wire", "core/host", "conformance"]
 
 [workspace.package]
 edition = "2021"
@@ -13,6 +13,23 @@ serde = { version = "1", features = ["derive"] }
 thiserror = "2"
 proptest = "1"
 serde_json = "1"
+# sumer-host's supervisor: a child process's stdin/stdout/stderr are
+# asynchronous pipes that must be driven concurrently (writer, reader,
+# stderr-drain, per-request deadline timers) without blocking threads on
+# each other -- exactly what an async runtime is for. Features kept to the
+# minimum the supervisor actually calls: "process" (spawn/wait on the
+# adapter child), "io-util" (AsyncRead/AsyncWriteExt on its stdio pipes),
+# "sync" (mpsc/oneshot/Semaphore for the mux and backpressure), "time"
+# (per-request deadlines and hello-handshake timeout), "rt" (the supervisor
+# spawns its own reader/writer/drain/exit-watch tasks via `tokio::spawn`,
+# gated on this feature even though it does not start a runtime), "macros"
+# (only for the `tokio::select!` proc-macro racing a natural exit against a
+# kill request in `process::supervise` -- not `#[tokio::main]`/`#[tokio::test]`,
+# which need a runtime and stay dev-dependency-only). No "rt-multi-thread"
+# here -- the library never starts its own runtime, it only runs inside
+# whatever runtime its caller (host binary, or these tests) already
+# provides.
+tokio = { version = "1", default-features = false, features = ["process", "io-util", "sync", "time", "rt", "macros"] }
 
 [workspace.lints.clippy]
 # No f32/f64 arithmetic anywhere near money (API contract hard rule 1).

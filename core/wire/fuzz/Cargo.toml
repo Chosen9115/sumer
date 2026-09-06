@@ -1,0 +1,27 @@
+[package]
+name = "sumer-wire-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+# Deliberately its own workspace: this stops cargo from walking up to the
+# repo-root workspace (which does not, and should not, list this directory
+# as a member -- cargo-fuzz's dependency set and edition needs are
+# independent of the main workspace's).
+[workspace]
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+
+[dependencies.sumer-wire]
+path = ".."
+
+[[bin]]
+name = "codec"
+path = "fuzz_targets/codec.rs"
+test = false
+doc = false
+bench = false

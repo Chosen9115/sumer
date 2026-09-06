@@ -1,0 +1,258 @@
+{
+  "case": "oversized_observation",
+  "script": {
+    "runs": [
+      {
+        "label": "default",
+        "hello": {
+          "protocol": "1",
+          "adapter_id": "fake-adapter",
+          "adapter_version": "0.1.0",
+          "capabilities": [
+            "resources.list",
+            "balances.read",
+            "history.read",
+            "status.read"
+          ],
+          "local_id_derivation": "fixture-literal@1",
+          "max_in_flight": 1
+        },
+        "on": {
+          "resources.list": [
+            {
+              "do": [
+                {
+                  "op": "reply_ok",
+                  "body": {
+                    "resources": [
+                      {
+                        "resource_id": "wallet-oversized",
+                        "provider_id": "0xEXAMPLEOVERSIZEDWALLET",
+                        "kind": "onchain_wallet",
+                        "label": "Example wallet with one oversized and one truncated event (fixture placeholder)"
+                      }
+                    ]
+                  }
+                }
+              ]
+            }
+          ],
+          "balances.read": [
+            {
+              "when": {
+                "resource_ids": [
+                  "wallet-oversized"
+                ]
+              },
+              "do": [
+                {
+                  "op": "reply_ok",
+                  "body": {
+                    "observations": [
+                      {
+                        "resource_id": "wallet-oversized",
+                        "category": "available",
+                        "canonical_hint": "available",
+                        "amount": {
+                          "asset": "sat",
+                          "amount": "900000"
+                        },
+                        "provenance": {
+                          "adapter_id": "fake-adapter",
+                          "provider_id": "0xEXAMPLEOVERSIZEDWALLET",
+                          "surface": "onchain",
+                          "observed_at": "2026-09-01T00:00:00Z",
+                          "completeness": "complete"
+                        }
+                      }
+                    ],
+                    "statuses": [
+                      {
+                        "resource_id": "wallet-oversized",
+                        "outcome": {
+                          "fetched": {
+                            "page_empty": false
+                          }
+                        }
+                      }
+                    ]
+                  }
+                }
+              ]
+            }
+          ],
+          "status.read": [
+            {
+              "when": {
+                "resource_ids": [
+                  "wallet-oversized"
+                ]
+              },
+              "do": [
+                {
+                  "op": "reply_ok",
+                  "body": {
+                    "statuses": [
+                      {
+                        "resource_id": "wallet-oversized",
+                        "outcome": {
+                          "fetched": {
+                            "page_empty": false
+                          }
+                        }
+                      }
+                    ]
+                  }
+                }
+              ]
+            }
+          ],
+          "history.read": [
+            {
+              "when": {
+                "resources": [
+                  {
+                    "resource_id": "wallet-oversized",
+                    "page": {
+                      "kind": "cursor",
+                      "cursor": ""
+                    }
+                  }
+                ]
+              },
+              "do": [
+                {
+                  "op": "reply_ok",
+                  "body": {
+                    "observations": [
+                      {
+                        "resource_id": "wallet-oversized",
+                        "local_id": "wallet-oversized:sibling-small",
+                        "provider_id": "sibling-small",
+                        "state": "active",
+                        "surface": "onchain",
+                        "posting": "posted",
+                        "amount": {
+                          "asset": "sat",
+                          "amount": "500"
+                        },
+                        "raw_sign": "provider_positive",
+                        "description": "SMALL SIBLING EVENT, UNTRUNCATED (fixture placeholder)",
+                        "provider_extra": {
+                          "memo": "small and ordinary"
+                        },
+                        "provenance": {
+                          "adapter_id": "fake-adapter",
+                          "provider_id": "sibling-small",
+                          "surface": "onchain",
+                          "observed_at": "2026-09-01T10:00:00Z",
+                          "completeness": "complete"
+                        }
+                      },
+                      {
+                        "resource_id": "wallet-oversized",
+                        "local_id": "wallet-oversized:big-truncatable",
+                        "provider_id": "big-truncatable",
+                        "state": "active",
+                        "surface": "onchain",
+                        "posting": "posted",
+                        "amount": {
+                          "asset": "sat",
+                          "amount": "700000"
+                        },
+                        "raw_sign": "provider_positive",
+                        "description": "EVENT WHOSE provider_extra WAS TOO LARGE AND HAS BEEN TRUNCATED (fixture placeholder)",
+                        "provider_extra": {
+                          "_truncated": true,
+                          "_original_bytes": 120000
+                        },
+                        "provenance": {
+                          "adapter_id": "fake-adapter",
+                          "provider_id": "big-truncatable",
+                          "surface": "onchain",
+                          "observed_at": "2026-09-01T10:05:00Z",
+                          "completeness": "partial"
+                        }
+                      }
+                    ],
+                    "statuses": [
+                      {
+                        "resource_id": "wallet-oversized",
+                        "outcome": {
+                          "oversized_observation": {
+                            "local_id": "wallet-oversized:big-untruncatable",
+                            "bytes": 260000
+                          }
+                        },
+                        "page": {
+                          "cursor_resumable": "exact",
+                          "next": null
+                        }
+                      }
+                    ]
+                  }
+                }
+              ]
+            }
+          ]
+        }
+      }
+    ]
+  },
+  "expect": {
+    "assertions": [
+      "A10"
+    ],
+    "resources": [
+      {
+        "resource_id": "wallet-oversized",
+        "kind": "onchain_wallet"
+      }
+    ],
+    "history_live_set": {
+      "wallet-oversized": [
+        {
+          "local_id": "wallet-oversized:sibling-small",
+          "state": "active",
+          "posting": "posted",
+          "amount": {
+            "asset": "sat",
+            "amount": "500"
+          },
+          "completeness": "complete"
+        },
+        {
+          "local_id": "wallet-oversized:big-truncatable",
+          "state": "active",
+          "posting": "posted",
+          "amount": {
+            "asset": "sat",
+            "amount": "700000"
+          },
+          "completeness": "partial",
+          "provider_extra": {
+            "_truncated": true,
+            "_original_bytes": 120000
+          }
+        }
+      ]
+    },
+    "omitted_observations": {
+      "wallet-oversized": [
+        {
+          "local_id": "wallet-oversized:big-untruncatable",
+          "reported_bytes": 260000
+        }
+      ]
+    },
+    "statuses": {
+      "wallet-oversized": {
+        "oversized_observation": {
+          "local_id": "wallet-oversized:big-untruncatable",
+          "bytes": 260000
+        }
+      }
+    },
+    "notes": "Three-way check, and all three must hold simultaneously or A10 is vacuous: (1) wallet-oversized:big-truncatable is PRESENT with provider_extra collapsed to exactly {_truncated:true,_original_bytes:120000} and completeness:Partial -- the truncation marker from spec/wire.md e, verbatim; (2) wallet-oversized:sibling-small is a SMALL, ORDINARY, UNTRUNCATED observation in the SAME page -- a host or adapter that truncates/drops everything in a page once it sees one oversized entry fails here even though the truncated entry itself looks right; (3) wallet-oversized:big-untruncatable never appears in observations at all (MAX_OBSERVATION_BYTES=65536 exceeded even after truncating provider_extra) but its outcome is still reported via the resource's single statuses entry, and the resource is still 'readable' -- the two other observations in the SAME reply prove the page was not bricked by the one oversized event."
+  }
+}

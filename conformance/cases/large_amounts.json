@@ -1,0 +1,293 @@
+{
+  "case": "large_amounts",
+  "script": {
+    "runs": [
+      {
+        "label": "default",
+        "hello": {
+          "protocol": "1",
+          "adapter_id": "fake-adapter",
+          "adapter_version": "0.1.0",
+          "capabilities": [
+            "resources.list",
+            "balances.read",
+            "history.read",
+            "status.read"
+          ],
+          "local_id_derivation": "fixture-literal@1",
+          "max_in_flight": 1
+        },
+        "on": {
+          "resources.list": [
+            {
+              "do": [
+                {
+                  "op": "reply_ok",
+                  "body": {
+                    "resources": [
+                      {
+                        "resource_id": "wallet-eth",
+                        "provider_id": "0xEXAMPLE000000000000000000000000000WALLET",
+                        "kind": "onchain_wallet",
+                        "label": "Example ETH wallet (fixture placeholder)"
+                      },
+                      {
+                        "resource_id": "wallet-btc",
+                        "provider_id": "bc1qexamplefixtureplaceholderaddress",
+                        "kind": "onchain_wallet",
+                        "label": "Example BTC wallet (fixture placeholder)"
+                      }
+                    ]
+                  }
+                }
+              ]
+            }
+          ],
+          "balances.read": [
+            {
+              "when": {
+                "resource_ids": [
+                  "wallet-eth",
+                  "wallet-btc"
+                ]
+              },
+              "do": [
+                {
+                  "op": "reply_ok",
+                  "body": {
+                    "observations": [
+                      {
+                        "resource_id": "wallet-eth",
+                        "category": "wei_balance",
+                        "canonical_hint": null,
+                        "amount": {
+                          "asset": "eth-wei",
+                          "amount": "115792089237316195423570985008687907853269984665640564039457584007913129639935"
+                        },
+                        "provenance": {
+                          "adapter_id": "fake-adapter",
+                          "provider_id": "0xEXAMPLE000000000000000000000000000WALLET",
+                          "surface": "onchain",
+                          "observed_at": "2026-09-01T00:00:00Z",
+                          "completeness": "complete"
+                        }
+                      },
+                      {
+                        "resource_id": "wallet-eth",
+                        "category": "eth_balance",
+                        "canonical_hint": "available",
+                        "amount": {
+                          "asset": "ETH",
+                          "amount": "1000000.123456789012345678"
+                        },
+                        "provenance": {
+                          "adapter_id": "fake-adapter",
+                          "provider_id": "0xEXAMPLE000000000000000000000000000WALLET",
+                          "surface": "onchain",
+                          "observed_at": "2026-09-01T00:00:00Z",
+                          "completeness": "complete"
+                        }
+                      },
+                      {
+                        "resource_id": "wallet-btc",
+                        "category": "satoshi_balance",
+                        "canonical_hint": "available",
+                        "amount": {
+                          "asset": "sat",
+                          "amount": "2100000000000000"
+                        },
+                        "provenance": {
+                          "adapter_id": "fake-adapter",
+                          "provider_id": "bc1qexamplefixtureplaceholderaddress",
+                          "surface": "onchain",
+                          "observed_at": "2026-09-01T00:00:00Z",
+                          "completeness": "complete"
+                        }
+                      }
+                    ],
+                    "statuses": [
+                      {
+                        "resource_id": "wallet-eth",
+                        "outcome": {
+                          "fetched": {
+                            "page_empty": false
+                          }
+                        }
+                      },
+                      {
+                        "resource_id": "wallet-btc",
+                        "outcome": {
+                          "fetched": {
+                            "page_empty": false
+                          }
+                        }
+                      }
+                    ]
+                  }
+                }
+              ]
+            }
+          ],
+          "history.read": [
+            {
+              "when": {
+                "resources": [
+                  {
+                    "resource_id": "wallet-eth",
+                    "page": {
+                      "kind": "cursor",
+                      "cursor": ""
+                    }
+                  }
+                ]
+              },
+              "do": [
+                {
+                  "op": "reply_ok",
+                  "body": {
+                    "observations": [],
+                    "statuses": [
+                      {
+                        "resource_id": "wallet-eth",
+                        "outcome": {
+                          "fetched": {
+                            "page_empty": true
+                          }
+                        },
+                        "page": {
+                          "cursor_resumable": "exact",
+                          "next": null
+                        }
+                      }
+                    ]
+                  }
+                }
+              ]
+            },
+            {
+              "when": {
+                "resources": [
+                  {
+                    "resource_id": "wallet-btc",
+                    "page": {
+                      "kind": "cursor",
+                      "cursor": ""
+                    }
+                  }
+                ]
+              },
+              "do": [
+                {
+                  "op": "reply_ok",
+                  "body": {
+                    "observations": [],
+                    "statuses": [
+                      {
+                        "resource_id": "wallet-btc",
+                        "outcome": {
+                          "fetched": {
+                            "page_empty": true
+                          }
+                        },
+                        "page": {
+                          "cursor_resumable": "exact",
+                          "next": null
+                        }
+                      }
+                    ]
+                  }
+                }
+              ]
+            }
+          ],
+          "status.read": [
+            {
+              "when": {
+                "resource_ids": [
+                  "wallet-eth",
+                  "wallet-btc"
+                ]
+              },
+              "do": [
+                {
+                  "op": "reply_ok",
+                  "body": {
+                    "statuses": [
+                      {
+                        "resource_id": "wallet-eth",
+                        "outcome": {
+                          "fetched": {
+                            "page_empty": false
+                          }
+                        }
+                      },
+                      {
+                        "resource_id": "wallet-btc",
+                        "outcome": {
+                          "fetched": {
+                            "page_empty": false
+                          }
+                        }
+                      }
+                    ]
+                  }
+                }
+              ]
+            }
+          ]
+        }
+      }
+    ]
+  },
+  "expect": {
+    "assertions": [
+      "A1"
+    ],
+    "resources": [
+      {
+        "resource_id": "wallet-eth",
+        "kind": "onchain_wallet"
+      },
+      {
+        "resource_id": "wallet-btc",
+        "kind": "onchain_wallet"
+      }
+    ],
+    "balances": {
+      "wallet-eth": [
+        {
+          "category": "wei_balance",
+          "canonical_hint": null,
+          "amount": {
+            "asset": "eth-wei",
+            "amount": "115792089237316195423570985008687907853269984665640564039457584007913129639935"
+          }
+        },
+        {
+          "category": "eth_balance",
+          "canonical_hint": "available",
+          "amount": {
+            "asset": "ETH",
+            "amount": "1000000.123456789012345678"
+          }
+        }
+      ],
+      "wallet-btc": [
+        {
+          "category": "satoshi_balance",
+          "canonical_hint": "available",
+          "amount": {
+            "asset": "sat",
+            "amount": "2100000000000000"
+          }
+        }
+      ]
+    },
+    "compare": "cmp_same_asset",
+    "grammar_check": {
+      "wei_balance_digit_count": 78,
+      "eth_balance_scale": 18,
+      "note": "the wei value is the exact uint256::MAX magnitude (78 significant digits); an f64-backed decoder loses precision below the last ~2 significant digits. cmp_same_asset must treat this string as exactly equal to itself re-parsed, not merely 'close'."
+    }
+  }
+}

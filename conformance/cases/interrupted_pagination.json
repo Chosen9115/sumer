@@ -1,0 +1,1533 @@
+{
+  "case": "interrupted_pagination",
+  "script": {
+    "runs": [
+      {
+        "label": "exact_full",
+        "hello": {
+          "protocol": "1",
+          "adapter_id": "fake-adapter",
+          "adapter_version": "0.1.0",
+          "capabilities": [
+            "resources.list",
+            "balances.read",
+            "history.read",
+            "status.read"
+          ],
+          "local_id_derivation": "fixture-literal@1",
+          "max_in_flight": 1
+        },
+        "on": {
+          "resources.list": [
+            {
+              "do": [
+                {
+                  "op": "reply_ok",
+                  "body": {
+                    "resources": [
+                      {
+                        "resource_id": "wallet-page",
+                        "provider_id": "0xEXAMPLEPAGEDWALLET",
+                        "kind": "onchain_wallet",
+                        "label": "Example wallet paginated by block height (fixture placeholder)"
+                      }
+                    ]
+                  }
+                }
+              ]
+            }
+          ],
+          "balances.read": [
+            {
+              "when": {
+                "resource_ids": [
+                  "wallet-page"
+                ]
+              },
+              "do": [
+                {
+                  "op": "reply_ok",
+                  "body": {
+                    "observations": [
+                      {
+                        "resource_id": "wallet-page",
+                        "category": "available",
+                        "canonical_hint": "available",
+                        "amount": {
+                          "asset": "sat",
+                          "amount": "400000"
+                        },
+                        "provenance": {
+                          "adapter_id": "fake-adapter",
+                          "provider_id": "0xEXAMPLEPAGEDWALLET",
+                          "surface": "onchain",
+                          "observed_at": "2026-09-01T00:00:00Z",
+                          "completeness": "complete"
+                        }
+                      }
+                    ],
+                    "statuses": [
+                      {
+                        "resource_id": "wallet-page",
+                        "outcome": {
+                          "fetched": {
+                            "page_empty": false
+                          }
+                        }
+                      }
+                    ]
+                  }
+                }
+              ]
+            }
+          ],
+          "status.read": [
+            {
+              "when": {
+                "resource_ids": [
+                  "wallet-page"
+                ]
+              },
+              "do": [
+                {
+                  "op": "reply_ok",
+                  "body": {
+                    "statuses": [
+                      {
+                        "resource_id": "wallet-page",
+                        "outcome": {
+                          "fetched": {
+                            "page_empty": false
+                          }
+                        }
+                      }
+                    ]
+                  }
+                }
+              ]
+            }
+          ],
+          "history.read": [
+            {
+              "when": {
+                "resources": [
+                  {
+                    "resource_id": "wallet-page",
+                    "page": {
+                      "kind": "cursor",
+                      "cursor": ""
+                    }
+                  }
+                ]
+              },
+              "do": [
+                {
+                  "op": "reply_ok",
+                  "body": {
+                    "observations": [
+                      {
+                        "resource_id": "wallet-page",
+                        "local_id": "wallet-page:e1",
+                        "provider_id": "e1",
+                        "state": "active",
+                        "surface": "onchain",
+                        "posting": "posted",
+                        "amount": {
+                          "asset": "sat",
+                          "amount": "10000"
+                        },
+                        "raw_sign": "provider_positive",
+                        "description": "EXAMPLE EVENT 1 (fixture placeholder)",
+                        "provider_extra": {},
+                        "provenance": {
+                          "adapter_id": "fake-adapter",
+                          "provider_id": "e1",
+                          "surface": "onchain",
+                          "observed_at": "2026-09-01T01:00:00Z",
+                          "completeness": "complete"
+                        }
+                      },
+                      {
+                        "resource_id": "wallet-page",
+                        "local_id": "wallet-page:e2",
+                        "provider_id": "e2",
+                        "state": "active",
+                        "surface": "onchain",
+                        "posting": "posted",
+                        "amount": {
+                          "asset": "sat",
+                          "amount": "20000"
+                        },
+                        "raw_sign": "provider_positive",
+                        "description": "EXAMPLE EVENT 2 (fixture placeholder)",
+                        "provider_extra": {},
+                        "provenance": {
+                          "adapter_id": "fake-adapter",
+                          "provider_id": "e2",
+                          "surface": "onchain",
+                          "observed_at": "2026-09-01T02:00:00Z",
+                          "completeness": "complete"
+                        }
+                      }
+                    ],
+                    "statuses": [
+                      {
+                        "resource_id": "wallet-page",
+                        "outcome": {
+                          "fetched": {
+                            "page_empty": false
+                          }
+                        },
+                        "page": {
+                          "cursor_resumable": "exact",
+                          "next": {
+                            "kind": "cursor",
+                            "cursor": "wallet-page:h100"
+                          }
+                        }
+                      }
+                    ]
+                  }
+                }
+              ]
+            },
+            {
+              "when": {
+                "resources": [
+                  {
+                    "resource_id": "wallet-page",
+                    "page": {
+                      "kind": "cursor",
+                      "cursor": "wallet-page:h100"
+                    }
+                  }
+                ]
+              },
+              "do": [
+                {
+                  "op": "reply_ok",
+                  "body": {
+                    "observations": [
+                      {
+                        "resource_id": "wallet-page",
+                        "local_id": "wallet-page:e3",
+                        "provider_id": "e3",
+                        "state": "active",
+                        "surface": "onchain",
+                        "posting": "posted",
+                        "amount": {
+                          "asset": "sat",
+                          "amount": "30000"
+                        },
+                        "raw_sign": "provider_positive",
+                        "description": "EXAMPLE EVENT 3 (fixture placeholder)",
+                        "provider_extra": {},
+                        "provenance": {
+                          "adapter_id": "fake-adapter",
+                          "provider_id": "e3",
+                          "surface": "onchain",
+                          "observed_at": "2026-09-01T03:00:00Z",
+                          "completeness": "complete"
+                        }
+                      }
+                    ],
+                    "statuses": [
+                      {
+                        "resource_id": "wallet-page",
+                        "outcome": {
+                          "fetched": {
+                            "page_empty": false
+                          }
+                        },
+                        "page": {
+                          "cursor_resumable": "exact",
+                          "next": {
+                            "kind": "cursor",
+                            "cursor": "wallet-page:h200"
+                          }
+                        }
+                      }
+                    ]
+                  }
+                }
+              ]
+            },
+            {
+              "when": {
+                "resources": [
+                  {
+                    "resource_id": "wallet-page",
+                    "page": {
+                      "kind": "cursor",
+                      "cursor": "wallet-page:h200"
+                    }
+                  }
+                ]
+              },
+              "do": [
+                {
+                  "op": "reply_ok",
+                  "body": {
+                    "observations": [
+                      {
+                        "resource_id": "wallet-page",
+                        "local_id": "wallet-page:e4",
+                        "provider_id": "e4",
+                        "state": "active",
+                        "surface": "onchain",
+                        "posting": "posted",
+                        "amount": {
+                          "asset": "sat",
+                          "amount": "40000"
+                        },
+                        "raw_sign": "provider_positive",
+                        "description": "EXAMPLE EVENT 4 (fixture placeholder)",
+                        "provider_extra": {},
+                        "provenance": {
+                          "adapter_id": "fake-adapter",
+                          "provider_id": "e4",
+                          "surface": "onchain",
+                          "observed_at": "2026-09-01T04:00:00Z",
+                          "completeness": "complete"
+                        }
+                      }
+                    ],
+                    "statuses": [
+                      {
+                        "resource_id": "wallet-page",
+                        "outcome": {
+                          "fetched": {
+                            "page_empty": false
+                          }
+                        },
+                        "page": {
+                          "cursor_resumable": "exact",
+                          "next": null
+                        }
+                      }
+                    ]
+                  }
+                }
+              ]
+            }
+          ]
+        }
+      },
+      {
+        "label": "exact_interrupted_before",
+        "hello": {
+          "protocol": "1",
+          "adapter_id": "fake-adapter",
+          "adapter_version": "0.1.0",
+          "capabilities": [
+            "resources.list",
+            "balances.read",
+            "history.read",
+            "status.read"
+          ],
+          "local_id_derivation": "fixture-literal@1",
+          "max_in_flight": 1
+        },
+        "on": {
+          "resources.list": [
+            {
+              "do": [
+                {
+                  "op": "reply_ok",
+                  "body": {
+                    "resources": [
+                      {
+                        "resource_id": "wallet-page",
+                        "provider_id": "0xEXAMPLEPAGEDWALLET",
+                        "kind": "onchain_wallet",
+                        "label": "Example wallet paginated by block height (fixture placeholder)"
+                      }
+                    ]
+                  }
+                }
+              ]
+            }
+          ],
+          "history.read": [
+            {
+              "when": {
+                "resources": [
+                  {
+                    "resource_id": "wallet-page",
+                    "page": {
+                      "kind": "cursor",
+                      "cursor": ""
+                    }
+                  }
+                ]
+              },
+              "do": [
+                {
+                  "op": "reply_ok",
+                  "body": {
+                    "observations": [
+                      {
+                        "resource_id": "wallet-page",
+                        "local_id": "wallet-page:e1",
+                        "provider_id": "e1",
+                        "state": "active",
+                        "surface": "onchain",
+                        "posting": "posted",
+                        "amount": {
+                          "asset": "sat",
+                          "amount": "10000"
+                        },
+                        "raw_sign": "provider_positive",
+                        "description": "EXAMPLE EVENT 1 (fixture placeholder)",
+                        "provider_extra": {},
+                        "provenance": {
+                          "adapter_id": "fake-adapter",
+                          "provider_id": "e1",
+                          "surface": "onchain",
+                          "observed_at": "2026-09-01T01:00:00Z",
+                          "completeness": "complete"
+                        }
+                      },
+                      {
+                        "resource_id": "wallet-page",
+                        "local_id": "wallet-page:e2",
+                        "provider_id": "e2",
+                        "state": "active",
+                        "surface": "onchain",
+                        "posting": "posted",
+                        "amount": {
+                          "asset": "sat",
+                          "amount": "20000"
+                        },
+                        "raw_sign": "provider_positive",
+                        "description": "EXAMPLE EVENT 2 (fixture placeholder)",
+                        "provider_extra": {},
+                        "provenance": {
+                          "adapter_id": "fake-adapter",
+                          "provider_id": "e2",
+                          "surface": "onchain",
+                          "observed_at": "2026-09-01T02:00:00Z",
+                          "completeness": "complete"
+                        }
+                      }
+                    ],
+                    "statuses": [
+                      {
+                        "resource_id": "wallet-page",
+                        "outcome": {
+                          "fetched": {
+                            "page_empty": false
+                          }
+                        },
+                        "page": {
+                          "cursor_resumable": "exact",
+                          "next": {
+                            "kind": "cursor",
+                            "cursor": "wallet-page:h100"
+                          }
+                        }
+                      }
+                    ]
+                  }
+                }
+              ]
+            },
+            {
+              "when": {
+                "resources": [
+                  {
+                    "resource_id": "wallet-page",
+                    "page": {
+                      "kind": "cursor",
+                      "cursor": "wallet-page:h100"
+                    }
+                  }
+                ]
+              },
+              "do": [
+                {
+                  "op": "exit",
+                  "code": 1
+                }
+              ]
+            }
+          ],
+          "balances.read": [
+            {
+              "when": {
+                "resource_ids": [
+                  "wallet-page"
+                ]
+              },
+              "do": [
+                {
+                  "op": "reply_ok",
+                  "body": {
+                    "observations": [
+                      {
+                        "resource_id": "wallet-page",
+                        "category": "available",
+                        "canonical_hint": "available",
+                        "amount": {
+                          "asset": "sat",
+                          "amount": "400000"
+                        },
+                        "provenance": {
+                          "adapter_id": "fake-adapter",
+                          "provider_id": "0xEXAMPLEPAGEDWALLET",
+                          "surface": "onchain",
+                          "observed_at": "2026-09-01T00:00:00Z",
+                          "completeness": "complete"
+                        }
+                      }
+                    ],
+                    "statuses": [
+                      {
+                        "resource_id": "wallet-page",
+                        "outcome": {
+                          "fetched": {
+                            "page_empty": false
+                          }
+                        }
+                      }
+                    ]
+                  }
+                }
+              ]
+            }
+          ],
+          "status.read": [
+            {
+              "when": {
+                "resource_ids": [
+                  "wallet-page"
+                ]
+              },
+              "do": [
+                {
+                  "op": "reply_ok",
+                  "body": {
+                    "statuses": [
+                      {
+                        "resource_id": "wallet-page",
+                        "outcome": {
+                          "fetched": {
+                            "page_empty": false
+                          }
+                        }
+                      }
+                    ]
+                  }
+                }
+              ]
+            }
+          ]
+        }
+      },
+      {
+        "label": "exact_interrupted_after",
+        "hello": {
+          "protocol": "1",
+          "adapter_id": "fake-adapter",
+          "adapter_version": "0.1.0",
+          "capabilities": [
+            "resources.list",
+            "balances.read",
+            "history.read",
+            "status.read"
+          ],
+          "local_id_derivation": "fixture-literal@1",
+          "max_in_flight": 1
+        },
+        "on": {
+          "history.read": [
+            {
+              "when": {
+                "resources": [
+                  {
+                    "resource_id": "wallet-page",
+                    "page": {
+                      "kind": "cursor",
+                      "cursor": "wallet-page:h100"
+                    }
+                  }
+                ]
+              },
+              "do": [
+                {
+                  "op": "reply_ok",
+                  "body": {
+                    "observations": [
+                      {
+                        "resource_id": "wallet-page",
+                        "local_id": "wallet-page:e3",
+                        "provider_id": "e3",
+                        "state": "active",
+                        "surface": "onchain",
+                        "posting": "posted",
+                        "amount": {
+                          "asset": "sat",
+                          "amount": "30000"
+                        },
+                        "raw_sign": "provider_positive",
+                        "description": "EXAMPLE EVENT 3 (fixture placeholder)",
+                        "provider_extra": {},
+                        "provenance": {
+                          "adapter_id": "fake-adapter",
+                          "provider_id": "e3",
+                          "surface": "onchain",
+                          "observed_at": "2026-09-01T03:00:00Z",
+                          "completeness": "complete"
+                        }
+                      }
+                    ],
+                    "statuses": [
+                      {
+                        "resource_id": "wallet-page",
+                        "outcome": {
+                          "fetched": {
+                            "page_empty": false
+                          }
+                        },
+                        "page": {
+                          "cursor_resumable": "exact",
+                          "next": {
+                            "kind": "cursor",
+                            "cursor": "wallet-page:h200"
+                          }
+                        }
+                      }
+                    ]
+                  }
+                }
+              ]
+            },
+            {
+              "when": {
+                "resources": [
+                  {
+                    "resource_id": "wallet-page",
+                    "page": {
+                      "kind": "cursor",
+                      "cursor": "wallet-page:h200"
+                    }
+                  }
+                ]
+              },
+              "do": [
+                {
+                  "op": "reply_ok",
+                  "body": {
+                    "observations": [
+                      {
+                        "resource_id": "wallet-page",
+                        "local_id": "wallet-page:e4",
+                        "provider_id": "e4",
+                        "state": "active",
+                        "surface": "onchain",
+                        "posting": "posted",
+                        "amount": {
+                          "asset": "sat",
+                          "amount": "40000"
+                        },
+                        "raw_sign": "provider_positive",
+                        "description": "EXAMPLE EVENT 4 (fixture placeholder)",
+                        "provider_extra": {},
+                        "provenance": {
+                          "adapter_id": "fake-adapter",
+                          "provider_id": "e4",
+                          "surface": "onchain",
+                          "observed_at": "2026-09-01T04:00:00Z",
+                          "completeness": "complete"
+                        }
+                      }
+                    ],
+                    "statuses": [
+                      {
+                        "resource_id": "wallet-page",
+                        "outcome": {
+                          "fetched": {
+                            "page_empty": false
+                          }
+                        },
+                        "page": {
+                          "cursor_resumable": "exact",
+                          "next": null
+                        }
+                      }
+                    ]
+                  }
+                }
+              ]
+            }
+          ],
+          "resources.list": [
+            {
+              "do": [
+                {
+                  "op": "reply_ok",
+                  "body": {
+                    "resources": [
+                      {
+                        "resource_id": "wallet-page",
+                        "provider_id": "0xEXAMPLEPAGEDWALLET",
+                        "kind": "onchain_wallet",
+                        "label": "Example wallet paginated by block height (fixture placeholder)"
+                      }
+                    ]
+                  }
+                }
+              ]
+            }
+          ],
+          "balances.read": [
+            {
+              "when": {
+                "resource_ids": [
+                  "wallet-page"
+                ]
+              },
+              "do": [
+                {
+                  "op": "reply_ok",
+                  "body": {
+                    "observations": [
+                      {
+                        "resource_id": "wallet-page",
+                        "category": "available",
+                        "canonical_hint": "available",
+                        "amount": {
+                          "asset": "sat",
+                          "amount": "400000"
+                        },
+                        "provenance": {
+                          "adapter_id": "fake-adapter",
+                          "provider_id": "0xEXAMPLEPAGEDWALLET",
+                          "surface": "onchain",
+                          "observed_at": "2026-09-01T00:00:00Z",
+                          "completeness": "complete"
+                        }
+                      }
+                    ],
+                    "statuses": [
+                      {
+                        "resource_id": "wallet-page",
+                        "outcome": {
+                          "fetched": {
+                            "page_empty": false
+                          }
+                        }
+                      }
+                    ]
+                  }
+                }
+              ]
+            }
+          ],
+          "status.read": [
+            {
+              "when": {
+                "resource_ids": [
+                  "wallet-page"
+                ]
+              },
+              "do": [
+                {
+                  "op": "reply_ok",
+                  "body": {
+                    "statuses": [
+                      {
+                        "resource_id": "wallet-page",
+                        "outcome": {
+                          "fetched": {
+                            "page_empty": false
+                          }
+                        }
+                      }
+                    ]
+                  }
+                }
+              ]
+            }
+          ]
+        }
+      },
+      {
+        "label": "batch_restart_full",
+        "hello": {
+          "protocol": "1",
+          "adapter_id": "fake-adapter",
+          "adapter_version": "0.1.0",
+          "capabilities": [
+            "resources.list",
+            "balances.read",
+            "history.read",
+            "status.read"
+          ],
+          "local_id_derivation": "fixture-literal@1",
+          "max_in_flight": 1
+        },
+        "on": {
+          "resources.list": [
+            {
+              "do": [
+                {
+                  "op": "reply_ok",
+                  "body": {
+                    "resources": [
+                      {
+                        "resource_id": "acct-page",
+                        "provider_id": "acct_page_1",
+                        "kind": "bank_checking",
+                        "label": "Example account paginated Plaid-style (fixture placeholder)"
+                      }
+                    ]
+                  }
+                }
+              ]
+            }
+          ],
+          "balances.read": [
+            {
+              "when": {
+                "resource_ids": [
+                  "acct-page"
+                ]
+              },
+              "do": [
+                {
+                  "op": "reply_ok",
+                  "body": {
+                    "observations": [
+                      {
+                        "resource_id": "acct-page",
+                        "category": "available",
+                        "canonical_hint": "available",
+                        "amount": {
+                          "asset": "USD",
+                          "amount": "500.00"
+                        },
+                        "provenance": {
+                          "adapter_id": "fake-adapter",
+                          "provider_id": "acct_page_1",
+                          "surface": "checking",
+                          "observed_at": "2026-09-01T00:00:00Z",
+                          "completeness": "complete"
+                        }
+                      }
+                    ],
+                    "statuses": [
+                      {
+                        "resource_id": "acct-page",
+                        "outcome": {
+                          "fetched": {
+                            "page_empty": false
+                          }
+                        }
+                      }
+                    ]
+                  }
+                }
+              ]
+            }
+          ],
+          "status.read": [
+            {
+              "when": {
+                "resource_ids": [
+                  "acct-page"
+                ]
+              },
+              "do": [
+                {
+                  "op": "reply_ok",
+                  "body": {
+                    "statuses": [
+                      {
+                        "resource_id": "acct-page",
+                        "outcome": {
+                          "fetched": {
+                            "page_empty": false
+                          }
+                        }
+                      }
+                    ]
+                  }
+                }
+              ]
+            }
+          ],
+          "history.read": [
+            {
+              "when": {
+                "resources": [
+                  {
+                    "resource_id": "acct-page",
+                    "page": {
+                      "kind": "cursor",
+                      "cursor": ""
+                    }
+                  }
+                ]
+              },
+              "do": [
+                {
+                  "op": "reply_ok",
+                  "body": {
+                    "observations": [
+                      {
+                        "resource_id": "acct-page",
+                        "local_id": "acct-page:f1",
+                        "provider_id": "f1",
+                        "state": "active",
+                        "surface": "checking",
+                        "posting": "posted",
+                        "amount": {
+                          "asset": "USD",
+                          "amount": "12.00"
+                        },
+                        "raw_sign": "provider_negative",
+                        "description": "EXAMPLE EVENT F1 (fixture placeholder)",
+                        "provider_extra": {},
+                        "provenance": {
+                          "adapter_id": "fake-adapter",
+                          "provider_id": "f1",
+                          "surface": "checking",
+                          "observed_at": "2026-09-01T01:00:00Z",
+                          "completeness": "complete"
+                        }
+                      },
+                      {
+                        "resource_id": "acct-page",
+                        "local_id": "acct-page:f2",
+                        "provider_id": "f2",
+                        "state": "active",
+                        "surface": "checking",
+                        "posting": "posted",
+                        "amount": {
+                          "asset": "USD",
+                          "amount": "34.00"
+                        },
+                        "raw_sign": "provider_negative",
+                        "description": "EXAMPLE EVENT F2 (fixture placeholder)",
+                        "provider_extra": {},
+                        "provenance": {
+                          "adapter_id": "fake-adapter",
+                          "provider_id": "f2",
+                          "surface": "checking",
+                          "observed_at": "2026-09-01T02:00:00Z",
+                          "completeness": "complete"
+                        }
+                      }
+                    ],
+                    "statuses": [
+                      {
+                        "resource_id": "acct-page",
+                        "outcome": {
+                          "fetched": {
+                            "page_empty": false
+                          }
+                        },
+                        "page": {
+                          "cursor_resumable": "batch_restart",
+                          "next": {
+                            "kind": "cursor",
+                            "cursor": "acct-page:continue"
+                          }
+                        }
+                      }
+                    ]
+                  }
+                }
+              ]
+            },
+            {
+              "when": {
+                "resources": [
+                  {
+                    "resource_id": "acct-page",
+                    "page": {
+                      "kind": "cursor",
+                      "cursor": "acct-page:continue"
+                    }
+                  }
+                ]
+              },
+              "do": [
+                {
+                  "op": "reply_ok",
+                  "body": {
+                    "observations": [
+                      {
+                        "resource_id": "acct-page",
+                        "local_id": "acct-page:f3",
+                        "provider_id": "f3",
+                        "state": "active",
+                        "surface": "checking",
+                        "posting": "posted",
+                        "amount": {
+                          "asset": "USD",
+                          "amount": "56.00"
+                        },
+                        "raw_sign": "provider_negative",
+                        "description": "EXAMPLE EVENT F3 (fixture placeholder)",
+                        "provider_extra": {},
+                        "provenance": {
+                          "adapter_id": "fake-adapter",
+                          "provider_id": "f3",
+                          "surface": "checking",
+                          "observed_at": "2026-09-01T03:00:00Z",
+                          "completeness": "complete"
+                        }
+                      }
+                    ],
+                    "statuses": [
+                      {
+                        "resource_id": "acct-page",
+                        "outcome": {
+                          "fetched": {
+                            "page_empty": false
+                          }
+                        },
+                        "page": {
+                          "cursor_resumable": "batch_restart",
+                          "next": null
+                        }
+                      }
+                    ]
+                  }
+                }
+              ]
+            }
+          ]
+        }
+      },
+      {
+        "label": "batch_restart_interrupted_before",
+        "hello": {
+          "protocol": "1",
+          "adapter_id": "fake-adapter",
+          "adapter_version": "0.1.0",
+          "capabilities": [
+            "resources.list",
+            "balances.read",
+            "history.read",
+            "status.read"
+          ],
+          "local_id_derivation": "fixture-literal@1",
+          "max_in_flight": 1
+        },
+        "on": {
+          "resources.list": [
+            {
+              "do": [
+                {
+                  "op": "reply_ok",
+                  "body": {
+                    "resources": [
+                      {
+                        "resource_id": "acct-page",
+                        "provider_id": "acct_page_1",
+                        "kind": "bank_checking",
+                        "label": "Example account paginated Plaid-style (fixture placeholder)"
+                      }
+                    ]
+                  }
+                }
+              ]
+            }
+          ],
+          "history.read": [
+            {
+              "when": {
+                "resources": [
+                  {
+                    "resource_id": "acct-page",
+                    "page": {
+                      "kind": "cursor",
+                      "cursor": ""
+                    }
+                  }
+                ]
+              },
+              "do": [
+                {
+                  "op": "reply_ok",
+                  "body": {
+                    "observations": [
+                      {
+                        "resource_id": "acct-page",
+                        "local_id": "acct-page:f1",
+                        "provider_id": "f1",
+                        "state": "active",
+                        "surface": "checking",
+                        "posting": "posted",
+                        "amount": {
+                          "asset": "USD",
+                          "amount": "12.00"
+                        },
+                        "raw_sign": "provider_negative",
+                        "description": "EXAMPLE EVENT F1 (fixture placeholder)",
+                        "provider_extra": {},
+                        "provenance": {
+                          "adapter_id": "fake-adapter",
+                          "provider_id": "f1",
+                          "surface": "checking",
+                          "observed_at": "2026-09-01T01:00:00Z",
+                          "completeness": "complete"
+                        }
+                      },
+                      {
+                        "resource_id": "acct-page",
+                        "local_id": "acct-page:f2",
+                        "provider_id": "f2",
+                        "state": "active",
+                        "surface": "checking",
+                        "posting": "posted",
+                        "amount": {
+                          "asset": "USD",
+                          "amount": "34.00"
+                        },
+                        "raw_sign": "provider_negative",
+                        "description": "EXAMPLE EVENT F2 (fixture placeholder)",
+                        "provider_extra": {},
+                        "provenance": {
+                          "adapter_id": "fake-adapter",
+                          "provider_id": "f2",
+                          "surface": "checking",
+                          "observed_at": "2026-09-01T02:00:00Z",
+                          "completeness": "complete"
+                        }
+                      }
+                    ],
+                    "statuses": [
+                      {
+                        "resource_id": "acct-page",
+                        "outcome": {
+                          "fetched": {
+                            "page_empty": false
+                          }
+                        },
+                        "page": {
+                          "cursor_resumable": "batch_restart",
+                          "next": {
+                            "kind": "cursor",
+                            "cursor": "acct-page:continue"
+                          }
+                        }
+                      }
+                    ]
+                  }
+                }
+              ]
+            },
+            {
+              "when": {
+                "resources": [
+                  {
+                    "resource_id": "acct-page",
+                    "page": {
+                      "kind": "cursor",
+                      "cursor": "acct-page:continue"
+                    }
+                  }
+                ]
+              },
+              "do": [
+                {
+                  "op": "exit",
+                  "code": 1
+                }
+              ]
+            }
+          ],
+          "balances.read": [
+            {
+              "when": {
+                "resource_ids": [
+                  "acct-page"
+                ]
+              },
+              "do": [
+                {
+                  "op": "reply_ok",
+                  "body": {
+                    "observations": [
+                      {
+                        "resource_id": "acct-page",
+                        "category": "available",
+                        "canonical_hint": "available",
+                        "amount": {
+                          "asset": "USD",
+                          "amount": "500.00"
+                        },
+                        "provenance": {
+                          "adapter_id": "fake-adapter",
+                          "provider_id": "acct_page_1",
+                          "surface": "checking",
+                          "observed_at": "2026-09-01T00:00:00Z",
+                          "completeness": "complete"
+                        }
+                      }
+                    ],
+                    "statuses": [
+                      {
+                        "resource_id": "acct-page",
+                        "outcome": {
+                          "fetched": {
+                            "page_empty": false
+                          }
+                        }
+                      }
+                    ]
+                  }
+                }
+              ]
+            }
+          ],
+          "status.read": [
+            {
+              "when": {
+                "resource_ids": [
+                  "acct-page"
+                ]
+              },
+              "do": [
+                {
+                  "op": "reply_ok",
+                  "body": {
+                    "statuses": [
+                      {
+                        "resource_id": "acct-page",
+                        "outcome": {
+                          "fetched": {
+                            "page_empty": false
+                          }
+                        }
+                      }
+                    ]
+                  }
+                }
+              ]
+            }
+          ]
+        }
+      },
+      {
+        "label": "batch_restart_interrupted_after",
+        "hello": {
+          "protocol": "1",
+          "adapter_id": "fake-adapter",
+          "adapter_version": "0.1.0",
+          "capabilities": [
+            "resources.list",
+            "balances.read",
+            "history.read",
+            "status.read"
+          ],
+          "local_id_derivation": "fixture-literal@1",
+          "max_in_flight": 1
+        },
+        "on": {
+          "history.read": [
+            {
+              "when": {
+                "resources": [
+                  {
+                    "resource_id": "acct-page",
+                    "page": {
+                      "kind": "cursor",
+                      "cursor": ""
+                    }
+                  }
+                ]
+              },
+              "do": [
+                {
+                  "op": "reply_ok",
+                  "body": {
+                    "observations": [
+                      {
+                        "resource_id": "acct-page",
+                        "local_id": "acct-page:f1",
+                        "provider_id": "f1",
+                        "state": "active",
+                        "surface": "checking",
+                        "posting": "posted",
+                        "amount": {
+                          "asset": "USD",
+                          "amount": "12.00"
+                        },
+                        "raw_sign": "provider_negative",
+                        "description": "EXAMPLE EVENT F1 (fixture placeholder)",
+                        "provider_extra": {},
+                        "provenance": {
+                          "adapter_id": "fake-adapter",
+                          "provider_id": "f1",
+                          "surface": "checking",
+                          "observed_at": "2026-09-01T01:00:00Z",
+                          "completeness": "complete"
+                        }
+                      },
+                      {
+                        "resource_id": "acct-page",
+                        "local_id": "acct-page:f2",
+                        "provider_id": "f2",
+                        "state": "active",
+                        "surface": "checking",
+                        "posting": "posted",
+                        "amount": {
+                          "asset": "USD",
+                          "amount": "34.00"
+                        },
+                        "raw_sign": "provider_negative",
+                        "description": "EXAMPLE EVENT F2 (fixture placeholder)",
+                        "provider_extra": {},
+                        "provenance": {
+                          "adapter_id": "fake-adapter",
+                          "provider_id": "f2",
+                          "surface": "checking",
+                          "observed_at": "2026-09-01T02:00:00Z",
+                          "completeness": "complete"
+                        }
+                      }
+                    ],
+                    "statuses": [
+                      {
+                        "resource_id": "acct-page",
+                        "outcome": {
+                          "fetched": {
+                            "page_empty": false
+                          }
+                        },
+                        "page": {
+                          "cursor_resumable": "batch_restart",
+                          "next": {
+                            "kind": "cursor",
+                            "cursor": "acct-page:continue"
+                          }
+                        }
+                      }
+                    ]
+                  }
+                }
+              ]
+            },
+            {
+              "when": {
+                "resources": [
+                  {
+                    "resource_id": "acct-page",
+                    "page": {
+                      "kind": "cursor",
+                      "cursor": "acct-page:continue"
+                    }
+                  }
+                ]
+              },
+              "do": [
+                {
+                  "op": "reply_ok",
+                  "body": {
+                    "observations": [
+                      {
+                        "resource_id": "acct-page",
+                        "local_id": "acct-page:f3",
+                        "provider_id": "f3",
+                        "state": "active",
+                        "surface": "checking",
+                        "posting": "posted",
+                        "amount": {
+                          "asset": "USD",
+                          "amount": "56.00"
+                        },
+                        "raw_sign": "provider_negative",
+                        "description": "EXAMPLE EVENT F3 (fixture placeholder)",
+                        "provider_extra": {},
+                        "provenance": {
+                          "adapter_id": "fake-adapter",
+                          "provider_id": "f3",
+                          "surface": "checking",
+                          "observed_at": "2026-09-01T03:00:00Z",
+                          "completeness": "complete"
+                        }
+                      }
+                    ],
+                    "statuses": [
+                      {
+                        "resource_id": "acct-page",
+                        "outcome": {
+                          "fetched": {
+                            "page_empty": false
+                          }
+                        },
+                        "page": {
+                          "cursor_resumable": "batch_restart",
+                          "next": null
+                        }
+                      }
+                    ]
+                  }
+                }
+              ]
+            }
+          ],
+          "resources.list": [
+            {
+              "do": [
+                {
+                  "op": "reply_ok",
+                  "body": {
+                    "resources": [
+                      {
+                        "resource_id": "acct-page",
+                        "provider_id": "acct_page_1",
+                        "kind": "bank_checking",
+                        "label": "Example account paginated Plaid-style (fixture placeholder)"
+                      }
+                    ]
+                  }
+                }
+              ]
+            }
+          ],
+          "balances.read": [
+            {
+              "when": {
+                "resource_ids": [
+                  "acct-page"
+                ]
+              },
+              "do": [
+                {
+                  "op": "reply_ok",
+                  "body": {
+                    "observations": [
+                      {
+                        "resource_id": "acct-page",
+                        "category": "available",
+                        "canonical_hint": "available",
+                        "amount": {
+                          "asset": "USD",
+                          "amount": "500.00"
+                        },
+                        "provenance": {
+                          "adapter_id": "fake-adapter",
+                          "provider_id": "acct_page_1",
+                          "surface": "checking",
+                          "observed_at": "2026-09-01T00:00:00Z",
+                          "completeness": "complete"
+                        }
+                      }
+                    ],
+                    "statuses": [
+                      {
+                        "resource_id": "acct-page",
+                        "outcome": {
+                          "fetched": {
+                            "page_empty": false
+                          }
+                        }
+                      }
+                    ]
+                  }
+                }
+              ]
+            }
+          ],
+          "status.read": [
+            {
+              "when": {
+                "resource_ids": [
+                  "acct-page"
+                ]
+              },
+              "do": [
+                {
+                  "op": "reply_ok",
+                  "body": {
+                    "statuses": [
+                      {
+                        "resource_id": "acct-page",
+                        "outcome": {
+                          "fetched": {
+                            "page_empty": false
+                          }
+                        }
+                      }
+                    ]
+                  }
+                }
+              ]
+            }
+          ]
+        }
+      }
+    ]
+  },
+  "expect": {
+    "assertions": [
+      "A2",
+      "A5"
+    ],
+    "run_selector_env": "SUMER_FIXTURE_RUN",
+    "families": {
+      "exact": {
+        "resource_id": "wallet-page",
+        "cursor_resumable": "exact",
+        "uninterrupted_run": {
+          "index": 0,
+          "label": "exact_full"
+        },
+        "interrupted_before_run": {
+          "index": 1,
+          "label": "exact_interrupted_before"
+        },
+        "interrupted_after_run": {
+          "index": 2,
+          "label": "exact_interrupted_after"
+        },
+        "full_live_set": [
+          "wallet-page:e1",
+          "wallet-page:e2",
+          "wallet-page:e3",
+          "wallet-page:e4"
+        ],
+        "resume_cursor": "wallet-page:h100",
+        "must_not_reemit_before_resume_cursor": [
+          "wallet-page:e1",
+          "wallet-page:e2"
+        ],
+        "uninterrupted_tail_frame_count_after_resume_cursor": 2,
+        "max_post_resume_frame_count": 3
+      },
+      "batch_restart": {
+        "resource_id": "acct-page",
+        "cursor_resumable": "batch_restart",
+        "uninterrupted_run": {
+          "index": 3,
+          "label": "batch_restart_full"
+        },
+        "interrupted_before_run": {
+          "index": 4,
+          "label": "batch_restart_interrupted_before"
+        },
+        "interrupted_after_run": {
+          "index": 5,
+          "label": "batch_restart_interrupted_after"
+        },
+        "full_live_set": [
+          "acct-page:f1",
+          "acct-page:f2",
+          "acct-page:f3"
+        ],
+        "resume_restarts_whole_batch": true,
+        "redelivered_on_resume": [
+          "acct-page:f1",
+          "acct-page:f2"
+        ]
+      }
+    },
+    "notes": "Six runs, selected by SUMER_FIXTURE_RUN (0-5); see the 'families' block for which triple of runs belongs to which cursor family. exact: the *_before run serves page 1 (e1,e2, next cursor h100) then EXITS instead of answering the h100 request -- the runner must kill/observe the crash, spawn *_after fresh, and resend cursor h100; *_after has no rule for anything except cursor h100/h200, so it will visibly fail (FIXTURE BUG stderr line, err.code=internal) if the runner resends anything else, which is the intended trip-wire for 'no event strictly before the resume cursor is re-emitted'. batch_restart: the *_before run serves the WHOLE first batch (f1,f2, next 'continue', batch NOT finished) then exits when asked to continue; because batch_restart only advances the durable cursor on next:null, the correct resume request is the ORIGINAL window request (not the 'continue' cursor) -- *_after's only rule matches that original window shape and re-serves f1+f2 before f3, exercising idempotent re-delivery rather than the exact family's no-reemission guarantee (which explicitly does NOT apply to batch_restart)."
+  }
+}
