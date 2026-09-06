@@ -12,6 +12,16 @@
 //! expectations are checked against **one** implementation instead of two
 //! that could silently diverge.
 //!
+//! **Known limit: nothing in this crate calls it.** [`crate::AdapterHandle`]
+//! never assigns a revision -- `history_read` hands observations back and
+//! says the fold is the caller's step -- so the conformance suite is this
+//! module's only consumer today. "The host assigns `revision` by arrival
+//! order" is therefore proven against `Fold` itself, and against a `Fold`
+//! the suite drives over real adapter reads, but never end to end through
+//! a host doing it on its own behalf: an integration built on
+//! `AdapterHandle` alone would get no revisions at all and nothing would
+//! notice. Closes when the CLI arrives and becomes that caller.
+//!
 //! **Revision order vs. chain order are two different things, on purpose.**
 //! `revision` is assigned strictly in the order [`Fold::ingest`] is called
 //! (the order the host actually received observations on the wire) -- a

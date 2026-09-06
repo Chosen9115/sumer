@@ -52,11 +52,17 @@ impl Failure {
 
     /// An `A11` failure bound to the violation KIND it is evidence about.
     ///
-    /// Where a fixture expected a specific kind, that is the kind: a check
-    /// that `OversizeFrame` is detected is evidence about `OversizeFrame`
-    /// whether the run produced one or produced nothing at all. Where
-    /// nothing was expected and a violation happened anyway (the close
-    /// boundary), it is the kind the run reported.
+    /// Where a fixture expected a specific kind **and the run got as far
+    /// as the stimulus that would have produced it**, that is the kind: a
+    /// check that `OversizeFrame` is detected is evidence about
+    /// `OversizeFrame` whether the run produced one or produced nothing at
+    /// all. Where nothing was expected and a violation happened anyway
+    /// (the close boundary), it is the kind the run reported.
+    ///
+    /// A run that died *before* its stimulus is neither: it may only carry
+    /// the kind the host actually reported on the way down, if any. See
+    /// `crate::runner::prerequisite_failure` for why crediting the
+    /// expected kind there is a hollow coverage claim.
     #[must_use]
     pub fn violation(kind: impl Into<String>, message: impl Into<String>) -> Failure {
         Failure {

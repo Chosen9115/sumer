@@ -274,9 +274,17 @@ claim would be worse than the hole.
 ## An execution has an end, and the end is judged
 
 The crawl closes its connection before it judges: the child's stdin is
-dropped, the adapter exits, the reader loop decodes every byte it wrote and
-finalizes the framing at that end of stream, and the terminal reason is
-read. A connection that ended in a protocol violation fails the execution.
+dropped, the adapter exits, the reader loop runs to the end of the stream
+and finalizes the framing there, and the terminal reason is read. A
+connection that ended in a protocol violation fails the execution.
+
+**That is not the same as "every byte the adapter wrote was judged", and
+this suite does not claim it.** The host's reader loop also returns
+normally on a read *error* — the pipe failed, and whatever was buffered may
+have been truncated by that failure rather than by the adapter, so it is
+not held against the adapter — and the supervisor treats the reader task
+finishing as drainage either way. What the close establishes is that the
+reader ran to completion and nothing it decoded was a violation.
 
 Without that boundary an execution had no end at all. The host delivers a
 valid reply *before* it reports a violation in whatever follows it, so an
@@ -304,6 +312,24 @@ holes a reviewer executed:
   (`pending_to_posted__writer_outlives_the_adapter`), and it is deliberately
   a different kind from `StdinEofIgnored` — that one names a process still
   running, and an adapter that exited on time must never be failed for it.
+
+**Two limits on `StdoutHeldOpen`, and neither is a tuning detail.**
+
+- **The drain is a fixed one-second observation budget**
+  (`process::READER_DRAIN`), not a measurement. What it times is the
+  host's reader *task* completing, which is not the fact "no descriptor for
+  that pipe is still open" — the two are merely correlated, because the
+  task returns at EOF and EOF arrives when the last write end closes. So an
+  **honest adapter can be reported `StdoutHeldOpen`** if host scheduling
+  delays the drain past the bound: a loaded CI box or a starved runtime is
+  enough, there is no retry, and the connection is then reported as having
+  broken the protocol. That is a false-attribution risk this suite accepts,
+  not a constant someone forgot to tune.
+- **The kind cannot identify what holds the stream.** Task completion
+  cannot identify descriptor ownership, so an adapter that forked a writer
+  and a host whose reader was simply not scheduled in time are
+  indistinguishable from here. Read `StdoutHeldOpen` as "nobody saw the end
+  of this stream", never as "the adapter held it open".
 
 ## A9's requirement: two executions, and the whole history
 
@@ -392,15 +418,51 @@ before it got there. Concretely:
   `spec/fdx-6.4-mapping.md` and was done against the real 6.4 schema; the
   suite holds the fixture to the table, not the table to FDX.
 - **Some of this is structural; some of it is still discipline, and the
-  difference matters.** *Structural* — enforced by a type or a constructor,
-  and impossible for a driver to forget — is: per-execution sequence
-  equality, the A10 size measurement, status coverage, and the resources
-  list. A `JudgedExecution` cannot be obtained without them having run.
-  *Discipline* — cross-execution claims no type in this crate can force —
+  difference matters.** *Structural* — impossible for a driver to forget —
+  is: per-execution sequence equality, the A10 size measurement, status
+  coverage, and the resources list. A driver cannot obtain a
+  `JudgedExecution` without them having run, because `run_crawl` is the
+  only thing that builds one and every one of its exits judges first. That
+  last part is held by those exits, not by a type: a sixth `return exec;`
+  added tomorrow would compile unjudged. *Discipline* — cross-execution
+  claims no type in this crate can force —
   is: the A5 resume bracket, A9's comparison, A4's must-still-succeed
   probes, and A11's violation-kind checks. Historically most of this
   suite's hollow assertions lived exactly there, and a reviewer hunting for
   the next one should look there first.
+- **Mutation coverage is not mechanically guaranteed end to end.** Every
+  claim in the battery's `COVERAGE` table is backed by a mutant that
+  actually kills, and a claim naming a protocol-violation *kind* is bound
+  to the mechanism the run established rather than to the `A11` label all
+  nine kinds share. Two gaps under that are held by review, not by
+  machinery, and `conformance/tests/mutations.rs` states both in full:
+  three `COVERS_VIA` rows (`A8`→`A2`, `A3`→`A1`, `A10`→`A2`) are bound to
+  a *label*, so nothing checks that the A2 failure a mutant claiming A8
+  provoked was about history retention rather than a drifted amount in the
+  same comparison; and nothing binds a mutant to the specific field it
+  patched, so a patch that does not match its own `why` reads as identical
+  if it trips the same ids. Treat the table as "this pair has a killing
+  mutant behind it", not as "this pair is proven by machine".
+- **`sumer_host::fold::Fold` and `sumer_host::paging::ResumeState` have no
+  caller inside the host.** `AdapterHandle` never assigns a revision and
+  never computes a resume request — `history_read` hands back observations
+  and says the fold is somebody else's step. This suite is their only
+  consumer. So "the host assigns `revision: u64` by arrival order"
+  (`spec/observation.md` §1) is proven against the standalone `Fold` and
+  against a `Fold` this suite drives over real adapter reads, and never
+  once end to end through a host that does it on its own behalf. An
+  integration built on `AdapterHandle` alone would get no revisions at all
+  and nothing here would notice. This closes when the CLI arrives and
+  becomes that caller.
+- **The framer's fuzz target has never executed anywhere.** `cargo fuzz run
+  codec` is wired into `.github/workflows/nightly.yml` only, against
+  `main`, and no nightly run has happened yet. Shipping it unrun is
+  acceptable; counting it is not. **It earns no evidence credit until it
+  has actually run once** — the invariants listed in
+  `core/wire/src/codec.rs` (never panics, never allocates past
+  `MAX_FRAME_BYTES + 1`, split-invariance) are today held by the unit and
+  property tests alone, and the existence of the workflow must not be read
+  as coverage.
 - This suite never inspects an adapter's source, memory, or process
   internals. It is exactly as strong as its wire evidence and no
   stronger.

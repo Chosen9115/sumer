@@ -43,9 +43,15 @@
 //!     that *something* fatal happened. A mutant claiming
 //!     `StdinEofIgnored` must produce a failure whose `mechanism` is
 //!     `StdinEofIgnored` -- the kind the run actually reported, or the
-//!     kind the fixture expected and did not get. Claiming one kind while
+//!     kind the fixture expected and did not get **on a run that reached
+//!     the stimulus that would have produced it**. Claiming one kind while
 //!     provoking another (garbage on the wire, say) no longer type-checks
-//!     as coverage.
+//!     as coverage, and neither does a run that aborted on a prerequisite:
+//!     pre-hello garbage on the run that tests oversized frames used to
+//!     die at spawn and still report `OversizeFrame`, for a frame it never
+//!     asked for. See `runner::prerequisite_failure`;
+//!     `protocol_violations__oversize_run_dies_before_the_stimulus` is the
+//!     mutant that holds it.
 //!   * **An id with no failure label of its own** reaches one through
 //!     [`COVERS_VIA`]: A8 (full history retention) is enforced inside A2's
 //!     sequence equality, A3 (unknown is never zero) inside A1's balances
@@ -119,6 +125,28 @@
 //! patches a different pointer than its `why` describes, and trips the same
 //! ids, reads as identical. The patch list is in the manifest, next to the
 //! prose, for exactly this reason.
+//!
+//! This is not a hypothetical: it is what let a coverage claim be paid for
+//! by a *prerequisite* failure. A mutant may patch any `/script/...`
+//! pointer of the fixture, including one belonging to a different run's
+//! handshake, and nothing here notices that the break it performed is not
+//! the break its claim is about. The mechanism binding closes that for the
+//! violation kinds (a prerequisite abort now reports what actually
+//! happened, never the kind the fixture wanted -- see
+//! `runner::prerequisite_failure`); for the assertion ids it remains a
+//! review obligation, held by `why` and by the patch list beside it.
+//!
+//! **4. A stimulus dispatched onto an already-dead connection still credits
+//! the kind its fixture expected.** `runner::prerequisite_failure` covers a
+//! run that short-circuits BEFORE its stimulus. It does not cover a frame
+//! that was written to a connection which had already died -- run 1's final
+//! `status.read` answering `AdapterCrashed`, and the `wait_for_violation`
+//! and `balances.read` arms beside it. The frame went out; whether the
+//! adapter ever read it is unestablished, so "the violation stopped
+//! happening" and "the adapter never saw the request" are indistinguishable
+//! there. Narrower than limit 3 -- reaching it needs a mutant that kills the
+//! connection mid-run and trips nothing else -- but it is the same shape,
+//! and it is written here rather than left to be discovered.
 //!
 //! # Live and parked
 //!

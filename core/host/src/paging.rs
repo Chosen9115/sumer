@@ -7,6 +7,12 @@
 //! A5 (exact-resume) checks one implementation instead of trusting two to
 //! agree.
 //!
+//! **Known limit: nothing in this crate calls it either.** Like
+//! [`crate::fold`], this module's only consumer today is the conformance
+//! suite; [`crate::AdapterHandle`] issues whatever page request its caller
+//! hands it and computes no resume of its own. Closes when the CLI
+//! arrives.
+//!
 //! The three `cursor_resumable` families answer one question differently:
 //! *what do I resend if I have to start this page over right now?*
 //!

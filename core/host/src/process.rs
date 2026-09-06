@@ -33,10 +33,27 @@ const ENV_ALLOWLIST: &[&str] = &["PATH", "HOME", "LANG", "LC_ALL", "TMPDIR"];
 /// ([`ProtocolViolationKind::StdoutHeldOpen`]) rather than waited out and
 /// then papered over as an ordinary exit.
 ///
-/// ponytail: a fixed bound, not the connection's deadline. An honest drain
-/// finishes in microseconds; raising this only buys patience for a stream
-/// that is already unjudgeable. Make it a parameter if a real adapter ever
-/// needs more than a second to close a pipe it already stopped writing to.
+/// # The honest limit: this is an observation BUDGET, not a measurement
+///
+/// What it times is the reader **task** finishing, which is not the same
+/// fact as "no descriptor for that pipe is still open". The two are only
+/// correlated: the task returns when the stream reaches EOF, which happens
+/// when the last write end closes. So the verdict built on this bound
+/// (`StdoutHeldOpen`) is a claim about a deadline the drain missed, and an
+/// honest adapter can miss it for reasons that are not its fault -- a
+/// loaded CI box, a starved runtime, a scheduler that does not get back to
+/// this task inside a second. **That is a false-attribution risk, not just
+/// a tuning constant**: no retry, no second look, and the connection is
+/// reported as having broken the protocol.
+///
+/// It is a fixed bound rather than the connection's deadline because an
+/// honest drain finishes in microseconds and raising it only buys patience
+/// for a stream that is already unjudgeable. That trade is deliberate and
+/// it is not free.
+///
+/// ponytail: fixed bound. Make it a parameter if a real adapter (or a real
+/// CI box) ever needs more than a second to close a pipe it already
+/// stopped writing to.
 const READER_DRAIN: std::time::Duration = std::time::Duration::from_secs(1);
 
 /// A freshly spawned adapter process with its stdio handles already split

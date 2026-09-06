@@ -326,16 +326,27 @@ impl AdapterHandle {
     /// stream that never ends is a wait that gives up. So three distinct
     /// facts are kept apart here, and each has its own outcome:
     ///
-    /// * **The process exited and its stdout reached end of stream.** Every
-    ///   byte it ever wrote was decoded and judged; the terminal reason is
-    ///   whatever that evidence produced --
+    /// * **The process exited and the reader loop returned.** The terminal
+    ///   reason is whatever the bytes it did decode produced --
     ///   `Terminal::Crashed(status)` for a cooperative exit, a
     ///   `Terminal::Violation` if the last bytes broke the protocol.
-    /// * **The process exited, the stream did not end** (in
+    ///
+    ///   What this does *not* establish is that every byte the adapter
+    ///   ever wrote was decoded and judged. The reader loop also returns
+    ///   normally on a **read error** -- the pipe failed, whatever was
+    ///   buffered may have been truncated by the failure rather than by
+    ///   the adapter, and the host declines to hold that against it -- and
+    ///   `supervise` reads the reader task finishing as drainage either
+    ///   way. So the honest claim is "the reader ran to completion and
+    ///   nothing it decoded was a violation", not "every byte was judged".
+    /// * **The process exited, the reader did not finish** (in
     ///   `process::READER_DRAIN`, or by the time this deadline expires):
     ///   [`ProtocolViolationKind::StdoutHeldOpen`]. The host cannot say it
     ///   read everything, and saying the connection ended cleanly would be
-    ///   certifying a drain it did not perform.
+    ///   certifying a drain it did not perform. It equally cannot say
+    ///   *what* kept the stream open: a forked writer and a reader task
+    ///   the runtime did not get back to inside the bound look the same
+    ///   from here (see `process::READER_DRAIN`).
     /// * **The process is still running** when `default_deadline` expires:
     ///   [`ProtocolViolationKind::StdinEofIgnored`] -- spec/wire.md §7,
     ///   **an adapter MUST exit when its stdin reaches EOF**. This kind is

@@ -56,10 +56,18 @@
 //!
 //! # The honest limit
 //!
-//! What is **structural** here -- impossible to forget, because a type or
-//! a constructor enforces it -- is: per-execution sequence equality, the
-//! A10 size measurement, status coverage, and the resources list. Every
-//! execution gets all four whether its driver asks or not.
+//! What is **structural** here -- impossible for a *driver* to forget --
+//! is: per-execution sequence equality, the A10 size measurement, status
+//! coverage, and the resources list. Every execution gets all four
+//! whether its driver asks or not.
+//!
+//! What holds that is worth naming precisely, because it is weaker than a
+//! type: [`JudgedExecution`] is `pub(crate)` and [`run_crawl`] is its only
+//! producer, and every exit of `run_crawl` judges before it returns
+//! (through [`finish`], or through the direct `assert_execution` on the
+//! one path that never got a connection). No type enforces that last
+//! part. A future `return exec;` added on a sixth path would compile and
+//! would be unjudged, and nothing here would say so.
 //!
 //! What is still **discipline** -- cross-execution claims no type in this
 //! crate can force -- is: the A5 resume bracket, A9's comparison of two
@@ -626,9 +634,17 @@ pub(crate) async fn run_crawl(
 /// Adding one more probe read after the crawl would only move that hole one
 /// reply further out. Instead this closes the connection --
 /// [`AdapterHandle::close`] drops the child's stdin, the adapter exits, the
-/// reader loop drains every byte it wrote before EOF, and the terminal
-/// reason is latched -- and then reads the verdict. A `Terminal::Violation`
-/// is this execution's failure.
+/// reader loop runs to the end of the stream, and the terminal reason is
+/// latched -- and then reads the verdict. A `Terminal::Violation` is this
+/// execution's failure.
+///
+/// **"Ran to the end of the stream" is not "every byte was judged."** The
+/// host's reader loop also returns normally on a read error (the pipe
+/// failed; what was buffered may have been truncated by the failure rather
+/// than by the adapter), and the supervisor reads the reader task
+/// finishing as drainage either way. What this boundary establishes is
+/// that the reader completed and nothing it decoded was a violation --
+/// see `sumer_host::AdapterHandle::close`.
 ///
 /// An adapter that ignores its stdin EOF and stays alive does not escape
 /// this either. It used to: with no rule requiring it to exit, `close`

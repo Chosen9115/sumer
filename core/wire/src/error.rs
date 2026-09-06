@@ -66,6 +66,13 @@ pub enum ProtocolViolationKind {
     /// connection produced. Distinct from [`ProtocolViolationKind::StdinEofIgnored`]
     /// on purpose: there the process is still running; here it exited and
     /// the stream outlived it.
+    ///
+    /// **This kind names a missed drain, never a culprit.** What the host
+    /// times is its own reader task finishing; task completion cannot
+    /// identify descriptor ownership, so an adapter that forked a writer
+    /// and a host whose reader was simply not scheduled in time are
+    /// indistinguishable from here. Read it as "nobody saw the end of this
+    /// stream", not as "the adapter held it open".
     StdoutHeldOpen,
 }
 

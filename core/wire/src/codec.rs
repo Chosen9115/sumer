@@ -26,6 +26,12 @@
 //! - oversize is detected the instant the buffered byte count would exceed
 //!   the cap, not after accumulating arbitrarily more first.
 //!
+//! **The fuzz target has never run.** It is wired into
+//! `.github/workflows/nightly.yml` only, against `main`, and no nightly
+//! has executed yet. It earns no evidence credit until it has run once:
+//! today these invariants are held by the unit and property tests in this
+//! crate, and the existence of the target must not be read as coverage.
+//!
 //! On any violation the decoder is **done**: a truncated JSON-Lines stream
 //! has no resync point, so there is no attempt to find the next newline and
 //! continue. Every subsequent call returns the same violation without

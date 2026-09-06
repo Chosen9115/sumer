@@ -471,8 +471,13 @@ async fn case_protocol_violations(
                 Err(HostError::ProtocolViolation(kind)) => {
                     assert_violation_kind(kind, expected_kind.as_deref(), &label, failures);
                 }
-                Err(e) => failures.push(expected_violation(
-                    expected_kind.as_deref(),
+                // The spawn IS run 0's stimulus, so a spawn that completed
+                // and reported nothing (below) is evidence about the
+                // expected kind. A spawn that died of something else --
+                // a crash, a missing interpreter -- never got the pre-hello
+                // bytes onto the wire and establishes nothing about them.
+                Err(e) => failures.push(prerequisite_failure(
+                    &e,
                     format!(
                         "{label}: expected spawn to fail with a ProtocolViolation, got a \
                          different error: {e}"
@@ -564,16 +569,42 @@ fn assert_violation_kind(
     }
 }
 
-/// An `A11` failure for a run whose fixture named the violation kind it
-/// expected: the failure is evidence about THAT kind, including -- in fact
-/// especially -- when the run produced no violation at all. Every "the
-/// violation stopped happening" mutant lands here, and a coverage claim
-/// naming a kind is checked against this binding rather than against the
-/// `A11` label all nine kinds share.
+/// An `A11` failure for a run that REACHED its stimulus and whose fixture
+/// named the violation kind that stimulus was supposed to produce: the
+/// failure is evidence about THAT kind, including -- in fact especially --
+/// when the run produced no violation at all. Every "the violation stopped
+/// happening" mutant lands here, and a coverage claim naming a kind is
+/// checked against this binding rather than against the `A11` label all
+/// nine kinds share.
+///
+/// **Only for a run that got as far as the stimulus.** A run that died
+/// before sending it goes through [`prerequisite_failure`] instead --
+/// see there for why.
 fn expected_violation(kind: Option<&str>, message: String) -> Failure {
     match kind {
         Some(k) => Failure::violation(k, message),
         None => Failure::new("A11", message),
+    }
+}
+
+/// An `A11` failure for a run that never reached its stimulus: the spawn
+/// failed, or the `resources.list` that has to precede it did.
+///
+/// **It may not be credited with the kind the fixture expected.** That
+/// credit is the claim "this execution exercised the path that detects
+/// this kind", and an execution which aborted before sending the stimulus
+/// exercised nothing of the sort. Crediting it anyway is how a coverage
+/// claim gets paid for by a prerequisite failure: put garbage before the
+/// hello on the run that tests oversized frames, and the run dies at spawn
+/// while still reporting `OversizeFrame` -- for a frame it never asked for.
+///
+/// What such a run may be credited with is the kind the host *actually*
+/// reported here, if it reported one: that violation really was detected,
+/// by this connection, on the way down.
+fn prerequisite_failure(e: &HostError, message: String) -> Failure {
+    match e {
+        HostError::ProtocolViolation(kind) => Failure::violation(format!("{kind:?}"), message),
+        _ => Failure::new("A11", message),
     }
 }
 
@@ -645,16 +676,16 @@ async fn check_violation_after_resources_list(
     let handle = match spawn_run(argv, path, run_idx, deadline).await {
         Ok(h) => h,
         Err(e) => {
-            failures.push(expected_violation(
-                expectation.kind,
+            failures.push(prerequisite_failure(
+                &e,
                 format!("{label}: spawn failed: {e}"),
             ));
             return;
         }
     };
     if let Err(e) = handle.resources_list().await {
-        failures.push(expected_violation(
-            expectation.kind,
+        failures.push(prerequisite_failure(
+            &e,
             format!("{label}: resources.list unexpectedly failed: {e}"),
         ));
         return;

@@ -340,6 +340,18 @@ violation. It is not `StdinEofIgnored` — that names a
 process still running, and blaming a process that exited on time for staying
 alive would fail an honest adapter for a lie.
 
+**What that wait is, honestly.** It is a short fixed budget, and what it
+measures is the host's own reader finishing — which is not the same fact as
+"no descriptor for that pipe is still open". The two are only correlated,
+so `StdoutHeldOpen` says *nobody saw the end of this stream*, not *the
+adapter held it open*: a forked writer and a host whose reader was not
+scheduled in time are indistinguishable from the host's side. Two
+consequences an adapter author should plan for. Close stdout explicitly in
+anything you fork that inherits it — that is the case the rule exists for,
+and the one you control. And know that this verdict can land on an honest
+adapter under a loaded host, with no retry behind it; if it does, the
+adapter is not the thing that changed.
+
 **Per language, because the default behaviour differs and this is exactly
 where an implementer gets it wrong.** The bug is always the same shape: a
 read loop that treats EOF as "nothing to read *yet*" rather than "nothing to

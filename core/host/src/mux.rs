@@ -391,9 +391,11 @@ impl Mux {
     /// afterwards -- a malformed frame, a second answer to an id already
     /// answered -- lands (or does not) in whatever order the scheduler
     /// happens to pick. After this call a conforming adapter exits, its
-    /// exit closes its stdout, the reader loop decodes every remaining byte
-    /// and finalizes the framing at that end of stream, and `supervise`
-    /// latches the terminal reason. So "the connection ended clean" becomes
+    /// exit closes its stdout, the reader loop decodes what it reads and
+    /// finalizes the framing at that end of stream (a read *error* also
+    /// ends it, and is charged to the pipe rather than to the adapter --
+    /// see the loop in `reader`), and `supervise` latches the terminal
+    /// reason. So "the connection ended clean" becomes
     /// a fact that can be waited for and checked, rather than a race nobody
     /// looks at.
     ///
