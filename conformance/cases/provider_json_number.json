@@ -4,19 +4,6 @@
     "runs": [
       {
         "label": "default",
-        "hello": {
-          "protocol": "1",
-          "adapter_id": "fake-adapter",
-          "adapter_version": "0.1.0",
-          "capabilities": [
-            "resources.list",
-            "balances.read",
-            "history.read",
-            "status.read"
-          ],
-          "local_id_derivation": "fixture-literal@1",
-          "max_in_flight": 1
-        },
         "on": {
           "resources.list": [
             {
@@ -34,7 +21,8 @@
                     ]
                   }
                 }
-              ]
+              ],
+              "consume": false
             }
           ],
           "history.read": [
@@ -42,11 +30,7 @@
               "when": {
                 "resources": [
                   {
-                    "resource_id": "wallet-decimal",
-                    "page": {
-                      "kind": "cursor",
-                      "cursor": ""
-                    }
+                    "resource_id": "wallet-decimal"
                   }
                 ]
               },
@@ -58,11 +42,6 @@
                     "statuses": [
                       {
                         "resource_id": "wallet-decimal",
-                        "outcome": {
-                          "fetched": {
-                            "page_empty": true
-                          }
-                        },
                         "page": {
                           "cursor_resumable": "exact",
                           "next": null
@@ -110,7 +89,7 @@
               "do": [
                 {
                   "op": "reply_with_decimal_amounts",
-                  "provider_payload_json": "{\"balances\": {\"token_balance_wei\": 115792089237316195423570985008687907853269984665640564039457584007913129639935, \"token_balance_wei_float\": 115792089237316195423570985008687907853269984665640564039457584007913129639935.0, \"precise_fraction\": 123456789012345678.987654321}}",
+                  "provider_payload_json": "{\"balances\": {\"token_balance_wei\": 115792089237316195423570985008687907853269984665640564039457584007913129639935, \"token_balance_wei_float\": 115792089237316195423570985008687907853269984665640564039457584007913129639935.0, \"precise_fraction\": 123456789012345678.987654321, \"high_precision_debit_unsigned\": 12345678901234567890123456789.01}}",
                   "amounts": [
                     {
                       "payload_path": [
@@ -147,6 +126,19 @@
                         2,
                         "amount"
                       ]
+                    },
+                    {
+                      "payload_path": [
+                        "balances",
+                        "high_precision_debit_unsigned"
+                      ],
+                      "asset": "USD",
+                      "negate": true,
+                      "insert_into": [
+                        "observations",
+                        3,
+                        "amount"
+                      ]
                     }
                   ],
                   "body": {
@@ -156,56 +148,60 @@
                         "category": "token_balance_wei_bare_int",
                         "canonical_hint": null,
                         "amount": null,
-                        "provenance": {
-                          "adapter_id": "fake-adapter",
-                          "provider_id": "0xEXAMPLEDECIMALWALLET",
-                          "surface": "onchain",
-                          "observed_at": "2026-09-01T00:00:00Z",
-                          "completeness": "complete"
-                        }
+                        "provenance": {}
                       },
                       {
                         "resource_id": "wallet-decimal",
                         "category": "token_balance_wei_float_token",
                         "canonical_hint": null,
                         "amount": null,
-                        "provenance": {
-                          "adapter_id": "fake-adapter",
-                          "provider_id": "0xEXAMPLEDECIMALWALLET",
-                          "surface": "onchain",
-                          "observed_at": "2026-09-01T00:00:00Z",
-                          "completeness": "complete"
-                        }
+                        "provenance": {}
                       },
                       {
                         "resource_id": "wallet-decimal",
                         "category": "precise_fraction",
                         "canonical_hint": null,
                         "amount": null,
-                        "provenance": {
-                          "adapter_id": "fake-adapter",
-                          "provider_id": "0xEXAMPLEDECIMALWALLET",
-                          "surface": "onchain",
-                          "observed_at": "2026-09-01T00:00:00Z",
-                          "completeness": "complete"
-                        }
+                        "provenance": {}
+                      },
+                      {
+                        "resource_id": "wallet-decimal",
+                        "category": "high_precision_debit",
+                        "canonical_hint": null,
+                        "amount": null,
+                        "provenance": {}
                       }
                     ],
                     "statuses": [
                       {
-                        "resource_id": "wallet-decimal",
-                        "outcome": {
-                          "fetched": {
-                            "page_empty": false
-                          }
-                        }
+                        "resource_id": "wallet-decimal"
                       }
                     ]
                   }
                 }
               ]
+            },
+            {
+              "when": {
+                "resource_ids": [
+                  "wallet-decimal"
+                ]
+              },
+              "do": [
+                {
+                  "op": "reply_ok_raw",
+                  "body_json": "{\"observations\":[{\"resource_id\":\"wallet-decimal\",\"category\":\"available\",\"canonical_hint\":null,\"amount\":{\"asset\":\"USD\",\"amount\":10.25},\"provenance\":{\"adapter_id\":\"fake-adapter\",\"provider_id\":\"0xEXAMPLEDECIMALWALLET\",\"surface\":\"onchain\",\"observed_at\":\"2026-09-01T00:00:00Z\",\"completeness\":\"complete\"}}],\"statuses\":[{\"resource_id\":\"wallet-decimal\",\"outcome\":{\"fetched\":{\"page_empty\":false}}}]}"
+                }
+              ]
             }
           ]
+        },
+        "provenance": {
+          "adapter_id": "fake-adapter",
+          "provider_id": "0xEXAMPLEDECIMALWALLET",
+          "surface": "onchain",
+          "observed_at": "2026-09-01T00:00:00Z",
+          "completeness": "complete"
         }
       }
     ]
@@ -245,10 +241,27 @@
             "asset": "USDC-precise",
             "amount": "123456789012345678.987654321"
           }
+        },
+        {
+          "category": "high_precision_debit",
+          "canonical_hint": null,
+          "amount": {
+            "asset": "USD",
+            "amount": "-12345678901234567890123456789.01"
+          }
         }
       ]
     },
-    "compare": "cmp_same_asset",
-    "notes": "The wire never carries the raw provider payload -- it is embedded in THIS fixture as an escaped JSON STRING (script.on.balances\\.read[0].do[0].provider_payload_json) specifically so the outer conformance-runner's own json parsing of THIS fixture file never touches the float tokens either. fake_adapter.py parses that string itself with json.loads(text, parse_float=Decimal) and formats every extracted value with format(d, 'f') per spec/money.md section 3 (never str(Decimal(...)), which reproduces exponent notation for small magnitudes). Three tokens, three shapes: a bare 78-digit JSON integer (Python's json module hands this straight to int(), arbitrary precision, never at risk even without parse_float -- included because a real wei balance is realistically integral); the SAME 78-digit magnitude written with a trailing '.0' so Python's scanner classifies it as a float token and parse_float actually engages (this is the one an IEEE-754 double provably cannot round-trip: python3 -c \"print(format(float('115792089237316195423570985008687907853269984665640564039457584007913129639935.0'),'.90g'))\" prints a value one higher than the true magnitude); and a 27-significant-digit decimal fraction (float(...) truncates it to '123456789012345680', silently losing the last ~10 digits). A host, or an adapter implementation, that runs this payload through a naive json.loads with no parse_float override will instead see 1.157920892373162e+77 and 1.2345678901234568e+17 -- and per spec/money.md section 2, a JSON *number* in the amount field must be rejected outright at the deserializer, so even a 'faithful' re-stringification of that float would be doubly wrong: wrong value AND wrong wire shape (a Rust f64 formatted back to a string is still evidence the number touched a float somewhere in the pipeline, which is exactly what A1 is checking for)."
+    "notes": "Two separate things are proven here, and neither is prose.\n\n(1) EXACTNESS THROUGH THE ADAPTER. The raw provider payload is embedded in THIS fixture as an escaped JSON STRING (script.on.balances\\.read[0].do[0].provider_payload_json) specifically so the outer conformance-runner's own JSON parsing of THIS fixture file never touches the float tokens either. fake_adapter.py parses that string itself with json.loads(text, parse_float=Decimal) and formats every extracted value with format(d, 'f') per spec/money.md section 3. Four tokens, four shapes: a bare 78-digit JSON integer (Python's json module hands this straight to int(), arbitrary precision); the SAME 78-digit magnitude written with a trailing '.0' so the scanner classifies it as a float token and parse_float actually engages (an IEEE-754 double provably cannot round-trip it); a 27-significant-digit decimal fraction (float(...) truncates it to '123456789012345680'); and a 31-significant-digit DEBIT that the adapter must NEGATE. That last one is a decimal-context trap rather than a float trap and no earlier fixture had one: Python's default context rounds at 28 digits, so `-d` silently yields -12345678901234567890123456790 while copy_negate() yields the exact -12345678901234567890123456789.01. expect.grammar_check pins the digit count and scale so the rounding cannot pass as 'close enough'.\n\n(2) A BARE JSON NUMBER ON THE WIRE IS REJECTED. The second balances.read on this same connection replies with a body written to stdout VERBATIM (reply_ok_raw), carrying \"amount\": {\"asset\": \"USD\", \"amount\": 10.25} -- a JSON NUMBER, not a string, exactly where an AmountWire belongs. spec/money.md section 2 requires that to be rejected AT THE DESERIALIZER, before any Sumer-specific validation runs, because a JSON number is an IEEE-754 double by definition. expect.envelope_errors requires err.code=invalid_request for the whole reply, and the runner then re-issues resources.list to prove the rejection did not take the connection with it. Before this leg existed, this fixture's name promised a wire-level rule that only its prose asserted.",
+    "grammar_check": {
+      "high_precision_debit_digit_count": 31,
+      "high_precision_debit_scale": 2,
+      "note": "31 significant digits with a scale of 2. Python's DEFAULT decimal context has prec=28 and ROUNDS: plain `-d` on this value returns -12345678901234567890123456790, losing the cents and the last digit of the integer part, with no error raised and no float anywhere in sight. The adapter must negate with a context-INDEPENDENT operation (copy_negate); the digit count and scale asserted here are what catches it if it does not."
+    },
+    "envelope_errors": {
+      "wallet-decimal_balances_read": {
+        "code": "invalid_request"
+      }
+    }
   }
 }

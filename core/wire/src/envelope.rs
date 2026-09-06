@@ -8,7 +8,9 @@
 //! corruption (see [`crate::codec`]) is fatal.
 
 use crate::error::WireErrorCode;
-use serde::{Deserialize, Serialize};
+use crate::shape::object_only;
+use serde::de::Error as _;
+use serde::{Deserialize, Deserializer, Serialize};
 
 /// A wire request id: a `u64` from a monotonic counter, never reused for
 /// the process lifetime. `#[serde(transparent)]` makes it serialize as a
@@ -28,12 +30,19 @@ impl RequestId {
 /// still parse successfully here, so recognizing (or rejecting) it is a
 /// business decision made one layer up (see `ops.rs`), not a parse failure.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(remote = "Self", deny_unknown_fields)]
 pub struct Request {
     pub id: RequestId,
     pub op: String,
     #[serde(default = "default_params")]
     pub params: serde_json::Value,
 }
+
+object_only!(
+    Request,
+    "a request envelope: an object with `id`, `op`, and optional `params`",
+    serialize
+);
 
 fn default_params() -> serde_json::Value {
     serde_json::Value::Null
@@ -56,12 +65,19 @@ impl Request {
 /// `detail` is free-form evidence (e.g. `{"op": "..."}` for an unsupported
 /// op) -- never a stable identifier callers should match on; `code` is.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(remote = "Self", deny_unknown_fields)]
 pub struct ErrorBody {
     pub code: WireErrorCode,
     pub message: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub detail: Option<serde_json::Value>,
 }
+
+object_only!(
+    ErrorBody,
+    "an error body: an object with `code`, `message`, and optional `detail`",
+    serialize
+);
 
 impl ErrorBody {
     #[must_use]
@@ -82,17 +98,76 @@ impl ErrorBody {
 
 /// A decoded reply line: `{"id":7,"ok":{...}}` or `{"id":7,"err":{...}}`.
 ///
-/// `#[serde(untagged)]` distinguishes the two by which of `ok`/`err` is
-/// present, matching the wire shape exactly -- there is no separate tag
-/// field. `T` is the op-specific `ok` payload type; the host generally
+/// Which of `ok`/`err` is present distinguishes the two -- there is no
+/// separate tag field. `#[serde(untagged)]` produces exactly that on the
+/// way out; on the way in it is not enough (see the `Deserialize` impl
+/// below), because an untagged derive takes the first variant that fits
+/// and ignores whatever else the frame carried. `T` is the op-specific `ok` payload type; the host generally
 /// decodes first as `Reply<serde_json::Value>` (it must know the original
 /// request's op, hence its expected reply shape, before it can decode
 /// further) and only then re-parses `ok` into the concrete type.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize)]
 #[serde(untagged)]
 pub enum Reply<T> {
     Ok { id: RequestId, ok: T },
     Err { id: RequestId, err: ErrorBody },
+}
+
+/// Hand-written rather than `#[serde(untagged)]`-derived: an untagged
+/// derive selects the first variant that *fits*, so `{"id":1,"ok":{},
+/// "err":{...}}` decodes as a success and the `err` is silently dropped.
+/// The contract calls a frame satisfying both shapes -- or neither --
+/// malformed, so presence and exclusivity are checked here, before any
+/// variant is chosen. Unknown keys are rejected too, which is what makes a
+/// request/reply field mixture (`op`/`params` on a reply) malformed rather
+/// than ignored.
+impl<'de, T: Deserialize<'de>> Deserialize<'de> for Reply<T> {
+    fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        struct ReplyVisitor<T>(std::marker::PhantomData<T>);
+
+        impl<'de, T: Deserialize<'de>> serde::de::Visitor<'de> for ReplyVisitor<T> {
+            type Value = Reply<T>;
+
+            fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str("a reply envelope: an object with `id` and exactly one of `ok`/`err`")
+            }
+
+            fn visit_map<A: serde::de::MapAccess<'de>>(
+                self,
+                mut map: A,
+            ) -> Result<Reply<T>, A::Error> {
+                let mut id: Option<RequestId> = None;
+                let mut ok: Option<T> = None;
+                let mut err: Option<ErrorBody> = None;
+                while let Some(key) = map.next_key::<String>()? {
+                    match key.as_str() {
+                        "id" if id.is_some() => return Err(A::Error::duplicate_field("id")),
+                        "id" => id = Some(map.next_value()?),
+                        "ok" if ok.is_some() => return Err(A::Error::duplicate_field("ok")),
+                        "ok" => ok = Some(map.next_value()?),
+                        "err" if err.is_some() => return Err(A::Error::duplicate_field("err")),
+                        "err" => err = Some(map.next_value()?),
+                        other => {
+                            return Err(A::Error::unknown_field(other, &["id", "ok", "err"]));
+                        }
+                    }
+                }
+                let id = id.ok_or_else(|| A::Error::missing_field("id"))?;
+                match (ok, err) {
+                    (Some(ok), None) => Ok(Reply::Ok { id, ok }),
+                    (None, Some(err)) => Ok(Reply::Err { id, err }),
+                    (Some(_), Some(_)) => Err(A::Error::custom(
+                        "a reply carries exactly one of `ok` or `err`, never both",
+                    )),
+                    (None, None) => Err(A::Error::custom(
+                        "a reply carries exactly one of `ok` or `err`, never neither",
+                    )),
+                }
+            }
+        }
+
+        d.deserialize_map(ReplyVisitor(std::marker::PhantomData))
+    }
 }
 
 impl<T> Reply<T> {
@@ -117,9 +192,16 @@ impl<T> Reply<T> {
 /// `hello` request params: `{"protocol":["1"]}`, the protocol versions the
 /// host offers.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(remote = "Self", deny_unknown_fields)]
 pub struct HelloParams {
     pub protocol: Vec<String>,
 }
+
+object_only!(
+    HelloParams,
+    "hello params: an object with a `protocol` array",
+    serialize
+);
 
 fn default_max_in_flight() -> u32 {
     1
@@ -129,6 +211,7 @@ fn default_max_in_flight() -> u32 {
 /// adapter omits it -- a legal serial adapter is explicitly permitted, and
 /// the host must never assume concurrency it wasn't told about.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(remote = "Self", deny_unknown_fields)]
 pub struct HelloReply {
     pub protocol: String,
     pub adapter_id: String,
@@ -138,6 +221,12 @@ pub struct HelloReply {
     #[serde(default = "default_max_in_flight")]
     pub max_in_flight: u32,
 }
+
+object_only!(
+    HelloReply,
+    "a hello reply: an object describing the adapter",
+    serialize
+);
 
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]

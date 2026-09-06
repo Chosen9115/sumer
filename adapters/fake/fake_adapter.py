@@ -6,9 +6,20 @@ STDLIB ONLY. Reads a fixture path from SUMER_FIXTURE (a JSON file holding
 per spec/wire.md, and replays the fixture's `script.runs[N]` where N comes
 from SUMER_FIXTURE_RUN (default "0"). Every hostile behaviour it performs
 (oversize frame, garbage, never-issued id, duplicate reply, out-of-order
-replies, deadline overrun, mid-batch exit, pre-hello banner, a JSON-number
-amount, an oversized provider_extra) is driven entirely by the fixture's
-`script` -- this file contains no case-specific logic.
+replies, a request held past its deadline, mid-batch exit, pre-hello banner, a bare
+JSON-number amount, a genuinely oversized observation) is driven entirely by
+the fixture's `script` -- this file contains no case-specific logic.
+
+MONEY IS EXACT HERE, STRUCTURALLY. Every `decimal` operation this file
+performs is context-INDEPENDENT (`copy_negate`, comparison, construction,
+`format(d, "f")`), and the module installs a decimal context that TRAPS
+`Inexact`/`Rounded` (see `_EXACT_CONTEXT`). Python's default context has
+`prec=28` and silently rounds: plain `-d` on a 31-significant-digit Decimal
+returns a rounded value with no error at all. That is precisely the class of
+bug this project exists to prevent, so an adapter that is meant to be the
+suite's adversary must not be able to commit it quietly -- under the trapping
+context any context-sensitive Decimal operation added here later raises
+instead of rounding.
 
 Framing: exactly one UTF-8 JSON object per LF-terminated line, both
 directions. Nothing is ever written to stdout before the hello reply
@@ -26,11 +37,34 @@ See README.md for:
     piece of this file that is real work rather than table lookup.
 """
 import copy
+import decimal
 import json
 import os
 import sys
-import time
 from decimal import Decimal
+
+# spec/wire.md section 1. An observation larger than this is degraded by the
+# two-step rule in spec/observation.md section 6 -- see `degrade_oversized`.
+MAX_OBSERVATION_BYTES = 65_536
+
+# Money never rounds in this process. `Inexact`/`Rounded` are trapped so a
+# context-sensitive Decimal operation raises instead of silently truncating
+# to the default 28-digit precision; the operations this file actually uses
+# (`copy_negate`, `!=`, `Decimal(int)`, `Decimal(str)` via parse_float, and
+# `format(d, "f")`) are all context-independent and unaffected.
+_EXACT_CONTEXT = decimal.Context(
+    traps=[
+        decimal.Inexact,
+        decimal.Rounded,
+        decimal.InvalidOperation,
+        decimal.DivisionByZero,
+        decimal.Overflow,
+        decimal.Underflow,
+        decimal.Subnormal,
+        decimal.FloatOperation,
+    ]
+)
+decimal.setcontext(_EXACT_CONTEXT)
 
 
 def _write_raw(data: bytes) -> None:
@@ -83,6 +117,114 @@ def set_path(obj, path, value):
     obj[path[-1]] = value
 
 
+# The one hello every fixture but `protocol_violations` wants. A run that
+# needs a different one (a different `max_in_flight`, an `err`) still writes
+# its own; this is a default, not a policy.
+DEFAULT_HELLO = {
+    "protocol": "1",
+    "adapter_id": "fake-adapter",
+    "adapter_version": "0.1.0",
+    "capabilities": [
+        "resources.list",
+        "balances.read",
+        "history.read",
+        "status.read",
+    ],
+    "local_id_derivation": "fixture-literal@1",
+    "max_in_flight": 1,
+}
+
+
+def apply_defaults(run, body):
+    """Fills in the parts of a reply body a fixture did not bother to spell
+    out. Every default is overridable per reply: an explicitly written key
+    always wins, and nothing here can change a value a fixture stated.
+
+    - `run["provenance"]` supplies fields for any observation `provenance`
+      that omits them (adapter_id, surface, observed_at ... are usually
+      constant across a whole run; `completeness` usually is not).
+    - A `statuses` entry with no `outcome` gets `fetched {page_empty: <did
+      this resource contribute any observation to THIS reply>}` -- computed
+      from the reply, not declared, so it cannot drift out of step with the
+      observations beside it. A fixture asserting anything else writes the
+      outcome out.
+    """
+    prov_defaults = run.get("provenance")
+    if prov_defaults:
+        for obs in body.get("observations", []):
+            merged = dict(prov_defaults)
+            merged.update(obs.get("provenance") or {})
+            obs["provenance"] = merged
+    for status in body.get("statuses", []):
+        if "outcome" not in status:
+            rid = status.get("resource_id")
+            empty = not any(
+                o.get("resource_id") == rid for o in body.get("observations", [])
+            )
+            status["outcome"] = {"fetched": {"page_empty": empty}}
+    return body
+
+
+def json_bytes(obj):
+    """The serialized size of `obj` in the exact encoding `send` uses."""
+    return len(json.dumps(obj, separators=(",", ":")).encode("utf-8"))
+
+
+def degrade_oversized(body):
+    """spec/observation.md section 6's two-step degrade, performed for real
+    on the bytes about to go out -- not declared by a fixture as a number.
+
+    Step 1: an observation whose serialized size exceeds
+    MAX_OBSERVATION_BYTES has its `provider_extra` replaced by exactly
+    `{"_truncated": true, "_original_bytes": N}` (N = the serialized size of
+    the provider_extra being discarded) and its provenance `completeness`
+    set to "partial".
+
+    Step 2: if it is STILL too large (an oversized `description`, say), the
+    observation is omitted entirely, the resource's status outcome becomes
+    `oversized_observation {local_id, bytes}` carrying its REAL measured
+    size, and every other observation on the page is emitted regardless --
+    one bad event must never brick a resource.
+    """
+    kept = []
+    for obs in body.get("observations", []):
+        size = json_bytes(obs)
+        if size > MAX_OBSERVATION_BYTES and isinstance(obs.get("provider_extra"), dict):
+            obs["provider_extra"] = {
+                "_truncated": True,
+                "_original_bytes": json_bytes(obs["provider_extra"]),
+            }
+            obs["provenance"]["completeness"] = "partial"
+            size = json_bytes(obs)
+        if size > MAX_OBSERVATION_BYTES:
+            for status in body.get("statuses", []):
+                if status.get("resource_id") == obs.get("resource_id"):
+                    status["outcome"] = {
+                        "oversized_observation": {
+                            "local_id": obs.get("local_id"),
+                            "bytes": size,
+                        }
+                    }
+            continue
+        kept.append(obs)
+    body["observations"] = kept
+    return body
+
+
+def build_body(run, action, body):
+    """The steps every reply body goes through, in the only order that makes
+    sense: fill in the fixture's defaults, then `pad` inflates fields to a
+    real byte count (so a fixture can be genuinely oversized without carrying
+    260 KB of literal JSON), then `degrade` applies the section 6 rule to
+    whatever came out."""
+    apply_defaults(run, body)
+    for spec in action.get("pad", []):
+        set_path(body, spec["path"], "x" * spec["bytes"])
+    if action.get("degrade"):
+        degrade_oversized(body)
+    return body
+
+
 class Adapter:
     def __init__(self, run):
         self.run = run
@@ -92,17 +234,29 @@ class Adapter:
             op: [False] * len(rules) for op, rules in run.get("on", {}).items()
         }
 
-    def send(self, obj):
-        line = json.dumps(obj, separators=(",", ":")) + "\n"
+    def send_line(self, line):
         sys.stdout.write(line)
         sys.stdout.flush()
         self.last_sent_line = line
+
+    def send(self, obj):
+        self.send_line(json.dumps(obj, separators=(",", ":")) + "\n")
 
     def run_actions(self, actions, req):
         for action in actions:
             kind = action["op"]
             if kind == "reply_ok":
-                self.send({"id": req["id"], "ok": action["body"]})
+                body = build_body(self.run, action, copy.deepcopy(action["body"]))
+                self.send({"id": req["id"], "ok": body})
+            elif kind == "reply_ok_raw":
+                # `body_json` is raw JSON TEXT, written to the wire verbatim.
+                # The only way this adapter can put a bare JSON *number*
+                # where an Amount belongs (spec/money.md section 2 requires
+                # that to be rejected at the deserializer) without the value
+                # ever passing through a Python float on the way there.
+                self.send_line(
+                    '{"id":%d,"ok":%s}\n' % (req["id"], action["body_json"])
+                )
             elif kind == "reply_err":
                 self.send(
                     {
@@ -117,7 +271,7 @@ class Adapter:
             elif kind == "reply_ok_id":
                 # Explicit id, not the requester's -- used for never-issued
                 # id and duplicate-answer hostile replies.
-                self.send({"id": action["id"], "ok": action["body"]})
+                self.send({"id": action["id"], "ok": build_body(self.run, action, copy.deepcopy(action["body"]))})
             elif kind == "reply_err_id":
                 self.send(
                     {
@@ -136,7 +290,7 @@ class Adapter:
             elif kind == "reply_deferred":
                 which = action.get("which", "oldest")
                 target = self.deferred.pop(0) if which == "oldest" else self.deferred.pop()
-                self.send({"id": target["id"], "ok": action["body"]})
+                self.send({"id": target["id"], "ok": build_body(self.run, action, copy.deepcopy(action["body"]))})
             elif kind == "replay_last_reply":
                 # Resend the exact previous frame byte-for-byte -- the
                 # cheapest way to build a "reply to an already-answered id"
@@ -144,8 +298,6 @@ class Adapter:
                 assert self.last_sent_line is not None, "replay_last_reply before any reply was sent"
                 sys.stdout.write(self.last_sent_line)
                 sys.stdout.flush()
-            elif kind == "sleep_ms":
-                time.sleep(action["ms"] / 1000.0)
             elif kind == "stdout_raw":
                 _write_raw(action["text"].encode("utf-8"))
             elif kind == "stdout_raw_bytes":
@@ -159,14 +311,6 @@ class Adapter:
                 sys.exit(action.get("code", 1))
             elif kind == "reply_with_decimal_amounts":
                 self._reply_with_decimal_amounts(action, req)
-            elif kind == "reply_ok_padded":
-                # Builds an oversize frame without bloating the fixture file:
-                # `pad_path` gets overwritten with `pad_bytes` filler
-                # characters just before sending. Used for the OversizeFrame
-                # violation (MAX_FRAME_BYTES = 1_048_576, spec/wire.md a).
-                body = copy.deepcopy(action["body"])
-                set_path(body, action["pad_path"], "x" * action["pad_bytes"])
-                self.send({"id": req["id"], "ok": body})
             else:
                 raise ValueError(f"fixture bug: unknown action op {kind!r}")
 
@@ -185,6 +329,7 @@ class Adapter:
         """
         payload = json.loads(action["provider_payload_json"], parse_float=Decimal)
         body = copy.deepcopy(action["body"])
+
         for spec in action["amounts"]:
             value = get_path(payload, spec["payload_path"])
             if isinstance(value, int) and not isinstance(value, bool):
@@ -208,15 +353,29 @@ class Adapter:
                 # never inside sumer-money itself. Zero is left alone: money.md
                 # rejects a signed zero (SignOnZero), so negating a zero
                 # amount would produce a string the wire grammar forbids.
-                value = -value
+                #
+                # `copy_negate`, NOT `-value`. Unary minus is a context-aware
+                # decimal operation: under Python's default 28-digit context
+                # it ROUNDS, so -Decimal("12345678901234567890123456789.01")
+                # silently becomes -12345678901234567890123456790. No float
+                # is involved -- it is the decimal context alone. copy_negate
+                # only flips the sign bit and is context-independent, so it is
+                # exact at any precision. (`_EXACT_CONTEXT` traps the rounding
+                # too, but the right operation is the fix; the trap is the net
+                # under it.)
+                value = value.copy_negate()
+            # format(d, "f") -- never str(Decimal(...)), which reproduces
+            # exponent notation for small magnitudes (spec/money.md section 3).
+            # __format__ reads the coefficient directly and is likewise
+            # context-independent, so it does not round either.
             amount_str = format(value, "f")
             set_path(body, spec["insert_into"], {"asset": spec["asset"], "amount": amount_str})
-        self.send({"id": req["id"], "ok": body})
+        self.send({"id": req["id"], "ok": build_body(self.run, action, body)})
 
     def handle(self, req):
         op = req.get("op")
         if op == "hello":
-            hello = self.run.get("hello", {})
+            hello = self.run.get("hello", DEFAULT_HELLO)
             if "err" in hello:
                 self.send({"id": req["id"], "err": hello["err"]})
             else:

@@ -36,6 +36,32 @@ By computing staleness only from the host's own receipt time, the worst an
 adapter's clock can do is make its `observed_at` evidence less useful — it can
 never make the host misrepresent freshness.
 
+**How the host computes it.** Staleness is derived per resource, from that
+resource's own `status` outcome (§6) in the **same reply** the observation
+arrived in:
+
+| That resource's outcome | Staleness stamped on its observations |
+|---|---|
+| `stale { as_of }` | `Cached` |
+| `unavailable`, `gone` | `Unavailable` |
+| every other outcome | `Live` |
+
+Host-stamped has never meant host-invented. An adapter that answers
+`stale { as_of }` has said, in the vocabulary this document gives it, that
+what it is handing over is not current; stamping `Live` over that would be
+the host overruling evidence it went and asked for. What the adapter still
+cannot do is *name the staleness itself* — there is no `staleness` field on
+the wire, and an adapter that sends one gets `invalid_request` — so a skewed
+or lying clock still cannot make stale data look fresh. `observed_at` is not
+an input to this at any point.
+
+Everything not covered by that table is `Live`, and honestly so: those
+observations were read off the wire moments earlier. This milestone has no
+cache layer, so nothing yet replays a stored observation. A host that starts
+doing so MUST classify what it replays from the **stored** `received_at`,
+per the rule above; that is a wider computation than this table, not a
+different one.
+
 ## 2. Balances
 
 Balances are a **list of provider-named categories, never a struct**:
@@ -97,14 +123,36 @@ ones it did.
       posting: pending | posted | unknown,
       amount, fees?,
       raw_sign: provider_positive | provider_negative,
-      description,             // PLAIN TEXT — markup is invalid_request
+      description,             // PLAIN TEXT — see the rule below
       provider_extra: {name: value},
       provenance }
 
-`description` is plain text. An adapter that sends markup (HTML, Markdown, or
-any other markup convention) gets `invalid_request` — this field is displayed
-directly, and accepting markup here would make every consumer of the field a
-markup sanitizer by necessity.
+`description` is plain text, and "plain text" is exactly this rule:
+
+> A `description` MUST NOT contain any byte in `U+0000`–`U+001F` other than
+> horizontal tab (`U+0009`), MUST NOT contain `U+007F`, and MUST NOT contain
+> `<` (`U+003C`) or `>` (`U+003E`). Every other character is permitted. An
+> adapter that sends one of those bytes gets `invalid_request`.
+
+Both sides run the same check, byte by byte, and get the same answer.
+
+**Why this rule and not "no markup".** An earlier version of this document
+said an adapter sending "HTML, Markdown, or any other markup convention" gets
+`invalid_request`. That is not implementable. There is no decidable test for
+"is this Markdown" — the dialect has no closed grammar, and its markers are
+characters that appear constantly in real provider data: `PAYPAL *STEAM`,
+`SQ *COFFEE #4471`, `***ATM FEE`, `A_B_CORP`, `[ATM] 24H`. Rejecting those
+would reject legitimate transactions; rejecting only some of them would be a
+rule no second implementation could reproduce, which is the one thing a wire
+spec cannot afford. `<` and `>` are different in kind: they are the two bytes
+every tag-based dialect needs, and they carry no meaning of their own inside
+a payee name, so banning them is both exact and cheap.
+
+**The obligation the old wording was reaching for lands on the consumer.**
+`description` is provider-authored text and is rendered **as text**: never as
+HTML, never as a Markdown source string, never interpolated into a template
+that interprets either. A consumer that renders it as markup is the bug; the
+`<`/`>` ban is a second line of defence, not the first.
 
 ### The host assigns `revision`
 
@@ -159,6 +207,28 @@ ones already on file, and can react (flag the chain, warn the user,
 re-anchor) instead of quietly treating two different `local_id`s for the same
 real-world record as two different records, which would double-count history.
 
+### `local_id` is namespaced by `adapter_id`
+
+**A `local_id` means nothing outside the adapter that derived it. Every
+per-record structure the host keeps — the observation chain, the revision
+counter, the live set, and every lookup into them — is keyed by
+`(adapter_id, local_id)`, never by `local_id` alone.**
+
+This follows from the derivation itself: `local_id` is a pure function of
+*one* provider's data, chosen and versioned by *one* adapter
+(`local_id_derivation`, above). Nothing coordinates those functions across
+adapters, so two adapters emitting `"tx-1"`, or `"2026-09-06:42.00:acme"`,
+for two unrelated real-world records is expected, not pathological — exactly
+as two adapters are free to both use `"main"` as a `resource_id`
+(`spec/wire.md` §10).
+
+A host that keys on `local_id` alone silently merges those two records into
+one chain. The consequences are not cosmetic: the later adapter's amount
+overwrites the earlier one's in the live set, and a tombstone emitted by one
+adapter deletes the other adapter's transaction. Both are silent — the fold
+produces a well-formed, entirely wrong answer, with nothing on the wire to
+signal it.
+
 **Dedup by `provider_id` alone is forbidden.** `provider_id` is a *field on*
 an observation, carried through for evidence and cross-reference — it is not
 the deduplication key, and is not present on every observation to begin with
@@ -209,11 +279,19 @@ what a cursor durably promises:
   model: a block-height cursor is exact because block height only moves
   forward and every page boundary is a safe place to persist "resume from
   here."
-- **`batch_restart`** — the durable cursor advances only on `next: null`, i.e.
-  only once the whole batch is exhausted. This is Plaid's model: an
-  interrupted batch resumes from its *start*, not from wherever it stopped,
+- **`batch_restart`** — the durable resume point is the batch's *start*, and
+  in this version of the protocol it never advances. This is Plaid's model:
+  an interrupted batch resumes from its start, not from wherever it stopped,
   because the provider does not promise that an intermediate cursor value
-  remains valid or meaningful across a resume.
+  remains valid or meaningful across a resume. When the batch drains
+  (`next: null`) there is nothing to advance *to*: a drained page's `next` is
+  null by definition, and `PageRequest` has no separate slot for "the point a
+  future batch should start from." So a `batch_restart` resource has no
+  drained/terminal resume state — asking it for a next page again resends the
+  same start. Persisting a post-batch cursor is deliberately deferred until
+  there is a real paginating provider to define what it means
+  (`constitution/FOUNDING_PLAN.md` §10); until then this document, the code
+  in `core/host/src/paging.rs`, and its tests all say this one thing.
 - **`none`** — there is no durable cursor at all. A caller resumes by
   re-issuing a `Window { resource_id, asset?, start, end }` request instead,
   identifying the gap by its boundaries rather than by an opaque token the
@@ -262,6 +340,23 @@ failure of the page:
    `oversized_observation { local_id?, bytes }` in `statuses`, and
    **continues the page** — it keeps emitting every other observation that
    fits.
+
+**The host enforces the cap too, at decode.** Steps 1 and 2 are the
+adapter's obligations, and an adapter that skips them is non-conforming — but
+"the adapter promised" is not enforcement. A host MUST measure each decoded
+observation and, for any that still exceeds `MAX_OBSERVATION_BYTES`, perform
+step 2 itself: omit that observation, report `oversized_observation
+{ local_id?, bytes }` for its resource, and continue the page. The host does
+not attempt step 1 (truncating `provider_extra` on the adapter's behalf) —
+that would hand a caller a record the adapter never emitted, silently
+altered.
+
+Because **every requested `resource_id` appears in `statuses` exactly once**,
+the host *replaces* that resource's outcome with `oversized_observation`
+rather than appending a second entry for it; the entry's `page` is kept, so
+the resource stays resumable. `bytes` is the size the host measured on its
+own serialization of the decoded observation, which differs from the
+adapter's bytes only in JSON whitespace and key order.
 
 The reason this is a two-step degrade rather than a single reject-and-move-on:
 **a resource must never be bricked by one large event.** An adapter (or a host

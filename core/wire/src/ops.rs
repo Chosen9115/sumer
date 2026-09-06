@@ -8,6 +8,7 @@
 //! parse failure). No `execute()` -- exactly these four, plus `hello`.
 
 use crate::observation::{BalanceWire, ObservationWire, PageRequest, ResourceStatus};
+use crate::shape::object_only;
 use serde::{Deserialize, Serialize};
 
 pub const OP_HELLO: &str = "hello";
@@ -28,15 +29,25 @@ pub const OP_STATUS_READ: &str = "status.read";
 /// exactly the "unexplained magic" the merge bar rejects. `None` says it
 /// directly.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(remote = "Self", deny_unknown_fields)]
 pub struct ResourceQuery {
     pub resource_id: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub page: Option<PageRequest>,
 }
 
+object_only!(ResourceQuery, "a resource query: an object", serialize);
+
 /// `resources.list` params: no filter fields defined in this milestone.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(remote = "Self", deny_unknown_fields)]
 pub struct ResourcesListParams {}
+
+object_only!(
+    ResourcesListParams,
+    "resources.list params: an object",
+    serialize
+);
 
 /// One resource an adapter can serve reads for.
 ///
@@ -46,6 +57,7 @@ pub struct ResourcesListParams {}
 /// case). `resources.list` runs before anything has been observed, so
 /// there is nothing to attach a surface to yet.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(remote = "Self", deny_unknown_fields)]
 pub struct ResourceDescriptor {
     pub resource_id: String,
     pub provider_id: String,
@@ -55,53 +67,104 @@ pub struct ResourceDescriptor {
     pub provider_extra: Option<serde_json::Map<String, serde_json::Value>>,
 }
 
+object_only!(
+    ResourceDescriptor,
+    "a resource descriptor: an object",
+    serialize
+);
+
 /// `resources.list` reply: `{"resources": [...]}`, and nothing else --
 /// no `observations`, no `statuses`. Nothing was requested before
 /// discovery, so there is nothing to report a per-resource outcome for.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(remote = "Self", deny_unknown_fields)]
 pub struct ResourcesListReply {
     pub resources: Vec<ResourceDescriptor>,
 }
 
+object_only!(
+    ResourcesListReply,
+    "a resources.list reply body: an object",
+    serialize
+);
+
 /// `balances.read` params: batched, NOT paginated -- balances have no
 /// cursor, so this is just the list of resources to read.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(remote = "Self", deny_unknown_fields)]
 pub struct BalancesReadParams {
     pub resource_ids: Vec<String>,
 }
 
+object_only!(
+    BalancesReadParams,
+    "balances.read params: an object",
+    serialize
+);
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(remote = "Self", deny_unknown_fields)]
 pub struct BalancesReadReply {
     pub observations: Vec<BalanceWire>,
     pub statuses: Vec<ResourceStatus>,
 }
 
+object_only!(
+    BalancesReadReply,
+    "a balances.read reply body: an object",
+    serialize
+);
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(remote = "Self", deny_unknown_fields)]
 pub struct HistoryReadParams {
     pub resources: Vec<ResourceQuery>,
 }
 
+object_only!(
+    HistoryReadParams,
+    "history.read params: an object",
+    serialize
+);
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(remote = "Self", deny_unknown_fields)]
 pub struct HistoryReadReply {
     pub observations: Vec<ObservationWire>,
     pub statuses: Vec<ResourceStatus>,
 }
 
+object_only!(
+    HistoryReadReply,
+    "a history.read reply body: an object",
+    serialize
+);
+
 /// `status.read` params: just the resource ids -- there is nothing to
 /// paginate when the answer is "is this resource still reachable".
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(remote = "Self", deny_unknown_fields)]
 pub struct StatusReadParams {
     pub resource_ids: Vec<String>,
 }
+
+object_only!(StatusReadParams, "status.read params: an object", serialize);
 
 /// `status.read` reply. No `observations` field: this op fetches nothing,
 /// it only reports reachability/credential state per resource (the extra
 /// `credential_expires_at`/`strong_auth_expires_at`/`history_start` fields
 /// on `ResourceStatus` are populated here, and only here).
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(remote = "Self", deny_unknown_fields)]
 pub struct StatusReadReply {
     pub statuses: Vec<ResourceStatus>,
 }
+
+object_only!(
+    StatusReadReply,
+    "a status.read reply body: an object",
+    serialize
+);
 
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]

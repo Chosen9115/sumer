@@ -31,6 +31,7 @@ mod envelope;
 mod error;
 mod observation;
 mod ops;
+mod shape;
 
 pub use codec::FrameDecoder;
 pub use envelope::{ErrorBody, HelloParams, HelloReply, Reply, Request, RequestId};

@@ -18,6 +18,14 @@ path or arguments need a space, wrap your adapter in a small shell script
 and pass that script's path instead). `<dir>` is a directory of `*.json`
 fixtures in the schema documented in `adapters/fake/README.md`.
 
+**Your adapter is never asked for a cursor it did not hand out.** A
+resource's first `history.read` carries no `page` field at all -- absent
+means "from the start of available history" (`spec/observation.md` §5,
+Ruling A8) -- and every page after it echoes back a cursor the previous
+reply's `statuses[].page.next` returned. An adapter whose cursors are
+opaque tokens it alone mints, and which rejects anything else, is exactly
+what the contract permits and passes this suite unmodified.
+
 Examples:
 
 ```
@@ -69,6 +77,10 @@ cases need more than one adapter process:
   it: this suite would not catch a real host and this suite silently
   disagreeing about resumption or revision assignment if it carried its
   own second implementation of either.
+- **`provider_json_number.json`** and **`stale_balance.json`** each make one
+  extra call on the *same* connection whose reply must be rejected at the
+  envelope level (`expect.envelope_errors`), then re-issue `resources.list`
+  to prove the rejection did not take the connection with it.
 - **`protocol_violations.json`** spawns your adapter six times, one per
   entry in its fixture's `script.runs[]`, selected via the
   `SUMER_FIXTURE_RUN` environment variable (a 0-based index, per
@@ -89,14 +101,25 @@ the wire's 30-second default, so a scenario that deliberately forces a
 host-side timeout doesn't cost 30 real seconds per run. A runner that
 ignores it entirely is still conformant.
 
-## A9's requirement: two process invocations, not one
+## A9's requirement: two process invocations, and an association, not a set
 
 Whenever a case's fold produces any `local_id`s, this runner spawns your
-adapter a **second, independent** time for that same fixture and diffs the
-set of `local_id`s the two runs produced. A `local_id` derived from
-anything process-local -- a freshly generated UUID, an in-memory counter
-that doesn't survive a restart -- fails here even though a single run
-would have looked perfectly fine.
+adapter a **second, independent** time for that same fixture and compares
+what the two runs produced. A `local_id` derived from anything
+process-local -- a freshly generated UUID, an in-memory counter that
+doesn't survive a restart -- fails here even though a single run would have
+looked perfectly fine.
+
+What is compared is the **association**, not the set: each `local_id`
+against the provider record it identifies (amount, posting, state, surface,
+`provider_id`, `provider_extra`), with the two host-stamped fields
+(`received_at` and the `staleness` derived from it) excluded because they
+legitimately differ per receipt. Comparing the bare set of ids is not
+enough, and this suite used to make that mistake: an adapter that hands out
+the same ids on the second launch attached to *different records* -- swap
+two observations' ids and the set is identical while every id now names the
+wrong thing -- has a derivation that is not a function of the record at
+all, which is precisely what A9 exists to reject.
 
 ## Assertions implemented (A1-A11)
 
@@ -109,12 +132,12 @@ its stated mitigation, not just its happy-path check:
 | A2 | Live-set equality after folding | Ignoring `state`/`supersedes` entirely |
 | A3 | `null` (unknown) is never zero | Emitting `null` for every category, or `0` for every unknown one |
 | A4 | Error class is never plain text; ops around a failure still succeed | Returning the same error for everything, or killing the connection on any hiccup |
-| A5 | Exactly-resumable cursor, bracketed both ways | Re-emitting everything (passes only because dedup absorbs it) *and* emitting nothing (fails the live-set half) |
+| A5 | Exactly-resumable cursor, bracketed both ways, over the resumed live set's full **financial content** | Re-emitting everything (passes only because dedup absorbs it), emitting nothing (fails the live-set half), *and* re-emitting the right `local_id`s carrying different amounts (which a key-set comparison could not see) |
 | A6 | The live set floor: non-empty when expected | "Report success" with nothing behind it |
 | A7 | Every requested `resource_id` in `statuses`, exactly once | One blanket status for a whole batch |
 | A8 | Full chain retention, in fold order | Keeping only the final state |
-| A9 | `local_id` purity across two independent process launches | A freshly generated UUID per run |
-| A10 | The oversized-observation two-step degrade, three ways at once | Truncating (or dropping) the whole page over one bad record |
+| A9 | `local_id` purity across two independent process launches, compared as record-to-id associations | A freshly generated UUID per run, *and* a derivation that reuses the same ids for different records on the second run |
+| A10 | The oversized-observation two-step degrade, four ways at once, driven by genuinely oversized input | Truncating (or dropping) the whole page over one bad record, *and* leaving leaked payload beside the truncation marker (`provider_extra` is compared exactly, and every observation received is measured against `MAX_OBSERVATION_BYTES`) |
 | A11 | Fatal violations kill; a tombstoned reply is discarded and the connection survives | A host that kills the connection on *any* anomaly |
 
 ## Honest limits of black-box testing
@@ -132,40 +155,39 @@ before it got there. Concretely:
   as hard as possible (78 significant digits, 27-digit fractions well
   past `f64`'s ~15-17 significant decimal digits), not to make it
   impossible.
-- **`fdx_lossless.json`'s claim that `spec/fdx-6.4-mapping.md`'s LOSSY
-  column is empty is only checked to the extent this suite asserts
-  amounts, categories, and postings** (`expect.balances` /
-  `expect.history_live_set`). The fixture's `expect.fdx_field_map`
-  documents where every FDX field lands, including into
-  `provider_extra`; this runner does not independently re-derive that
-  mapping table field-by-field.
-- **`expect.provenance.*.staleness` is not checked**, deliberately. The
-  wire forbids an adapter from ever sending `staleness` (it is
-  host-computed, spec/observation.md §1), and this milestone's
-  `sumer-host` always stamps `Staleness::Live` -- there is no cache layer
-  yet for `Cached`/`Unavailable` to describe (see the module docs on
-  `core/host/src/lib.rs`). Asserting `stale_balance.json`'s
-  `expect.provenance.checking-2.staleness: "cached"` against the shipped
-  host would therefore fail unconditionally, for a reason outside this
-  suite's mandate rather than a real nonconformance. This runner checks
-  `completeness` (which the wire *can* carry and which this fixture's
-  script does set) and leaves `staleness` out; see the worker report for
-  this PR for the same note addressed to Linus.
+- **A1 likewise cannot prove no *decimal context* rounded.** It can only prove the
+  emitted digits survived. `provider_json_number.json` makes that as hard
+  as possible by asserting a 31-significant-digit negated amount together
+  with its exact digit count and scale, which a 28-digit default context
+  cannot produce.
+- **`fdx_lossless.json` checks the FDX mapping's landing sites, not its
+  meaning.** `expect.fdx_field_map` is now read: every
+  `provider_extra.<key>` its prose names must have arrived on the wire, and
+  every `provider_extra` key that arrived must be named by it, with each
+  observation's `provider_extra` compared exactly. What that cannot check is
+  whether the prose *describes the right FDX field* -- that a row saying
+  `transactions[].status` lands in `provider_extra.fdx_status` is true of
+  the schema, not just of this fixture. That reconciliation lives in
+  `spec/fdx-6.4-mapping.md` and was done against the real 6.4 schema; the
+  suite holds the fixture to the table, not the table to FDX.
 - This suite never inspects an adapter's source, memory, or process
   internals. It is exactly as strong as its wire evidence and no
   stronger.
 
-## A known API gap in `sumer-host`, not routed around
+## One client, no second one
 
-`unsupported_op.json`'s whole point is sending an op no capability list
-ever names (`execute`, reserved for a future milestone). `sumer_host::AdapterHandle`
-exposes exactly four typed methods (`resources_list`, `balances_read`,
-`history_read`, `status_read`), each hardcoding its own op string --
-there is no public way to ask it to send an arbitrary op. Adding one was
-out of scope for this crate's file list, so this one case is driven by a
-small, private, single-purpose raw JSONL client (`runner::RawLink`)
-instead of `AdapterHandle`. It reimplements no id-lifecycle or
-protocol-violation logic -- every other case, including all of A11, goes
-through the real `AdapterHandle` -- it is strictly "write one line, read
-the next line back," in order, and exists only because there was no other
-way to exercise this one fixture without modifying `sumer-host` itself.
+Every case in this suite -- `unsupported_op.json`'s undeclared-op probe
+included -- goes through `sumer_host::AdapterHandle`, so every connection
+gets the same spawn (including the environment allowlist), the same
+`FrameDecoder` (so `MAX_FRAME_BYTES` and non-UTF-8 rejection are enforced),
+and the same id lifecycle. The probe reaches the wire through
+`AdapterHandle::call_raw`, which sends an arbitrary op string and returns
+the envelope reply verbatim -- an `err` comes back as `Ok(Reply::Err {..})`
+rather than a transport failure, which is exactly the distinction that case
+is testing.
+
+An earlier revision of this crate carried a second, private JSONL client for
+that one probe. It was not a smaller version of `AdapterHandle`, it was a
+divergent one: it skipped the environment allowlist and read lines instead
+of frames, so two of the guarantees this suite exists to check were simply
+absent on that connection. It is gone.

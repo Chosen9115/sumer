@@ -91,16 +91,53 @@ hanging, so a bad fixture fails loudly instead of silently.
 | `reply_err` | `{"id": <the request's id>, "err": {code, message, detail}}` |
 | `reply_ok_id` | `{"id": <literal id>, "ok": body}` — never-issued / duplicate ids |
 | `reply_err_id` | same, with `err` |
-| `defer` | hold this request unanswered; a later rule must `reply_deferred` it |
+| `defer` | hold this request unanswered; a later rule must `reply_deferred` it. **This is also how you force a host-side timeout.** There is deliberately no `sleep_ms`: sleeping only beats a deadline if the machine cooperates, and under CI load it does not — a test whose pass depends on the scheduler is not a test. A deferred request is never answered until the fixture says so, so the timeout is certain at any deadline. Sleeping also blocked this adapter's own read loop, which forced every *other* request on the connection into the same short deadline. |
 | `reply_deferred` | pop the oldest (or newest, `which:"newest"`) deferred request and reply to *it* |
 | `replay_last_reply` | resend the previous frame byte-for-byte (builds "reply to an already-answered id" without knowing its numeric value) |
-| `sleep_ms` | `time.sleep(ms/1000)` |
 | `stdout_raw` | write `text` verbatim (garbage, banners; include your own `\n`) |
 | `stdout_raw_bytes` | write a literal list of byte values (deliberately invalid UTF-8) |
-| `reply_ok_padded` | like `reply_ok`, but `pad_path` is overwritten with `pad_bytes` copies of `"x"` first — builds an oversize frame without bloating the fixture file |
+| `reply_ok_raw` | writes `body_json` — raw JSON **text** — as the `ok` value, verbatim. The only way to put a bare JSON *number* where an `AmountWire` belongs (`spec/money.md` §2) without the value ever passing through a Python `float` on the way there. |
 | `stderr` | write `text` to stderr (never parsed by the host) |
 | `exit` | `sys.exit(code)` — mid-batch crash |
 | `reply_with_decimal_amounts` | see below — the one piece of real work |
+
+Two **modifiers** apply to `reply_ok` and `reply_with_decimal_amounts`, in
+this order, just before the reply is written:
+
+| Key | Effect |
+|---|---|
+| `pad: [{"path": [...], "bytes": N}]` | overwrite each `path` in the body with `N` copies of `"x"`. Lets a fixture be *genuinely* oversized — a 200 KB description, a 120 KB `provider_extra` — without carrying 200 KB of literal JSON. |
+| `degrade: true` | run `spec/observation.md` §6's two-step degrade over the padded body, measuring real serialized bytes: an observation over `MAX_OBSERVATION_BYTES` (65,536) has its `provider_extra` replaced by exactly `{"_truncated": true, "_original_bytes": N}` and its `completeness` set to `partial`; if it is *still* too large it is omitted entirely and its resource's status outcome becomes `oversized_observation {local_id, bytes}` with the measured size. Every other observation on the page is emitted regardless. |
+
+`pad` + `degrade` together are what make `oversized_observation.json` a real
+test rather than a declaration: the fixture states no byte counts, it states
+the padding, and every number in its `expect` block is one the degrade
+*produced*. `pad` on its own (no `degrade`) builds the `OversizeFrame`
+violation in `protocol_violations.json`.
+
+A rule may also carry `"consume": false`, which keeps it matching every time
+instead of firing once — needed by any op the runner legitimately calls more
+than once on one connection (`resources.list`, which the suite re-issues to
+prove a connection survived an envelope error).
+
+### Defaults a fixture does not have to write
+
+Three things were repeated verbatim in every fixture and carried no test
+content, so the adapter fills them in. **Every one is overridable: an
+explicitly written value always wins, and nothing here can change a value a
+fixture stated.**
+
+| Omitted | Filled in with |
+|---|---|
+| a run's `hello` | `{protocol:"1", adapter_id:"fake-adapter", adapter_version:"0.1.0", capabilities:[all four], local_id_derivation:"fixture-literal@1", max_in_flight:1}`. `protocol_violations.json`'s `survivable_then_kill` run still writes its own, because it needs `max_in_flight: 2`. |
+| keys of an observation's `provenance` | the run-level `"provenance"` object, for keys the observation omits. `adapter_id`/`surface`/`observed_at` are usually constant across a run; `completeness` usually is not, so it is usually written per observation. |
+| a `statuses` entry's `outcome` | `fetched {page_empty: <did this resource contribute any observation to THIS reply>}` — **computed from the reply**, not declared, so it cannot drift out of step with the observations beside it. Any other outcome (`stale`, `rate_limited`, `oversized_observation`, ...) is written out in full. |
+
+This removed ~600 lines of copy-paste across the twelve fixtures without
+changing a single byte of meaning on the wire: replaying every fixture
+through the adapter before and after produced semantically identical replies
+for all 22 runs (only the key order inside `provenance` moved, and
+`spec/wire.md` §1 makes field names the only way a value is addressed).
 
 ### `reply_with_decimal_amounts` — the Decimal recipe
 
@@ -127,7 +164,14 @@ token becomes an exact `Decimal`), optionally negates it (`negate: true`,
 for adapters that must normalize an unsigned amount plus a separate sign
 indicator — e.g. FDX's `debitCreditMemo` — into Sumer's single signed
 `Amount`, "applied before... never inside" the money layer per
-`spec/money.md` §6; a zero value is left alone rather than negated, since a
+`spec/money.md` §6 — and the negation is `Decimal.copy_negate()`, **never**
+unary `-`: unary minus is a context-aware decimal operation that silently
+rounds to the active context's precision (28 digits by default), so
+`-Decimal("12345678901234567890123456789.01")` returns
+`-12345678901234567890123456790` with no float involved and no error raised.
+The module also installs a decimal context that traps `Inexact`/`Rounded`, so
+any context-sensitive operation added to this file later raises instead of
+rounding quietly; a zero value is left alone rather than negated, since a
 signed zero is grammar-invalid), formats it with `format(d, "f")` (never
 `str(Decimal(...))`, which reproduces exponent notation for small
 magnitudes — `spec/money.md` §3), and splices `{"asset", "amount"}` into a
@@ -181,70 +225,26 @@ it — in which case this one scenario needs a real 30-second-plus sleep to
 stay honest, which is impractical for a fast suite. Flagging this as a gap
 worth closing in the actual runner design, not solving it unilaterally.
 
-## Wire shapes (Contract Amendment 1, ruled — no longer provisional)
+## Wire shapes
 
-Two blind PR2 workers picked different shapes for everything the frozen
-contract left unpinned. Amendment 1 settled all of it; every fixture here
-was reconciled to the ruling. This section states the ruled shapes, not a
-guess:
+`spec/wire.md` (envelope, ops, caps, id lifecycle) and `spec/observation.md`
+(provenance, balances, observations, statuses, pagination) are normative and
+own every shape these fixtures emit; `core/wire/` is the reference decoder
+for them. This file deliberately does not restate them — a second copy of a
+normative table is a copy that drifts, and this one had: it still documented
+`page: {"kind": "cursor", "cursor": ""}` as the way to ask for a first page
+after Ruling A8 replaced that with an **absent** `page` field.
 
-- **`resource_id` is a required field on every balance observation, every
-  history observation, and every `statuses` entry** (Ruling A1). Not
-  optional: `balances.read`/`status.read`/`history.read` batch multiple
-  resources in one call — A7's "every requested resource_id appears in
-  statuses exactly once" means nothing if every call is single-resource —
-  and a reply of pooled observations is unparseable without a
-  per-observation resource key. `core/wire/src/observation.rs`'s
-  `BalanceWire`/`ObservationWire` enforce this at deserialize time.
-- **An adapter MUST NOT send `staleness` or `received_at` in `provenance`**
-  (Ruling A2). Both are host-computed. `core/wire/src/observation.rs`'s
-  `ProvenanceWire` has no field for either, combined with
-  `#[serde(deny_unknown_fields)]`, so sending either is a hard deserialize
-  failure the host maps to `invalid_request`. `stale_balance.json`'s
-  adversarial half (a balance observation whose `provenance` literally
-  carries `received_at`) exercises exactly this rejection deliberately, not
-  simulated.
-- **Op params** (Ruling A3): `resources.list` takes `{}`. `balances.read`
-  and `status.read` take `{"resource_ids": [...]}` — batched, NOT
-  paginated (balances have no cursor). `history.read` takes
-  `{"resources": [{"resource_id": "...", "page": <PageRequest>}]}` —
-  batched, with each resource carrying its own cursor, because different
-  resources hold different paging state. A first-ever page for a resource
-  is requested with `page: {"kind": "cursor", "cursor": ""}` (an empty
-  opaque cursor means "from the start"); this adapter's fixtures use that
-  convention, and split a resumption cursor's own resource ownership out
-  of its `"<resource_id>:<suffix>"` naming convention — a fixture-file
-  convenience, not a wire rule.
-- **`resources.list` reply** (Ruling A4): `{"resources": [{resource_id,
-  provider_id, kind, label, provider_extra?}]}` — no `surface` (surface is
-  a property of an *observation*, carried on `Provenance`, not of a
-  resource: one resource can be observed through several surfaces, e.g.
-  Wise's activities-vs-statements case), and no `provenance` at all —
-  nothing has been observed yet at discovery time. `resources.list` and
-  `status.read` replies have **no** `observations` and **no** `statuses`
-  key on `resources.list`, and no `observations` key on `status.read` —
-  only `balances.read` and `history.read` carry
-  `{"observations": [...], "statuses": [...]}`.
-- **`history.read`'s per-resource paging state** lives nested inside each
-  entry of `statuses` as a `"page"` object (`cursor_resumable`, `next`,
-  and optionally `window_capped_to`/`page_size_reduced_to`) — never as a
-  top-level sibling of `observations`/`statuses`. This is the direct
-  consequence of keeping `history.read` batched: two different resources
-  in the same batched call can be at two different points in their own
-  pagination, so there is no single reply-wide cursor to report.
-- Enum wire tagging follows serde's *default* (no `#[serde(tag = ...)]`):
-  unit variants (`not_fetched`, `unavailable`, `live`, `complete`,
-  `pending`, `active`, `provider_positive`, canonical hints, ...) are bare
-  JSON strings, snake_case exactly as `core/wire/src/observation.rs`
-  renders them; variants carrying fields (`fetched{page_empty}`,
-  `stale{as_of}`, `rate_limited{retry_after_ms}`,
-  `oversized_observation{local_id,bytes}`) are single-key objects,
-  `{"variant_name": {...fields}}`.
+Two things worth knowing before writing a fixture, both consequences of
+those documents rather than additions to them:
 
-None of this changes what the fixtures assert about money, folding,
-pagination, or violations — only the addressing of that content (which
-JSON keys carry which values). See each fixture's `expect.notes` for
-case-specific reasoning.
+- The first page of a resource's history is requested with **no `page` key
+  at all**. A `when` clause for it is `{"resources": [{"resource_id": "..."}]}`
+  — matching a literal empty cursor will never fire.
+- `history.read`'s per-resource paging state lives nested inside each
+  `statuses` entry as a `"page"` object, never as a top-level sibling of
+  `observations`/`statuses`: two resources in one batched call can be at
+  different points in their own pagination.
 
 ## What each fixture is actually testing
 
@@ -282,92 +282,3 @@ fixture and `spec/fdx-6.4-mapping.md`'s Accounts/Balances sections. All identifi
 names, and account numbers in the payload are obvious placeholders
 (`acct-sample-0001`, `XXXX0000`, `"... (fixture placeholder)"` in every
 free-text field) — no real person, account, or institution.
-
-## Verification performed
-
-- `python3 -m json.tool` on all twelve files in `conformance/cases/`: all
-  valid JSON.
-- `python3 -c "import ast; ..."` walked over `fake_adapter.py`'s own AST:
-  imports are exactly `{json, os, sys, time, decimal, copy}` — all stdlib.
-- Ran the adapter by hand (piping hand-written request lines on stdin) for:
-  - `large_amounts.json` — confirmed framing is one JSON object per
-    LF-terminated line in both directions, and hello is the first line out.
-  - `provider_json_number.json` — confirmed the three extracted amounts
-    match `expect.balances` exactly (see the transcript below).
-  - `fdx_lossless.json` — confirmed DEBIT/CREDIT sign normalization
-    produces `-42.50` / `1500.00` / `-75.00`.
-  - `protocol_violations.json`, all six `SUMER_FIXTURE_RUN` values —
-    confirmed: run 0 writes garbage with no hello reply anywhere near it;
-    run 1's timing (`time` showed ~0.6s) and reply order (`id 5` then
-    `id 4`, i.e. genuinely out of arrival order) matched the script, and
-    the final frame carries `id: 18446744073709551615`; run 2's last two
-    frames are byte-identical (`replay_last_reply`); run 3's second output
-    line is 1,200,387 bytes, over `MAX_FRAME_BYTES`; run 4 emits plain
-    text instead of a JSON reply; run 5's last frame's tail bytes are
-    `0xFF 0xFE`, invalid UTF-8.
-- **Cross-checked every amount string this adapter emits against the real
-  `sumer-money` crate** (a throwaway `cargo run` binary depending on
-  `core/money` by path, not committed anywhere): every amount produced by
-  `large_amounts.json`, `provider_json_number.json`, and `fdx_lossless.json`
-  parses via `Amount::parse` and round-trips byte-identically through
-  `Display`. This is the strongest evidence available that the fixtures
-  satisfy `spec/money.md`'s grammar exactly, not just "look like decimals".
-
-### The `provider_json_number` transcript
-
-```
-=== Value A (27 sig digits) ===
-Decimal exact : 123456789012345678.987654321
-float() lossy : 123456789012345680
-round-trip equal to input? True
-float matches input exactly? False
-
-=== Value B2 (uint256-scale, forced float token) ===
-Decimal exact : 115792089237316195423570985008687907853269984665640564039457584007913129639935.0
-float() lossy : 115792089237316195423570985008687907853269984665640564039457584007913129639936
-round-trip equal to input? True
-float matches input exactly? False
-
-=== json.loads with parse_float=Decimal, over a payload STRING ===
-token_balance_wei type: <class 'int'>
-token_balance_wei value: 115792089237316195423570985008687907853269984665640564039457584007913129639935
-token_balance_wei_float type: <class 'decimal.Decimal'>
-token_balance_wei_float value (format d,'f'): 115792089237316195423570985008687907853269984665640564039457584007913129639935.0
-precise_fraction type: <class 'decimal.Decimal'>
-precise_fraction value (format d,'f'): 123456789012345678.987654321
-
-=== what a NAIVE adapter (plain json.loads, no parse_float) would emit ===
-naive precise_fraction: 1.2345678901234568e+17 -> str: 1.2345678901234568e+17
-naive token_balance_wei_float: 1.157920892373162e+77
-```
-
-And the adapter's actual reply for `provider_json_number.json`, unmodified:
-
-```json
-{"id":1,"ok":{"observations":[
-  {"resource_id":"wallet-decimal","category":"token_balance_wei_bare_int","canonical_hint":null,
-   "amount":{"asset":"eth-wei","amount":"115792089237316195423570985008687907853269984665640564039457584007913129639935"},
-   "provenance":{...}},
-  {"resource_id":"wallet-decimal","category":"token_balance_wei_float_token","canonical_hint":null,
-   "amount":{"asset":"eth-wei-reported-as-float","amount":"115792089237316195423570985008687907853269984665640564039457584007913129639935.0"},
-   "provenance":{...}},
-  {"resource_id":"wallet-decimal","category":"precise_fraction","canonical_hint":null,
-   "amount":{"asset":"USDC-precise","amount":"123456789012345678.987654321"},
-   "provenance":{...}}
-],"statuses":[{"resource_id":"wallet-decimal","outcome":{"fetched":{"page_empty":false}}}]}}
-```
-
-Every emitted amount string is byte-identical to the source decimal
-literal — the provider's float token never touched a Python `float`,
-anywhere in the pipeline.
-
-## What could not be verified
-
-The real conformance runner (`sumer-conformance`) either does not exist yet
-or was not available in this workspace — **no cargo-run pass against these
-fixtures was performed, and none is claimed.** Everything above is (a)
-JSON validity, (b) hand-driven wire-level behaviour of this adapter in
-isolation, and (c) cross-verification of amount strings against the real
-`sumer-money` crate. Whether the runner actually agrees with the op/params
-shapes this README documents as assumptions is the one thing that cannot
-be checked from this side of the fence.

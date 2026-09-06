@@ -12,10 +12,13 @@
 //!
 //! - `exact` -- the durable point is the `next` from the last **completed**
 //!   page. Every completed page is a safe place to resume from.
-//! - `batch_restart` -- the durable point never moves until a page returns
-//!   `next: None` (the whole batch is exhausted); until then, every resume
-//!   -- no matter how many pages already succeeded -- resends the value the
-//!   batch *started* with.
+//! - `batch_restart` -- the durable point is the batch's start and never
+//!   moves. Every resume -- no matter how many pages already succeeded --
+//!   resends the value the batch *started* with, and a drained batch
+//!   (`next: None`) has nothing to advance *to*: `PageRequest` has no slot
+//!   for "where a future batch should start," so there is no terminal
+//!   resume state for this family. Deferred until a real paginating
+//!   provider defines it (spec/observation.md 5).
 //! - `none` -- there is no durable point at all; every resume resends the
 //!   original `Window`, relying on `local_id` dedup (`sumer_host::fold`) to
 //!   avoid double-counting.
@@ -49,9 +52,10 @@ impl ResumeState {
     /// "the next page in an uninterrupted read" or "resume after a crash,
     /// on a fresh connection with no memory of it": both ask the same
     /// question and get the same answer, per the policy table above.
-    /// `None` once an `exact`/`batch_restart` read has fully drained
-    /// (a page returned `next: None`); a `none`-resumable resource has no
-    /// such terminal state here and always resends its original window.
+    /// `None` once an `exact` read has fully drained (a page returned
+    /// `next: None`) -- the only family with a terminal state here.
+    /// `batch_restart` always resends its batch start and `none` always
+    /// resends its original window, drained or not.
     #[must_use]
     pub fn next_request(&self) -> Option<PageRequest> {
         match self.resumable {
@@ -69,10 +73,9 @@ impl ResumeState {
         if resumable == CursorResumable::Exact {
             self.exact_next = next;
         }
-        // `BatchRestart`/`None`: an intermediate `next` is never adopted as
-        // the resume point -- only `start` is ever resent until the batch
-        // fully drains (`BatchRestart`) or the caller stops asking
-        // (`None`, which has no drained state at all).
+        // `BatchRestart`/`None`: `next` is never adopted as the resume
+        // point at all -- intermediate or final. Only `exact` has a durable
+        // point that moves, and only it has a drained/terminal state.
     }
 }
 
@@ -138,7 +141,9 @@ mod tests {
     fn batch_restart_still_resends_start_once_the_batch_finishes() {
         // `next: null` marks the batch done, but there is no "next batch"
         // concept in this milestone's PageRequest -- the durable point for
-        // *this* batch stays its own start.
+        // *this* batch stays its own start. This is the one rule
+        // spec/observation.md 5, the module docs above, and `record` all
+        // state; it is pinned here so they cannot drift apart again.
         let mut state = ResumeState::new(Some(cursor("batch-start")));
         state.record(CursorResumable::BatchRestart, Some(cursor("intermediate")));
         state.record(CursorResumable::BatchRestart, None);

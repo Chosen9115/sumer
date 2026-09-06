@@ -23,14 +23,25 @@
 //! sits long enough to exceed its own deadline before ever reaching the
 //! front of the queue *and* being written, it is purged and never sent
 //! (checked in [`pump`], both before and after waiting for a concurrency
-//! permit). Once actually written, a fresh `deadline`-long timer starts.
+//! permit). Once it reaches the front, ONE `deadline`-long timer covers the
+//! whole send: writing the frame *and* waiting for its reply. The write is
+//! not free -- an adapter that stops reading its stdin while staying alive
+//! blocks the host in `write_all` behind a full pipe -- so leaving it
+//! outside the deadline would let a request outlive its own deadline
+//! without bound, and stall every request queued behind it.
+//!
+//! **A write cut short by the deadline ends the connection.** Half a frame
+//! is on the adapter's stdin and there is no resync point in JSON Lines
+//! (spec/wire.md §2), so the rest of that frame is never written: the pump
+//! stops, the child is killed, and the caller is told `Timeout` while every
+//! other request on the connection resolves `AdapterCrashed`.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use serde_json::Value;
-use sumer_wire::{ProtocolViolationKind, Reply, RequestId, Rfc3339};
+use sumer_wire::{ErrorBody, ProtocolViolationKind, Reply, RequestId, Rfc3339, WireErrorCode};
 use tokio::io::AsyncWriteExt;
 use tokio::process::ChildStdin;
 use tokio::sync::{mpsc, oneshot, Semaphore};
@@ -141,7 +152,10 @@ impl Mux {
     /// other call); call [`Mux::raise_concurrency`] once hello succeeds to
     /// open it up to the adapter's declared value.
     #[must_use]
-    pub fn spawn(stdin: ChildStdin) -> Arc<Mux> {
+    pub fn spawn(
+        stdin: ChildStdin,
+        kill_tx: mpsc::Sender<Option<ProtocolViolationKind>>,
+    ) -> Arc<Mux> {
         let (tx, rx) = mpsc::channel(OUTBOUND_QUEUE_CAPACITY);
         let semaphore = Arc::new(Semaphore::new(1));
         let mux = Arc::new(Mux {
@@ -153,7 +167,7 @@ impl Mux {
             outbox: tx,
             semaphore: semaphore.clone(),
         });
-        tokio::spawn(pump(mux.clone(), rx, stdin, semaphore));
+        tokio::spawn(pump(mux.clone(), rx, stdin, semaphore, kill_tx));
         mux
     }
 
@@ -168,13 +182,20 @@ impl Mux {
         }
     }
 
-    fn issue(&self) -> (RequestId, oneshot::Receiver<Delivery>) {
+    /// Allocates the next id, or `None` once the counter is exhausted.
+    /// Ids are monotonic and never reused (spec/wire.md §6), so the counter
+    /// has an end; wrapping past it would reissue an id whose late reply
+    /// could be cross-attributed, which is the one failure the never-reuse
+    /// rule exists to make impossible. Exhaustion is reported to the caller
+    /// as [`HostError::IdsExhausted`] instead -- no wrap, no panic, no
+    /// abandoned caller.
+    fn issue(&self) -> Option<(RequestId, oneshot::Receiver<Delivery>)> {
         let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         let id = inner.next_id;
-        inner.next_id += 1;
+        inner.next_id = id.checked_add(1)?;
         let (tx, rx) = oneshot::channel();
         inner.slots.insert(id, Slot::Pending(tx));
-        (RequestId(id), rx)
+        Some((RequestId(id), rx))
     }
 
     /// Expires an id whose deadline has passed with no reply. A race
@@ -254,6 +275,21 @@ impl Mux {
             .terminal
     }
 
+    /// What to report for a call that cannot be completed because the
+    /// connection is finished. The latched terminal reason if there is one
+    /// -- it is the *true* reason, and a caller that is handed anything
+    /// else is being told the adapter died of unknown causes when the host
+    /// knows perfectly well it killed it for a named protocol violation.
+    ///
+    /// `AdapterCrashed { status: None }` is the fallback, and it means
+    /// exactly one thing: the adapter is gone and nothing has established
+    /// why. It is never a stand-in for a reason that exists.
+    fn terminal_error(&self) -> HostError {
+        self.terminal()
+            .map(HostError::from)
+            .unwrap_or(HostError::AdapterCrashed { status: None })
+    }
+
     /// Enqueues one request and awaits its outcome. Backpressure is the
     /// bounded channel itself: `send().await` blocks the caller while the
     /// queue is full, per the frozen contract.
@@ -275,13 +311,9 @@ impl Mux {
             responder,
         };
         if self.outbox.send(entry).await.is_err() {
-            return Err(self
-                .terminal()
-                .map(HostError::from)
-                .unwrap_or(HostError::AdapterCrashed { status: None }));
+            return Err(self.terminal_error());
         }
-        rx.await
-            .unwrap_or(Err(HostError::AdapterCrashed { status: None }))
+        rx.await.unwrap_or_else(|_| Err(self.terminal_error()))
     }
 
     /// The reader loop's entry point for one decoded frame. `hello_done`
@@ -321,13 +353,15 @@ impl Mux {
 
 /// The outbound pump: pulls queued requests, enforces `max_in_flight` via
 /// `semaphore`, purges anything that expired while queued, assigns an id
-/// and writes the frame, then races a per-request deadline against the
-/// reply in its own task so the pump keeps moving.
+/// and writes the frame under the request's deadline, then races what is
+/// left of that same deadline against the reply in its own task so the
+/// pump keeps moving.
 async fn pump(
     mux: Arc<Mux>,
     mut rx: mpsc::Receiver<QueuedRequest>,
     mut stdin: ChildStdin,
     semaphore: Arc<Semaphore>,
+    kill_tx: mpsc::Sender<Option<ProtocolViolationKind>>,
 ) {
     while let Some(req) = rx.recv().await {
         if let Some(t) = mux.terminal() {
@@ -342,9 +376,7 @@ async fn pump(
         }
 
         let Ok(permit) = Arc::clone(&semaphore).acquire_owned().await else {
-            let _ = req
-                .responder
-                .send(Err(HostError::AdapterCrashed { status: None }));
+            let _ = req.responder.send(Err(mux.terminal_error()));
             continue;
         };
 
@@ -359,38 +391,66 @@ async fn pump(
             continue;
         }
 
-        let (id, delivery_rx) = mux.issue();
+        let Some((id, delivery_rx)) = mux.issue() else {
+            let _ = req.responder.send(Err(HostError::IdsExhausted));
+            drop(permit);
+            continue;
+        };
         let line = match build_frame(id, &req.op, &req.params) {
             Ok(line) => line,
-            Err(_) => {
-                let _ = req
-                    .responder
-                    .send(Err(HostError::AdapterCrashed { status: None }));
+            Err(e) => {
+                // The host could not serialize its own request. Nothing
+                // about the adapter is known to be wrong, so it is not
+                // blamed for it.
+                let _ = req.responder.send(Err(HostError::Wire(ErrorBody::new(
+                    WireErrorCode::Internal,
+                    format!("could not serialize {} request: {e}", req.op),
+                ))));
                 drop(permit);
                 continue;
             }
         };
 
-        if stdin.write_all(line.as_bytes()).await.is_err() {
-            // The pipe is broken -- the adapter is dying or dead. The
-            // exit-watcher will classify it properly; here we just make
-            // sure this one caller doesn't hang forever.
-            let _ = req
-                .responder
-                .send(Err(HostError::AdapterCrashed { status: None }));
-            drop(permit);
-            continue;
+        // One deadline covers the whole send. An adapter that stops
+        // reading stdin blocks this write behind a full pipe indefinitely,
+        // and nothing queued behind it can move until it returns.
+        let send_deadline = tokio::time::Instant::now() + req.deadline;
+        match tokio::time::timeout_at(send_deadline, stdin.write_all(line.as_bytes())).await {
+            Ok(Ok(())) => {}
+            Ok(Err(_)) => {
+                // The pipe is broken, so this request will never be
+                // answered -- but *why* it is broken is not known here and
+                // frequently is not known yet at all: the exit watcher is
+                // still reaping the child, or the reader loop has just
+                // asked for a kill over a protocol violation it can name.
+                // Resolving the caller now means resolving it with a guess
+                // that loses that name. Fall through instead: the id's slot
+                // stays pending, `Mux::finish` resolves it with the real
+                // terminal reason the moment one is latched, and the
+                // deadline below still bounds the wait if none ever is
+                // (an adapter that closed its stdin but stayed alive).
+            }
+            Err(_elapsed) => {
+                // A partial frame is already on the adapter's stdin and
+                // JSON Lines has no resync point: the rest of it is never
+                // written. Tear the connection down instead.
+                mux.tombstone(id);
+                let _ = req.responder.send(Err(HostError::Timeout));
+                drop(permit);
+                let _ = kill_tx.try_send(None);
+                mux.finish(Terminal::Crashed(None));
+                return;
+            }
         }
 
-        let deadline = req.deadline;
         let mux2 = mux.clone();
         tokio::spawn(async move {
-            let outcome = tokio::time::timeout(deadline, delivery_rx).await;
+            let outcome = tokio::time::timeout_at(send_deadline, delivery_rx).await;
             let result = match outcome {
                 Ok(Ok(Delivery::Reply(reply, received_at))) => Ok((reply, received_at)),
                 Ok(Ok(Delivery::Crashed(status))) => Err(HostError::AdapterCrashed { status }),
                 Ok(Ok(Delivery::Violation(kind))) => Err(HostError::ProtocolViolation(kind)),
-                Ok(Err(_)) => Err(HostError::AdapterCrashed { status: None }),
+                Ok(Err(_)) => Err(mux2.terminal_error()),
                 Err(_elapsed) => {
                     mux2.tombstone(id);
                     Err(HostError::Timeout)
@@ -478,6 +538,33 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn id_exhaustion_is_an_explicit_outcome_not_a_panic() {
+        // `id` is monotonic and never reused, so the counter can in
+        // principle run out. Overflowing it panics the pump (release
+        // builds keep overflow-checks on) and abandons the caller with a
+        // dropped responder; exhaustion has to be something a caller is
+        // told about instead.
+        let (mut child, stdin) = silent_child();
+        let (kill_tx, _kill_rx) = mpsc::channel(1);
+        let mux = Mux::spawn(stdin, kill_tx);
+        mux.inner.lock().unwrap_or_else(|e| e.into_inner()).next_id = u64::MAX;
+
+        let result = mux
+            .call(
+                "noop".to_owned(),
+                serde_json::json!({}),
+                Duration::from_millis(200),
+            )
+            .await;
+        assert!(
+            matches!(result, Err(HostError::IdsExhausted)),
+            "id exhaustion must be an explicit outcome, not a dropped responder: {result:?}"
+        );
+
+        let _ = child.start_kill();
+    }
+
+    #[tokio::test]
     async fn queued_request_expires_before_ever_being_sent() {
         // max_in_flight defaults to 1 (the semaphore starts with exactly
         // one permit), so a call that never gets a reply holds that
@@ -485,7 +572,8 @@ mod tests {
         // to sit queued past its own deadline without the pump ever
         // reaching it.
         let (mut child, stdin) = silent_child();
-        let mux = Mux::spawn(stdin);
+        let (kill_tx, _kill_rx) = mpsc::channel(1);
+        let mux = Mux::spawn(stdin, kill_tx);
 
         // Deliberately short (not the crate's 30s default): dropping a
         // tokio `Runtime` blocks until every task it spawned finishes,

@@ -4,19 +4,6 @@
     "runs": [
       {
         "label": "default",
-        "hello": {
-          "protocol": "1",
-          "adapter_id": "fake-adapter",
-          "adapter_version": "0.1.0",
-          "capabilities": [
-            "resources.list",
-            "balances.read",
-            "history.read",
-            "status.read"
-          ],
-          "local_id_derivation": "fixture-literal@1",
-          "max_in_flight": 1
-        },
         "on": {
           "resources.list": [
             {
@@ -58,22 +45,14 @@
                           "amount": "900000"
                         },
                         "provenance": {
-                          "adapter_id": "fake-adapter",
                           "provider_id": "0xEXAMPLEOVERSIZEDWALLET",
-                          "surface": "onchain",
-                          "observed_at": "2026-09-01T00:00:00Z",
-                          "completeness": "complete"
+                          "observed_at": "2026-09-01T00:00:00Z"
                         }
                       }
                     ],
                     "statuses": [
                       {
-                        "resource_id": "wallet-oversized",
-                        "outcome": {
-                          "fetched": {
-                            "page_empty": false
-                          }
-                        }
+                        "resource_id": "wallet-oversized"
                       }
                     ]
                   }
@@ -112,11 +91,7 @@
               "when": {
                 "resources": [
                   {
-                    "resource_id": "wallet-oversized",
-                    "page": {
-                      "kind": "cursor",
-                      "cursor": ""
-                    }
+                    "resource_id": "wallet-oversized"
                   }
                 ]
               },
@@ -142,11 +117,8 @@
                           "memo": "small and ordinary"
                         },
                         "provenance": {
-                          "adapter_id": "fake-adapter",
                           "provider_id": "sibling-small",
-                          "surface": "onchain",
-                          "observed_at": "2026-09-01T10:00:00Z",
-                          "completeness": "complete"
+                          "observed_at": "2026-09-01T10:00:00Z"
                         }
                       },
                       {
@@ -161,40 +133,97 @@
                           "amount": "700000"
                         },
                         "raw_sign": "provider_positive",
-                        "description": "EVENT WHOSE provider_extra WAS TOO LARGE AND HAS BEEN TRUNCATED (fixture placeholder)",
+                        "description": "EVENT WITH A HUGE provider_extra, TRUNCATED BY THE ADAPTER'S OWN TWO-STEP DEGRADE (fixture placeholder)",
                         "provider_extra": {
-                          "_truncated": true,
-                          "_original_bytes": 120000
+                          "bulk_provider_payload": "REPLACED BY pad"
                         },
                         "provenance": {
-                          "adapter_id": "fake-adapter",
                           "provider_id": "big-truncatable",
-                          "surface": "onchain",
-                          "observed_at": "2026-09-01T10:05:00Z",
-                          "completeness": "partial"
+                          "observed_at": "2026-09-01T10:05:00Z"
+                        }
+                      },
+                      {
+                        "resource_id": "wallet-oversized",
+                        "local_id": "wallet-oversized:big-untruncatable",
+                        "provider_id": "big-untruncatable",
+                        "state": "active",
+                        "surface": "onchain",
+                        "posting": "posted",
+                        "amount": {
+                          "asset": "sat",
+                          "amount": "123456"
+                        },
+                        "raw_sign": "provider_positive",
+                        "description": "REPLACED BY pad",
+                        "provider_extra": {
+                          "memo": "small, but the description is not"
+                        },
+                        "provenance": {
+                          "provider_id": "big-untruncatable",
+                          "observed_at": "2026-09-01T10:10:00Z"
+                        }
+                      },
+                      {
+                        "resource_id": "wallet-oversized",
+                        "local_id": "wallet-oversized:sibling-after",
+                        "provider_id": "sibling-after",
+                        "state": "active",
+                        "surface": "onchain",
+                        "posting": "posted",
+                        "amount": {
+                          "asset": "sat",
+                          "amount": "700"
+                        },
+                        "raw_sign": "provider_positive",
+                        "description": "SMALL SIBLING EVENT EMITTED AFTER THE OMITTED ONE (fixture placeholder)",
+                        "provider_extra": {
+                          "memo": "still ordinary"
+                        },
+                        "provenance": {
+                          "provider_id": "sibling-after",
+                          "observed_at": "2026-09-01T10:15:00Z"
                         }
                       }
                     ],
                     "statuses": [
                       {
                         "resource_id": "wallet-oversized",
-                        "outcome": {
-                          "oversized_observation": {
-                            "local_id": "wallet-oversized:big-untruncatable",
-                            "bytes": 260000
-                          }
-                        },
                         "page": {
                           "cursor_resumable": "exact",
                           "next": null
                         }
                       }
                     ]
-                  }
+                  },
+                  "pad": [
+                    {
+                      "path": [
+                        "observations",
+                        1,
+                        "provider_extra",
+                        "bulk_provider_payload"
+                      ],
+                      "bytes": 120000
+                    },
+                    {
+                      "path": [
+                        "observations",
+                        2,
+                        "description"
+                      ],
+                      "bytes": 200000
+                    }
+                  ],
+                  "degrade": true
                 }
               ]
             }
           ]
+        },
+        "provenance": {
+          "adapter_id": "fake-adapter",
+          "surface": "onchain",
+          "completeness": "complete"
         }
       }
     ]
@@ -219,7 +248,12 @@
             "asset": "sat",
             "amount": "500"
           },
-          "completeness": "complete"
+          "provider_extra": {
+            "memo": "small and ordinary"
+          },
+          "provenance": {
+            "completeness": "complete"
+          }
         },
         {
           "local_id": "wallet-oversized:big-truncatable",
@@ -229,10 +263,27 @@
             "asset": "sat",
             "amount": "700000"
           },
-          "completeness": "partial",
           "provider_extra": {
             "_truncated": true,
-            "_original_bytes": 120000
+            "_original_bytes": 120028
+          },
+          "provenance": {
+            "completeness": "partial"
+          }
+        },
+        {
+          "local_id": "wallet-oversized:sibling-after",
+          "state": "active",
+          "posting": "posted",
+          "amount": {
+            "asset": "sat",
+            "amount": "700"
+          },
+          "provider_extra": {
+            "memo": "still ordinary"
+          },
+          "provenance": {
+            "completeness": "complete"
           }
         }
       ]
@@ -241,7 +292,7 @@
       "wallet-oversized": [
         {
           "local_id": "wallet-oversized:big-untruncatable",
-          "reported_bytes": 260000
+          "reported_bytes": 200480
         }
       ]
     },
@@ -249,10 +300,10 @@
       "wallet-oversized": {
         "oversized_observation": {
           "local_id": "wallet-oversized:big-untruncatable",
-          "bytes": 260000
+          "bytes": 200480
         }
       }
     },
-    "notes": "Three-way check, and all three must hold simultaneously or A10 is vacuous: (1) wallet-oversized:big-truncatable is PRESENT with provider_extra collapsed to exactly {_truncated:true,_original_bytes:120000} and completeness:Partial -- the truncation marker from spec/wire.md e, verbatim; (2) wallet-oversized:sibling-small is a SMALL, ORDINARY, UNTRUNCATED observation in the SAME page -- a host or adapter that truncates/drops everything in a page once it sees one oversized entry fails here even though the truncated entry itself looks right; (3) wallet-oversized:big-untruncatable never appears in observations at all (MAX_OBSERVATION_BYTES=65536 exceeded even after truncating provider_extra) but its outcome is still reported via the resource's single statuses entry, and the resource is still 'readable' -- the two other observations in the SAME reply prove the page was not bricked by the one oversized event."
+    "notes": "NOTHING HERE IS DECLARED; every size is real. The script pads two fields just before the reply is written -- provider_extra.bulk_provider_payload to 120,000 bytes on big-truncatable, and description to 200,000 bytes on big-untruncatable -- and the adapter then runs spec/observation.md section 6's two-step degrade over the actual serialized bytes. The numbers in this expect block are the values that degrade PRODUCES, not values the fixture asserts into existence: _original_bytes 120028 is the serialized size of the provider_extra that was thrown away ({\"bulk_provider_payload\":\"<120000 bytes>\"}), and bytes 200480 is the measured size of big-untruncatable AFTER step 1 truncated its provider_extra and step 1 still could not save it. Four things must hold at once or A10 is vacuous: (1) big-truncatable is PRESENT with provider_extra collapsed to EXACTLY {_truncated:true,_original_bytes:120028} -- compared exactly, not as a subset, because an adapter that leaves a leaked 70 KB field sitting beside the truncation marker satisfies a subset check while shipping an observation still far over MAX_OBSERVATION_BYTES; (2) its provenance.completeness is partial; (3) sibling-small BEFORE it and sibling-after AFTER it are ordinary untruncated observations in the SAME page -- an adapter that gives up on a page once it meets one oversized entry fails here even though the truncated entry itself looks right; (4) big-untruncatable never appears in observations at all, yet its outcome is reported through the resource's single statuses entry with its REAL byte count, and the resource stays readable. The runner independently measures every observation it receives in every case against MAX_OBSERVATION_BYTES, so an oversized observation cannot slip through any fixture by being unasserted."
   }
 }

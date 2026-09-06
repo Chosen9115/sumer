@@ -37,6 +37,19 @@ Reply (failure):
 increments once per request. Every frame — request or reply — has exactly one
 of `ok` or `err` at the top level when it is a reply, and exactly `op`+`params`
 when it is a request; a frame satisfying both shapes, or neither, is malformed.
+Presence and exclusivity are decided **before** a frame is interpreted as one
+kind or the other: `{"id":1,"ok":{...},"err":{...}}` is not a success reply
+with a stray field, it is malformed, and so is `{"id":1,"op":"...","ok":{}}`.
+
+**Every object in this protocol is a JSON object.** Nothing defined here or
+in `spec/observation.md` — no envelope, no params, no reply body, no
+provenance, no observation, no status, no page request — may also be sent as
+a positional JSON array of its fields. This is called out because it is a
+real divergence risk rather than a hypothetical one: some serialization
+libraries accept an array as a struct by position unless told not to, so two
+conforming-looking implementations can disagree about whether
+`["a","p","s","2026-09-06T00:00:00Z",null,"complete"]` is a valid
+`Provenance`. It is not. Field names are the only way a value is addressed.
 
 ### Caps
 
@@ -74,8 +87,8 @@ considered unrecoverable, so there is nothing to reply to.
 ## 3. stdout / stderr discipline
 
 `stdout` is framed JSON and nothing else, for the lifetime of the process.
-`stderr` is free-form: the host drains it, caps its volume, and never parses
-it. The adapter is responsible for redacting its own secrets before writing to
+`stderr` is free-form: the host drains it continuously — so a chatty adapter
+can never block on a full stderr pipe — and never parses or retains it. The adapter is responsible for redacting its own secrets before writing to
 stderr — the host does not scrub adapter log output.
 
 **An adapter must not write to stdout before its hello reply.** Any byte
@@ -118,7 +131,17 @@ The adapter replies with either an `ok` describing itself:
     }}
 
 or an `err` with `code: "unsupported_protocol"` if none of the host's offered
-versions are acceptable. `max_in_flight` is a `u32`; an adapter that omits it
+versions are acceptable.
+
+**The selected `protocol` MUST be one of the versions the host offered.** A
+host that receives any other value — `"999"`, `"2"`, `""` — rejects the
+handshake with an `unsupported_protocol` host-side outcome and never exposes
+the connection or sends another request on it. This is not pedantry about a
+string: an adapter that names an unoffered version has not negotiated
+anything, and a host that accepts it goes on to speak `"1"` at a peer that
+just said it speaks something else, reading every later frame under a
+contract neither side agreed to. The failure would surface later, as a
+mis-parsed reply, with nothing pointing back at the handshake. `max_in_flight` is a `u32`; an adapter that omits it
 gets the default of `1` (§7). `local_id_derivation` names and versions the pure
 function the adapter uses to compute `local_id` — see `spec/observation.md` §5.
 
@@ -172,6 +195,14 @@ wire format would ever surface the mistake. A monotonic, never-reused counter
 makes this structurally impossible: an id can only ever mean the one request
 it was issued for.
 
+**The counter can end.** A `u64` counter that is never reused is finite, and
+a host MUST NOT wrap it: reissuing id 0 after `u64::MAX` recreates exactly
+the cross-attribution this section exists to prevent. When the counter is
+exhausted, the connection can issue no further requests — the host reports
+that to the caller as its own host-side outcome (never a wire `err`; the
+adapter was never asked) and every subsequent request on that connection
+gets the same answer. A new connection starts a new counter.
+
 **Why a tombstoned reply is discarded, not fatal.** The host gave up waiting
 because *it* set a deadline, not because the adapter did anything wrong. An
 adapter that is merely slow — talking to a rate-limited upstream, say — and
@@ -208,12 +239,38 @@ to the adapter's stdin, it is purged from the queue and never sent at all —
 there is no point handing an adapter a request the host has already given up
 on.
 
+**One deadline covers the whole send: writing the frame, and waiting for the
+reply.** Writing is not free — a pipe holds a bounded amount of unread data
+(commonly 64 KiB), so an adapter that stops reading its stdin while staying
+alive blocks the host inside the write itself, indefinitely, and nothing
+queued behind that request can move either. A host MUST therefore bound the
+write by the same deadline as the wait, not start the clock after the write
+returns.
+
+**A write cut short by the deadline ends the connection.** Part of a frame is
+already on the adapter's stdin, and JSON Lines has no resync point (§2), so
+the remainder of that frame is never written afterward — resuming it later
+would hand the adapter a frame spliced across an unknown gap. The host stops
+writing, kills the process, returns `Timeout` to that caller, and resolves
+every other request on the connection as `AdapterCrashed`. The abandoned
+frame's id is tombstoned like any other expired id (§6); it can never be
+answered, because it was never fully asked.
+
 Once sent, a request that times out is tombstoned (§6) and the host returns
 `Timeout` to the caller — a host-side outcome, never a wire `err.code`, because
 the adapter itself never said anything; the host simply stopped waiting.
 
 If the adapter process crashes, every request currently in flight on that
-connection resolves as `AdapterCrashed{status}`. There is **no auto-restart**
+connection resolves as `AdapterCrashed{status}`. **A request the host could
+not finish writing is not resolved on the spot either** — a broken stdin pipe
+says the connection is over but not why, and the reason usually publishes a
+moment later (the child is still being reaped, or the reader loop has just
+asked for a kill over a violation it can name). The host reports the reason
+the connection actually ended, so `AdapterCrashed{status: None}` means "the
+adapter is gone and nothing established why" and never stands in for a reason
+that exists. If no reason ever publishes — an adapter that closes its stdin
+and keeps running — the request's own deadline still bounds the wait and it
+resolves as `Timeout`. There is **no auto-restart**
 in this milestone — a crashed adapter stays crashed until something outside
 this protocol relaunches it — and there is **no cancel frame**: the host
 cannot ask an adapter to abandon work it has already accepted. (Both are
@@ -250,9 +307,10 @@ without this rule stated plainly: one might reach for `err` because "nothing
 came back feels like failure," and would then be indistinguishable, on the
 wire, from a request that could not be processed at all. It must not be.
 
-Host-side outcomes — `Timeout`, `AdapterCrashed{status}`, and
-`ProtocolViolation{kind}` (`OversizeFrame`, `NotJson`, `NonUtf8`, `UnknownId`,
-`DuplicateId`, `PreHelloOutput`) — never appear on the wire at all. They are
+Host-side outcomes — `Timeout`, `AdapterCrashed{status}`, `IdsExhausted`
+(§6), and `ProtocolViolation{kind}` (`OversizeFrame`, `NotJson`, `NonUtf8`,
+`UnknownId`, `DuplicateId`, `PreHelloOutput`) — never appear on the wire at
+all. They are
 things the host concludes *about* the adapter (or its absence of an answer),
 not something the adapter emits.
 

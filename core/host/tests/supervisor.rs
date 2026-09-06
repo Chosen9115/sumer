@@ -399,3 +399,232 @@ async fn host_stamps_received_at_and_computes_live_staleness() {
     assert_eq!(provenance.staleness, sumer_wire::Staleness::Live);
     assert!(provenance.received_at.as_str().ends_with('Z'));
 }
+
+// ---------------------------------------------------------------------
+// Backpressure: the deadline bounds the write too, not just the wait
+// ---------------------------------------------------------------------
+
+#[tokio::test]
+async fn a_write_the_adapter_never_drains_expires_with_its_deadline() {
+    // Hello, then the adapter stops reading stdin while staying alive. The
+    // next request is larger than the pipe buffer, so the host blocks
+    // inside `write_all` -- which must not outlive the request's deadline.
+    let script = format!("{PRELUDE}\nhello_ok(read())\nimport time\ntime.sleep(10)\n");
+    let handle = spawn(&script, Duration::from_millis(500))
+        .await
+        .expect("handshake");
+
+    let started = std::time::Instant::now();
+    let oversized_id = "x".repeat(1_000_000);
+    let result = handle.status_read(vec![oversized_id]).await;
+    let elapsed = started.elapsed();
+
+    assert!(
+        matches!(result, Err(HostError::Timeout)),
+        "expected Timeout, got {result:?} after {elapsed:?}"
+    );
+    assert!(
+        elapsed < Duration::from_secs(3),
+        "the deadline must bound the write itself; blocked for {elapsed:?}"
+    );
+
+    // The frame was cut mid-write, so the stream is unsynchronized: the
+    // connection is torn down rather than resumed, and a later call says so
+    // instead of writing the rest of an abandoned frame.
+    let after = handle.resources_list().await;
+    assert!(
+        matches!(after, Err(HostError::AdapterCrashed { .. })),
+        "a partial frame must end the connection, got {after:?}"
+    );
+}
+
+// ---------------------------------------------------------------------
+// Handshake: the adapter must pick a version the host actually offered
+// ---------------------------------------------------------------------
+
+#[tokio::test]
+async fn a_protocol_version_that_was_never_offered_is_rejected() {
+    // The host offers ["1"]. "999" is not a negotiation, it is an adapter
+    // answering a question nobody asked -- and every later frame would be
+    // read under a contract neither side agreed to.
+    let script = format!("{PRELUDE}\nhello_ok(read(), protocol='999')\nread()\n");
+    match spawn(&script, Duration::from_secs(2)).await {
+        Err(HostError::Wire(err)) => assert_eq!(
+            err.code,
+            sumer_wire::WireErrorCode::UnsupportedProtocol,
+            "expected unsupported_protocol, got {err:?}"
+        ),
+        Err(other) => panic!("expected a wire error, got {other:?}"),
+        Ok(handle) => panic!(
+            "an unoffered protocol {:?} was accepted",
+            handle.hello().protocol
+        ),
+    }
+}
+
+// ---------------------------------------------------------------------
+// MAX_OBSERVATION_BYTES, enforced on real bytes
+// ---------------------------------------------------------------------
+
+#[tokio::test]
+async fn an_observation_over_the_cap_is_dropped_and_reported() {
+    // A genuinely oversized observation (a ~100 KiB description, which
+    // truncating `provider_extra` cannot fix), alongside a normal sibling.
+    // The page must survive: the sibling is delivered, the oversized record
+    // is omitted, and the resource's status says why.
+    let script = format!(
+        "{PRELUDE}\nhello_ok(read(), capabilities=['history.read'])\n\
+         def obs(local_id, description):\n\
+        \x20   return {{'resource_id': 'acct1', 'local_id': local_id, 'state': 'active',\n\
+        \x20           'surface': 'checking', 'posting': 'posted',\n\
+        \x20           'amount': {{'asset': 'USD', 'amount': '1.00'}},\n\
+        \x20           'raw_sign': 'provider_positive', 'description': description,\n\
+        \x20           'provenance': {{'adapter_id': 'a', 'provider_id': 'p', 'surface': 'checking',\n\
+        \x20                          'observed_at': '2026-09-06T12:00:00Z', 'completeness': 'complete'}}}}\n\
+         req = read()\n\
+         send({{'id': req['id'], 'ok': {{\n\
+        \x20   'observations': [obs('small', 'rent'), obs('huge', 'D' * 100000)],\n\
+        \x20   'statuses': [{{'resource_id': 'acct1', 'outcome': {{'fetched': {{'page_empty': False}}}},\n\
+        \x20                 'page': {{'cursor_resumable': 'exact', 'next': None}}}}]}}}})\n"
+    );
+    let handle = spawn(&script, Duration::from_secs(5))
+        .await
+        .expect("handshake");
+    let reply = handle
+        .history_read(vec![sumer_wire::ResourceQuery {
+            resource_id: "acct1".to_owned(),
+            page: None,
+        }])
+        .await
+        .expect("history.read");
+
+    let local_ids: Vec<&str> = reply
+        .observations
+        .iter()
+        .map(|o| o.local_id.as_str())
+        .collect();
+    assert_eq!(
+        local_ids,
+        vec!["small"],
+        "the oversized record is omitted and the rest of the page continues"
+    );
+
+    assert_eq!(reply.statuses.len(), 1, "one status per requested resource");
+    match &reply.statuses[0].outcome {
+        sumer_wire::ReadOutcome::OversizedObservation { local_id, bytes } => {
+            assert_eq!(local_id.as_deref(), Some("huge"));
+            assert!(
+                *bytes > 65_536,
+                "the reported size is the real one, got {bytes}"
+            );
+        }
+        other => panic!("expected oversized_observation, got {other:?}"),
+    }
+    assert!(
+        reply.statuses[0].page.is_some(),
+        "the resource stays resumable"
+    );
+}
+
+#[tokio::test]
+async fn staleness_comes_from_each_resources_own_status_outcome() {
+    // One reply, three resources: `stale{as_of}` says the adapter is
+    // serving data it already knows is old, `unavailable` says it has
+    // nothing current at all, and `fetched` is a live read. Staleness is
+    // still host-stamped -- the adapter cannot send it -- but the host
+    // derives it from what the adapter did say, per resource.
+    let script = format!(
+        "{PRELUDE}\nhello_ok(read(), capabilities=['balances.read'])\n\
+         def bal(resource_id):\n\
+        \x20   return {{'resource_id': resource_id, 'category': 'available', 'amount': None,\n\
+        \x20           'provenance': {{'adapter_id': 'a', 'provider_id': 'p', 'surface': 's',\n\
+        \x20                          'observed_at': '2026-01-01T00:00:00Z',\n\
+        \x20                          'completeness': 'complete'}}}}\n\
+         req = read()\n\
+         send({{'id': req['id'], 'ok': {{\n\
+        \x20   'observations': [bal('old'), bal('live'), bal('dark')],\n\
+        \x20   'statuses': [\n\
+        \x20       {{'resource_id': 'old', 'outcome': {{'stale': {{'as_of': '2026-01-01T00:00:00Z'}}}}}},\n\
+        \x20       {{'resource_id': 'live', 'outcome': {{'fetched': {{'page_empty': False}}}}}},\n\
+        \x20       {{'resource_id': 'dark', 'outcome': 'unavailable'}}]}}}})\n"
+    );
+    let handle = spawn(&script, Duration::from_secs(5))
+        .await
+        .expect("handshake");
+    let result = handle
+        .balances_read(vec!["old".to_owned(), "live".to_owned(), "dark".to_owned()])
+        .await
+        .expect("balances_read");
+
+    let staleness_of = |resource_id: &str| {
+        result
+            .observations
+            .iter()
+            .find(|b| b.resource_id == resource_id)
+            .map(|b| b.provenance.staleness)
+    };
+    assert_eq!(
+        staleness_of("old"),
+        Some(sumer_wire::Staleness::Cached),
+        "a `stale` status means the observations it covers are not live"
+    );
+    assert_eq!(
+        staleness_of("live"),
+        Some(sumer_wire::Staleness::Live),
+        "a live resource in the same reply is unaffected"
+    );
+    assert_eq!(
+        staleness_of("dark"),
+        Some(sumer_wire::Staleness::Unavailable),
+        "`unavailable` is not `cached`"
+    );
+}
+
+#[tokio::test]
+async fn a_failed_write_reports_the_real_terminal_reason_not_a_guess() {
+    // The window this pins open deterministically: the adapter's stdin is
+    // already unwritable (it closed fd 0), but the fatal duplicate reply
+    // that ends the connection has not been sent yet -- so no terminal
+    // reason is latched at the moment the host's write fails. A host that
+    // answers that write failure by *guessing* `AdapterCrashed{None}`
+    // resolves the caller before the truth is known, and the caller is told
+    // the adapter died of unknown causes when in fact the host killed it
+    // for a protocol violation it can name.
+    let script = format!(
+        "{PRELUDE}\nimport os, threading, time\n\
+         hello_ok(read(), max_in_flight=2)\n\
+         req = read()\n\
+         os.close(0)\n\
+         def late():\n\
+        \x20   time.sleep(0.15)\n\
+        \x20   send({{'id': req['id'], 'ok': {{'resources': []}}}})\n\
+        \x20   send({{'id': req['id'], 'ok': {{'resources': []}}}})\n\
+         threading.Thread(target=late, daemon=True).start()\n\
+         time.sleep(3)\n"
+    );
+    let handle = spawn(&script, Duration::from_secs(3))
+        .await
+        .expect("handshake");
+
+    // The second call is issued once the adapter has closed its stdin, so
+    // its frame cannot be written at all, and it is issued before the
+    // duplicate arrives, so nothing is latched yet when that write fails.
+    let (first, second) = tokio::join!(handle.resources_list(), async {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        handle.resources_list().await
+    });
+
+    assert!(
+        matches!(
+            second,
+            Err(HostError::ProtocolViolation(
+                ProtocolViolationKind::DuplicateId
+            ))
+        ),
+        "a request whose write failed must report why the connection died, got {second:?}"
+    );
+    assert!(
+        first.is_ok(),
+        "the first, legitimate copy of that reply is still delivered: {first:?}"
+    );
+}

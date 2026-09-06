@@ -4,19 +4,6 @@
     "runs": [
       {
         "label": "default",
-        "hello": {
-          "protocol": "1",
-          "adapter_id": "fake-adapter",
-          "adapter_version": "0.1.0",
-          "capabilities": [
-            "resources.list",
-            "balances.read",
-            "history.read",
-            "status.read"
-          ],
-          "local_id_derivation": "fixture-literal@1",
-          "max_in_flight": 1
-        },
         "on": {
           "resources.list": [
             {
@@ -114,11 +101,8 @@
                         "canonical_hint": "total",
                         "amount": null,
                         "provenance": {
-                          "adapter_id": "fake-adapter",
                           "provider_id": "acct-sample-0001",
-                          "surface": "fdx",
-                          "observed_at": "2026-09-01T12:00:00Z",
-                          "completeness": "complete"
+                          "observed_at": "2026-09-01T12:00:00Z"
                         }
                       },
                       {
@@ -127,22 +111,14 @@
                         "canonical_hint": "available",
                         "amount": null,
                         "provenance": {
-                          "adapter_id": "fake-adapter",
                           "provider_id": "acct-sample-0001",
-                          "surface": "fdx",
-                          "observed_at": "2026-09-01T12:00:00Z",
-                          "completeness": "complete"
+                          "observed_at": "2026-09-01T12:00:00Z"
                         }
                       }
                     ],
                     "statuses": [
                       {
-                        "resource_id": "fdx-checking-1",
-                        "outcome": {
-                          "fetched": {
-                            "page_empty": false
-                          }
-                        }
+                        "resource_id": "fdx-checking-1"
                       }
                     ]
                   }
@@ -155,11 +131,7 @@
               "when": {
                 "resources": [
                   {
-                    "resource_id": "fdx-checking-1",
-                    "page": {
-                      "kind": "cursor",
-                      "cursor": ""
-                    }
+                    "resource_id": "fdx-checking-1"
                   }
                 ]
               },
@@ -229,11 +201,8 @@
                           "fdx_transactionTimestamp": "2026-09-01T10:00:00Z"
                         },
                         "provenance": {
-                          "adapter_id": "fake-adapter",
                           "provider_id": "txn-0001",
-                          "surface": "fdx",
-                          "observed_at": "2026-09-01T10:00:00Z",
-                          "completeness": "complete"
+                          "observed_at": "2026-09-01T10:00:00Z"
                         }
                       },
                       {
@@ -254,11 +223,8 @@
                           "fdx_transactionTimestamp": "2026-08-31T09:00:00Z"
                         },
                         "provenance": {
-                          "adapter_id": "fake-adapter",
                           "provider_id": "txn-0002",
-                          "surface": "fdx",
-                          "observed_at": "2026-08-31T09:00:00Z",
-                          "completeness": "complete"
+                          "observed_at": "2026-08-31T09:00:00Z"
                         }
                       },
                       {
@@ -278,22 +244,14 @@
                           "fdx_transactionTimestamp": "2026-09-03T11:00:00Z"
                         },
                         "provenance": {
-                          "adapter_id": "fake-adapter",
                           "provider_id": "txn-0003",
-                          "surface": "fdx",
-                          "observed_at": "2026-09-03T11:00:00Z",
-                          "completeness": "complete"
+                          "observed_at": "2026-09-03T11:00:00Z"
                         }
                       }
                     ],
                     "statuses": [
                       {
                         "resource_id": "fdx-checking-1",
-                        "outcome": {
-                          "fetched": {
-                            "page_empty": false
-                          }
-                        },
                         "page": {
                           "cursor_resumable": "exact",
                           "next": null
@@ -305,6 +263,11 @@
               ]
             }
           ]
+        },
+        "provenance": {
+          "adapter_id": "fake-adapter",
+          "surface": "fdx",
+          "completeness": "complete"
         }
       }
     ]
@@ -316,7 +279,13 @@
     "resources": [
       {
         "resource_id": "fdx-checking-1",
-        "kind": "bank_checking"
+        "kind": "bank_checking",
+        "provider_extra": {
+          "fdx_accountType": "CHECKING",
+          "fdx_accountCategory": "DEPOSIT_ACCOUNT",
+          "fdx_nickname": "Sample Checking (fixture placeholder)",
+          "fdx_accountNumberDisplay": "XXXX0000"
+        }
       }
     ],
     "balances": {
@@ -347,6 +316,12 @@
           "amount": {
             "asset": "USD",
             "amount": "-42.50"
+          },
+          "provider_extra": {
+            "fdx_status": "PENDING",
+            "fdx_debitCreditMemo": "DEBIT",
+            "fdx_amount_unsigned": "42.50",
+            "fdx_transactionTimestamp": "2026-09-01T10:00:00Z"
           }
         },
         {
@@ -355,6 +330,13 @@
           "amount": {
             "asset": "USD",
             "amount": "1500.00"
+          },
+          "provider_extra": {
+            "fdx_status": "POSTED",
+            "fdx_debitCreditMemo": "CREDIT",
+            "fdx_amount_unsigned": "1500.00",
+            "fdx_postedTimestamp": "2026-08-31T09:00:00Z",
+            "fdx_transactionTimestamp": "2026-08-31T09:00:00Z"
           }
         },
         {
@@ -363,6 +345,12 @@
           "amount": {
             "asset": "USD",
             "amount": "-75.00"
+          },
+          "provider_extra": {
+            "fdx_status": "AUTHORIZATION",
+            "fdx_debitCreditMemo": "DEBIT",
+            "fdx_amount_unsigned": "75.00",
+            "fdx_transactionTimestamp": "2026-09-03T11:00:00Z"
           }
         }
       ]
@@ -387,6 +375,6 @@
       "_removed_from_6.3_draft": "account.balanceAsOf, transactions[].accountId, and transactions[].currency all appeared in an earlier draft of this payload sourced from Plaid's browsable 6.3 docs. None exist on 6.4's DepositAccount/Transaction schema objects: balanceAsOf is real in 6.4 but only on InvestmentAccount (not DepositAccount); Transaction carries no accountId at all (the account is scoped by the request path, /accounts/{accountId}/transactions, not repeated per-transaction); Transaction carries no currency field (only foreignCurrency, paired with foreignAmount, for the foreign-amount case this fixture does not exercise). All three were removed from the payload rather than kept as 6.3-only fields, per Ruling A6: 6.4 wins.",
       "balances.read observation.provenance.observed_at": "NOT an FDX-sourced mapping: 6.4's DepositAccount has no per-balance timestamp field (unlike InvestmentAccount's balanceAsOf). Provenance.observed_at is adapter-claimed evidence (spec/observation.md section 1), so this adapter stamps its own fetch-time clock reading here -- there is no source field to lose, so this is not a Lossy entry."
     },
-    "notes": "Every FDX field named above lands somewhere named above -- either as a first-class Sumer field or, for anything without a Sumer equivalent (account type/category/nickname/masked number, the untouched unsigned amount, the raw debitCreditMemo and status strings), verbatim in provider_extra with an fdx_-prefixed key so it is visibly provenance rather than a Sumer concept. Nothing is silently dropped; spec/fdx-6.4-mapping.md's LOSSY column, gated by this fixture, should therefore be empty for every row this fixture covers. This payload was reconciled against the real FDX 6.4 schema (see fdx_field_map.source); three fields present in an earlier 6.3-docs-derived draft (account.balanceAsOf, transactions[].accountId, transactions[].currency) were removed because 6.4's DepositAccount/Transaction schema objects do not have them -- see fdx_field_map._removed_from_6.3_draft. All amounts (two balances, three transactions -- five Decimal extractions total) are pulled from a single embedded raw-payload string via fake_adapter.py's reply_with_decimal_amounts, exactly like provider_json_number.json, because a real FDX server would return these as ordinary JSON numbers and this fixture is not exempt from the money.md rule just because the values themselves are small and 'safe-looking' (19.99-style two-decimal values are NOT exact in binary64 either)."
+    "notes": "Every FDX field named in fdx_field_map lands somewhere named there -- either as a first-class Sumer field or, for anything without a Sumer equivalent (account type/category/nickname/masked number, the untouched unsigned amount, the raw debitCreditMemo and status strings), verbatim in provider_extra with an fdx_-prefixed key so it is visibly provenance rather than a Sumer concept. That claim is now MACHINE-CHECKED in both directions: the runner scans every provider_extra.<key> the map names and requires it to have arrived on the wire (nothing is silently dropped), and requires every provider_extra key that DID arrive to be named by the map (nothing arrives undocumented). expect.resources and expect.history_live_set additionally pin each provider_extra's full contents EXACTLY -- key sets and values both -- so a dropped or mangled value fails as loudly as a dropped key. spec/fdx-6.4-mapping.md's LOSSY column, gated by this fixture, is therefore empty for every row this fixture covers because the suite says so, not because the prose does. The prose in each fdx_field_map value stays documentation: the runner reads the provider_extra.<key> targets out of it and nothing else."
   }
 }

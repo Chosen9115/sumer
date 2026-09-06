@@ -20,6 +20,7 @@
 //! *shape* of that computation's inputs and outputs, not the policy
 //! (staleness thresholds, clock access) itself, which belongs to the host.
 
+use crate::shape::object_only;
 use serde::de::Error as _;
 use serde::{Deserialize, Deserializer, Serialize};
 use std::fmt;
@@ -206,7 +207,7 @@ impl fmt::Display for PlainTextError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
             f,
-            "description contains markup or a control byte at offset {}",
+            "description contains an angle bracket or a control byte at offset {}",
             self.at
         )
     }
@@ -214,16 +215,24 @@ impl fmt::Display for PlainTextError {
 
 impl std::error::Error for PlainTextError {}
 
-/// The plain-text rule for `description`: no ASCII control bytes (other
-/// than horizontal tab) and no `<`/`>`, the two bytes every HTML/XML tag
-/// needs.
+/// The plain-text rule for `description`, stated exactly as
+/// `spec/observation.md` §3 states it: reject any ASCII control byte
+/// (`U+0000`-`U+001F` except horizontal tab) , `U+007F`, and the two bytes
+/// `<` and `>`. Everything else is accepted.
 ///
-/// ponytail: this is a narrow, cheap-to-explain rule -- it stops tag
-/// injection and raw control-byte smuggling. It does *not* catch every
-/// markup dialect (Markdown `**bold**`, BBCode `[b]`, ...). If a real
-/// provider's descriptions need those blocked too, upgrade to an allowlist
-/// sanitizer then; nothing here assumes this is the last word on "plain
-/// text".
+/// The spec used to say "HTML, Markdown, or any other markup convention"
+/// gets `invalid_request`, which is not implementable: "is this Markdown"
+/// has no decidable answer, and a real merchant name contains `*`, `#`,
+/// `_`, `[`, and `-` without intending any of them as markup (`***ATM FEE`,
+/// `#4471`, `PAYPAL *STEAM`). Rejecting those would reject legitimate
+/// provider data; rejecting only *some* Markdown would be a rule no second
+/// implementation could reproduce. `<`/`>` are different: they are the two
+/// bytes every tag-based dialect needs, they carry no meaning of their own
+/// in a payee name, and blocking them is exact.
+///
+/// The obligation the rejected-markup rule was reaching for lands on the
+/// consumer instead, and the spec now says it there: `description` is
+/// rendered as text, never as HTML/Markdown source.
 pub fn validate_plain_text(s: &str) -> Result<(), PlainTextError> {
     for (i, b) in s.bytes().enumerate() {
         let is_control = b < 0x20 && b != b'\t';
@@ -305,7 +314,7 @@ pub enum RawSign {
 /// into an ordinary deserialize failure, which callers map to
 /// `invalid_request`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[serde(remote = "Self", deny_unknown_fields)]
 pub struct ProvenanceWire {
     pub adapter_id: String,
     pub provider_id: String,
@@ -318,6 +327,12 @@ pub struct ProvenanceWire {
     pub effective_at: Option<Rfc3339>,
     pub completeness: Completeness,
 }
+
+object_only!(
+    ProvenanceWire,
+    "provenance: an object, never a positional array",
+    serialize
+);
 
 /// Provenance once the host has stamped it: everything in `ProvenanceWire`
 /// plus `received_at` and `staleness`. The only constructor is
@@ -372,7 +387,7 @@ impl Provenance {
 /// attribute anywhere on this field that could fabricate a zero), but an
 /// absent key is a hard deserialize error instead.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[serde(remote = "Self", deny_unknown_fields)]
 pub struct BalanceWire {
     /// Which resource this observation belongs to. Required: a
     /// `balances.read` reply batches observations for multiple resources
@@ -388,6 +403,8 @@ pub struct BalanceWire {
     pub amount: Option<Amount>,
     pub provenance: ProvenanceWire,
 }
+
+object_only!(BalanceWire, "a balance line: an object", serialize);
 
 /// See the `amount` field doc on [`BalanceWire`]: this passthrough exists
 /// only to opt the field out of serde's implicit "missing `Option<T>` field
@@ -433,7 +450,7 @@ impl Balance {
 /// it is emitting revision 3; requiring it would test a capability no real
 /// adapter has.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[serde(remote = "Self", deny_unknown_fields)]
 pub struct ObservationWire {
     /// Which resource this observation belongs to. Required for the same
     /// reason as `BalanceWire::resource_id`: a `history.read` reply batches
@@ -473,6 +490,12 @@ pub struct ObservationWire {
     pub provider_extra: serde_json::Map<String, serde_json::Value>,
     pub provenance: ProvenanceWire,
 }
+
+object_only!(
+    ObservationWire,
+    "a history observation: an object",
+    serialize
+);
 
 /// A history observation once the host has stamped its provenance (and,
 /// elsewhere, assigned it a revision -- see the module docs on why
@@ -550,11 +573,14 @@ pub fn fold_order_key(
 /// identifier -- `code`/`message`/`raw` are for a human or a log, not for
 /// matching logic.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(remote = "Self", deny_unknown_fields)]
 pub struct ProviderDetail {
     pub code: String,
     pub message: String,
     pub raw: serde_json::Value,
 }
+
+object_only!(ProviderDetail, "provider_detail: an object", serialize);
 
 /// The outcome of attempting to read one resource.
 ///
@@ -566,7 +592,7 @@ pub struct ProviderDetail {
 /// plain default (externally tagged) representation instead --
 /// `{"fetched": {"page_empty": false}}`, a bare string for a unit variant --
 /// which is what this derive produces without a `tag` attribute.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ReadOutcome {
     Fetched {
@@ -585,10 +611,126 @@ pub enum ReadOutcome {
     Gone,
     ScaRequired,
     OversizedObservation {
-        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[serde(skip_serializing_if = "Option::is_none")]
         local_id: Option<String>,
         bytes: u64,
     },
+}
+
+/// The four outcome bodies, each object-only (see [`crate::shape`]): a
+/// derived enum accepts `{"fetched": [false]}` for a struct variant, which
+/// is the same positional-array trap the wire structs have, one level in.
+/// These are private -- the public shape stays the struct variants above.
+#[derive(Deserialize)]
+#[serde(remote = "Self", deny_unknown_fields)]
+struct FetchedBody {
+    page_empty: bool,
+}
+object_only!(FetchedBody, "a `fetched` body: an object");
+
+#[derive(Deserialize)]
+#[serde(remote = "Self", deny_unknown_fields)]
+struct StaleBody {
+    as_of: Rfc3339,
+}
+object_only!(StaleBody, "a `stale` body: an object");
+
+#[derive(Deserialize)]
+#[serde(remote = "Self", deny_unknown_fields)]
+struct RateLimitedBody {
+    retry_after_ms: u64,
+}
+object_only!(RateLimitedBody, "a `rate_limited` body: an object");
+
+#[derive(Deserialize)]
+#[serde(remote = "Self", deny_unknown_fields)]
+struct OversizedBody {
+    #[serde(default)]
+    local_id: Option<String>,
+    bytes: u64,
+}
+object_only!(OversizedBody, "an `oversized_observation` body: an object");
+
+const OUTCOME_VARIANTS: &[&str] = &[
+    "fetched",
+    "not_fetched",
+    "stale",
+    "rate_limited",
+    "unavailable",
+    "reauth_required",
+    "revoked",
+    "gone",
+    "sca_required",
+    "oversized_observation",
+];
+
+/// Hand-written so an outcome names **exactly one** variant, and so each
+/// payload variant's body must be an object. `deserialize_any` is what
+/// admits both wire forms the contract uses: a bare string for a unit
+/// variant (`"unavailable"`) and a single-key object for one with a body
+/// (`{"fetched": {"page_empty": false}}`).
+impl<'de> Deserialize<'de> for ReadOutcome {
+    fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        struct OutcomeVisitor;
+
+        impl<'de> serde::de::Visitor<'de> for OutcomeVisitor {
+            type Value = ReadOutcome;
+
+            fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                f.write_str(
+                    "a read outcome: a bare string, or an object naming exactly one outcome",
+                )
+            }
+
+            fn visit_str<E: serde::de::Error>(self, v: &str) -> Result<ReadOutcome, E> {
+                match v {
+                    "not_fetched" => Ok(ReadOutcome::NotFetched),
+                    "unavailable" => Ok(ReadOutcome::Unavailable),
+                    "reauth_required" => Ok(ReadOutcome::ReauthRequired),
+                    "revoked" => Ok(ReadOutcome::Revoked),
+                    "gone" => Ok(ReadOutcome::Gone),
+                    "sca_required" => Ok(ReadOutcome::ScaRequired),
+                    other => Err(E::unknown_variant(other, OUTCOME_VARIANTS)),
+                }
+            }
+
+            fn visit_map<A: serde::de::MapAccess<'de>>(
+                self,
+                mut map: A,
+            ) -> Result<ReadOutcome, A::Error> {
+                let Some(key) = map.next_key::<String>()? else {
+                    return Err(A::Error::custom("an outcome object names one outcome"));
+                };
+                let outcome = match key.as_str() {
+                    "fetched" => ReadOutcome::Fetched {
+                        page_empty: map.next_value::<FetchedBody>()?.page_empty,
+                    },
+                    "stale" => ReadOutcome::Stale {
+                        as_of: map.next_value::<StaleBody>()?.as_of,
+                    },
+                    "rate_limited" => ReadOutcome::RateLimited {
+                        retry_after_ms: map.next_value::<RateLimitedBody>()?.retry_after_ms,
+                    },
+                    "oversized_observation" => {
+                        let body = map.next_value::<OversizedBody>()?;
+                        ReadOutcome::OversizedObservation {
+                            local_id: body.local_id,
+                            bytes: body.bytes,
+                        }
+                    }
+                    other => return Err(A::Error::unknown_variant(other, OUTCOME_VARIANTS)),
+                };
+                if map.next_key::<serde::de::IgnoredAny>()?.is_some() {
+                    return Err(A::Error::custom(
+                        "an outcome names exactly one variant, never several",
+                    ));
+                }
+                Ok(outcome)
+            }
+        }
+
+        d.deserialize_any(OutcomeVisitor)
+    }
 }
 
 /// One entry of a reply's `statuses` array. Every requested `resource_id`
@@ -599,6 +741,7 @@ pub enum ReadOutcome {
 /// credential lifetime and strong-auth/SCA lifetime are tracked
 /// separately); `balances.read`/`history.read` leave them `None`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(remote = "Self", deny_unknown_fields)]
 pub struct ResourceStatus {
     pub resource_id: String,
     pub outcome: ReadOutcome,
@@ -614,6 +757,8 @@ pub struct ResourceStatus {
     pub history_start: Option<Rfc3339>,
 }
 
+object_only!(ResourceStatus, "a status entry: an object", serialize);
+
 // ---------------------------------------------------------------------
 // Pagination
 // ---------------------------------------------------------------------
@@ -621,7 +766,12 @@ pub struct ResourceStatus {
 /// How to resume (or start) a paginated read. `Window`'s `[start, end)` is
 /// half-open; there is no offset/`nextOffset` variant (FDX deprecates it).
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(tag = "kind", rename_all = "snake_case")]
+#[serde(
+    remote = "Self",
+    tag = "kind",
+    rename_all = "snake_case",
+    deny_unknown_fields
+)]
 pub enum PageRequest {
     Cursor {
         cursor: String,
@@ -634,6 +784,12 @@ pub enum PageRequest {
         end: Rfc3339,
     },
 }
+
+object_only!(
+    PageRequest,
+    "a page request: an object with a `kind`",
+    serialize
+);
 
 /// How a durable cursor should be advanced.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -652,6 +808,7 @@ pub enum CursorResumable {
 
 /// Paging continuation for one resource's read.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(remote = "Self", deny_unknown_fields)]
 pub struct PageReply {
     pub cursor_resumable: CursorResumable,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -661,6 +818,8 @@ pub struct PageReply {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub page_size_reduced_to: Option<u32>,
 }
+
+object_only!(PageReply, "a page reply: an object", serialize);
 
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
@@ -727,6 +886,16 @@ mod tests {
     fn plain_text_rejects_control_bytes() {
         let err = validate_plain_text("hello\u{0007}world").unwrap_err();
         assert_eq!(err.at, 5);
+    }
+
+    #[test]
+    fn plain_text_accepts_markdown_looking_merchant_names() {
+        // The executable rule is angle brackets and control bytes, not
+        // "looks like markup": these are real payee strings.
+        assert!(validate_plain_text("**rent**").is_ok());
+        assert!(validate_plain_text("PAYPAL *STEAM PURCHASE").is_ok());
+        assert!(validate_plain_text("SQ *COFFEE #4471 [ATM]").is_ok());
+        assert!(validate_plain_text("A & B_Co - 50% off").is_ok());
     }
 
     #[test]

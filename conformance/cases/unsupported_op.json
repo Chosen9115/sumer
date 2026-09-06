@@ -4,19 +4,6 @@
     "runs": [
       {
         "label": "default",
-        "hello": {
-          "protocol": "1",
-          "adapter_id": "fake-adapter",
-          "adapter_version": "0.1.0",
-          "capabilities": [
-            "resources.list",
-            "balances.read",
-            "history.read",
-            "status.read"
-          ],
-          "local_id_derivation": "fixture-literal@1",
-          "max_in_flight": 1
-        },
         "on": {
           "resources.list": [
             {
@@ -34,7 +21,8 @@
                     ]
                   }
                 }
-              ]
+              ],
+              "consume": false
             }
           ],
           "balances.read": [
@@ -68,12 +56,7 @@
                     ],
                     "statuses": [
                       {
-                        "resource_id": "checking-5",
-                        "outcome": {
-                          "fetched": {
-                            "page_empty": false
-                          }
-                        }
+                        "resource_id": "checking-5"
                       }
                     ]
                   }
@@ -86,11 +69,7 @@
               "when": {
                 "resources": [
                   {
-                    "resource_id": "checking-5",
-                    "page": {
-                      "kind": "cursor",
-                      "cursor": ""
-                    }
+                    "resource_id": "checking-5"
                   }
                 ]
               },
@@ -102,11 +81,6 @@
                     "statuses": [
                       {
                         "resource_id": "checking-5",
-                        "outcome": {
-                          "fetched": {
-                            "page_empty": true
-                          }
-                        },
                         "page": {
                           "cursor_resumable": "batch_restart",
                           "next": null

@@ -104,12 +104,6 @@ impl FrameDecoder {
         self.violation.is_some()
     }
 
-    /// The violation that finished this decoder, if any.
-    #[must_use]
-    pub fn violation(&self) -> Option<ProtocolViolationKind> {
-        self.violation
-    }
-
     /// Bytes buffered for the frame currently in progress (no terminating
     /// LF has arrived yet). Non-empty at end-of-stream means a truncated
     /// final frame; classifying that (e.g. as `AdapterCrashed`) is a

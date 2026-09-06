@@ -17,22 +17,6 @@ pub enum WireErrorCode {
     Internal,
 }
 
-impl WireErrorCode {
-    /// Whether a caller may reasonably retry the *same* request unchanged.
-    ///
-    /// Only `not_ready` describes a transient condition ("the adapter isn't
-    /// ready yet, ask again"). `unsupported_protocol`, `unsupported`, and
-    /// `invalid_request` describe the request itself, which retrying
-    /// without changing it cannot fix. `internal` carries no resource
-    /// attribution to reason about (per the wire contract's definition of
-    /// `err`), so this is conservative and treats it as non-retryable
-    /// rather than guessing it is transient.
-    #[must_use]
-    pub fn is_retryable(self) -> bool {
-        matches!(self, WireErrorCode::NotReady)
-    }
-}
-
 /// Reasons the host kills the adapter process outright. These are
 /// host-side classifications and are never written to the wire: a stream
 /// that has hit one of these has no reply channel left to trust, so there
@@ -61,44 +45,10 @@ pub enum ProtocolViolationKind {
     PreHelloOutput,
 }
 
-impl ProtocolViolationKind {
-    /// Always `false`: every violation is fatal by construction. A
-    /// truncated JSON-Lines stream has no resync point, so retrying (or
-    /// resuming) is never offered -- the contract calls this "KILL, NO
-    /// RESYNC".
-    #[must_use]
-    pub fn is_retryable(self) -> bool {
-        false
-    }
-}
-
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn only_not_ready_is_retryable() {
-        assert!(WireErrorCode::NotReady.is_retryable());
-        assert!(!WireErrorCode::UnsupportedProtocol.is_retryable());
-        assert!(!WireErrorCode::Unsupported.is_retryable());
-        assert!(!WireErrorCode::InvalidRequest.is_retryable());
-        assert!(!WireErrorCode::Internal.is_retryable());
-    }
-
-    #[test]
-    fn no_protocol_violation_is_retryable() {
-        for kind in [
-            ProtocolViolationKind::OversizeFrame,
-            ProtocolViolationKind::NonUtf8,
-            ProtocolViolationKind::NotJson,
-            ProtocolViolationKind::UnknownId,
-            ProtocolViolationKind::DuplicateId,
-            ProtocolViolationKind::PreHelloOutput,
-        ] {
-            assert!(!kind.is_retryable());
-        }
-    }
 
     #[test]
     fn wire_error_code_snake_case_on_the_wire() {

@@ -1,27 +1,14 @@
 {
   "case": "protocol_violations",
   "conformance_hints": {
-    "deadline_ms": 300,
-    "why": "run index 1 (survivable_then_kill) sleeps 600ms on one request to force a host-side timeout/tombstone before replying anyway. The frozen contract's DEFAULT deadline is 30s (spec/wire.md constants) and defines no mechanism for a fixture to request a shorter per-connection deadline for testing. This field is ADVISORY ONLY -- not part of the frozen wire contract -- and the runner is free to ignore it, in which case this scenario needs a real ~30s+ sleep to exercise honestly."
+    "deadline_ms": 2000,
+    "why": "run index 1 (survivable_then_kill) must force a host-side timeout and tombstone, and the frozen contract's DEFAULT deadline is 30s (spec/wire.md section 7) with no mechanism for a fixture to ask for less. This field is ADVISORY ONLY -- not part of the frozen wire contract, never sent to the adapter -- and a runner that ignores it is still conformant; it just pays the full 30s for this one scenario.\n\nThe timeout is forced by DEFERRING balances.read(res-a), not by sleeping. That matters for two reasons. First, a deferred request is never answered until the fixture says so, so the timeout is certain at any deadline and on any machine -- a sleep only beats the deadline if the machine cooperates, which under CI load it does not, and a test whose pass depends on the scheduler is not a test. Second, sleeping blocked the adapter's own read loop, so every OTHER request on this connection also had to complete inside the same short deadline; with the sleep gone the deadline only has to be comfortably longer than a healthy round-trip, which is why it is 2000ms rather than 300ms. The late reply is delivered explicitly later, from history.read(res-b)'s rule, by which point the host has certainly tombstoned the id."
   },
   "script": {
     "runs": [
       {
         "label": "pre_hello_kill",
         "pre_hello_stdout": "not-json-garbage-written-before-any-hello-reply\n",
-        "hello": {
-          "protocol": "1",
-          "adapter_id": "fake-adapter",
-          "adapter_version": "0.1.0",
-          "capabilities": [
-            "resources.list",
-            "balances.read",
-            "history.read",
-            "status.read"
-          ],
-          "local_id_derivation": "fixture-literal@1",
-          "max_in_flight": 1
-        },
         "on": {}
       },
       {
@@ -74,41 +61,7 @@
               },
               "do": [
                 {
-                  "op": "sleep_ms",
-                  "ms": 600
-                },
-                {
-                  "op": "reply_ok",
-                  "body": {
-                    "observations": [
-                      {
-                        "resource_id": "res-a",
-                        "category": "available",
-                        "canonical_hint": "available",
-                        "amount": {
-                          "asset": "USD",
-                          "amount": "1.00"
-                        },
-                        "provenance": {
-                          "adapter_id": "fake-adapter",
-                          "provider_id": "provider_res_a",
-                          "surface": "checking",
-                          "observed_at": "2026-09-01T00:00:00Z",
-                          "completeness": "complete"
-                        }
-                      }
-                    ],
-                    "statuses": [
-                      {
-                        "resource_id": "res-a",
-                        "outcome": {
-                          "fetched": {
-                            "page_empty": false
-                          }
-                        }
-                      }
-                    ]
-                  }
+                  "op": "defer"
                 }
               ]
             },
@@ -132,22 +85,13 @@
                           "amount": "2.00"
                         },
                         "provenance": {
-                          "adapter_id": "fake-adapter",
-                          "provider_id": "provider_res_b",
-                          "surface": "checking",
-                          "observed_at": "2026-09-01T00:00:00Z",
-                          "completeness": "complete"
+                          "provider_id": "provider_res_b"
                         }
                       }
                     ],
                     "statuses": [
                       {
-                        "resource_id": "res-b",
-                        "outcome": {
-                          "fetched": {
-                            "page_empty": false
-                          }
-                        }
+                        "resource_id": "res-b"
                       }
                     ]
                   }
@@ -160,11 +104,7 @@
               "when": {
                 "resources": [
                   {
-                    "resource_id": "res-a",
-                    "page": {
-                      "kind": "cursor",
-                      "cursor": ""
-                    }
+                    "resource_id": "res-a"
                   }
                 ]
               },
@@ -178,11 +118,7 @@
               "when": {
                 "resources": [
                   {
-                    "resource_id": "res-b",
-                    "page": {
-                      "kind": "cursor",
-                      "cursor": ""
-                    }
+                    "resource_id": "res-b"
                   }
                 ]
               },
@@ -194,11 +130,6 @@
                     "statuses": [
                       {
                         "resource_id": "res-b",
-                        "outcome": {
-                          "fetched": {
-                            "page_empty": true
-                          }
-                        },
                         "page": {
                           "cursor_resumable": "exact",
                           "next": null
@@ -211,15 +142,35 @@
                   "op": "reply_deferred",
                   "which": "oldest",
                   "body": {
+                    "observations": [
+                      {
+                        "resource_id": "res-a",
+                        "category": "available",
+                        "canonical_hint": "available",
+                        "amount": {
+                          "asset": "USD",
+                          "amount": "1.00"
+                        },
+                        "provenance": {
+                          "provider_id": "provider_res_a"
+                        }
+                      }
+                    ],
+                    "statuses": [
+                      {
+                        "resource_id": "res-a"
+                      }
+                    ]
+                  }
+                },
+                {
+                  "op": "reply_deferred",
+                  "which": "oldest",
+                  "body": {
                     "observations": [],
                     "statuses": [
                       {
                         "resource_id": "res-a",
-                        "outcome": {
-                          "fetched": {
-                            "page_empty": true
-                          }
-                        },
                         "page": {
                           "cursor_resumable": "exact",
                           "next": null
@@ -267,23 +218,16 @@
               ]
             }
           ]
+        },
+        "provenance": {
+          "adapter_id": "fake-adapter",
+          "surface": "checking",
+          "observed_at": "2026-09-01T00:00:00Z",
+          "completeness": "complete"
         }
       },
       {
         "label": "duplicate_kill",
-        "hello": {
-          "protocol": "1",
-          "adapter_id": "fake-adapter",
-          "adapter_version": "0.1.0",
-          "capabilities": [
-            "resources.list",
-            "balances.read",
-            "history.read",
-            "status.read"
-          ],
-          "local_id_derivation": "fixture-literal@1",
-          "max_in_flight": 1
-        },
         "on": {
           "resources.list": [
             {
@@ -311,19 +255,6 @@
       },
       {
         "label": "oversize_frame_kill",
-        "hello": {
-          "protocol": "1",
-          "adapter_id": "fake-adapter",
-          "adapter_version": "0.1.0",
-          "capabilities": [
-            "resources.list",
-            "balances.read",
-            "history.read",
-            "status.read"
-          ],
-          "local_id_derivation": "fixture-literal@1",
-          "max_in_flight": 1
-        },
         "on": {
           "resources.list": [
             {
@@ -353,14 +284,7 @@
               },
               "do": [
                 {
-                  "op": "reply_ok_padded",
-                  "pad_bytes": 1200000,
-                  "pad_path": [
-                    "observations",
-                    0,
-                    "provenance",
-                    "observed_at"
-                  ],
+                  "op": "reply_ok",
                   "body": {
                     "observations": [
                       {
@@ -382,15 +306,21 @@
                     ],
                     "statuses": [
                       {
-                        "resource_id": "res-a",
-                        "outcome": {
-                          "fetched": {
-                            "page_empty": false
-                          }
-                        }
+                        "resource_id": "res-a"
                       }
                     ]
-                  }
+                  },
+                  "pad": [
+                    {
+                      "path": [
+                        "observations",
+                        0,
+                        "provenance",
+                        "observed_at"
+                      ],
+                      "bytes": 1200000
+                    }
+                  ]
                 }
               ]
             }
@@ -399,19 +329,6 @@
       },
       {
         "label": "garbage_kill",
-        "hello": {
-          "protocol": "1",
-          "adapter_id": "fake-adapter",
-          "adapter_version": "0.1.0",
-          "capabilities": [
-            "resources.list",
-            "balances.read",
-            "history.read",
-            "status.read"
-          ],
-          "local_id_derivation": "fixture-literal@1",
-          "max_in_flight": 1
-        },
         "on": {
           "resources.list": [
             {
@@ -451,19 +368,6 @@
       },
       {
         "label": "non_utf8_kill",
-        "hello": {
-          "protocol": "1",
-          "adapter_id": "fake-adapter",
-          "adapter_version": "0.1.0",
-          "capabilities": [
-            "resources.list",
-            "balances.read",
-            "history.read",
-            "status.read"
-          ],
-          "local_id_derivation": "fixture-literal@1",
-          "max_in_flight": 1
-        },
         "on": {
           "resources.list": [
             {
@@ -518,7 +422,6 @@
       "A4",
       "A11"
     ],
-    "run_selector_env": "SUMER_FIXTURE_RUN",
     "runs": [
       {
         "index": 0,
@@ -546,7 +449,7 @@
         ],
         "tombstoned_discarded": {
           "request": "balances.read(res-a)",
-          "detail": "the adapter sleeps 600ms (see conformance_hints.deadline_ms=300) then replies anyway; the host must have already tombstoned the id on timeout, DISCARD this late reply silently, and the connection must survive."
+          "detail": "balances.read(res-a) is DEFERRED, never answered inside the deadline (see conformance_hints), so the host must return Timeout and tombstone the id. The adapter then answers that id anyway, later, from history.read(res-b)'s rule: the host must DISCARD the late reply silently and the connection must survive it. Deferring rather than sleeping makes the timeout certain instead of a race against the machine's speed."
         },
         "out_of_order_tolerated": {
           "detail": "history.read(res-a) is deferred (max_in_flight:2 lets both res-a and res-b requests be in flight); history.read(res-b) is answered first, then the deferred res-a reply is sent second -- the host must correlate by id, not arrival order."

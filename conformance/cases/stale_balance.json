@@ -4,19 +4,6 @@
     "runs": [
       {
         "label": "default",
-        "hello": {
-          "protocol": "1",
-          "adapter_id": "fake-adapter",
-          "adapter_version": "0.1.0",
-          "capabilities": [
-            "resources.list",
-            "balances.read",
-            "history.read",
-            "status.read"
-          ],
-          "local_id_derivation": "fixture-literal@1",
-          "max_in_flight": 1
-        },
         "on": {
           "resources.list": [
             {
@@ -40,7 +27,8 @@
                     ]
                   }
                 }
-              ]
+              ],
+              "consume": false
             }
           ],
           "balances.read": [
@@ -64,11 +52,8 @@
                           "amount": "300.00"
                         },
                         "provenance": {
-                          "adapter_id": "fake-adapter",
                           "provider_id": "acct_checking_2",
-                          "surface": "checking",
-                          "observed_at": "2026-08-20T00:00:00Z",
-                          "completeness": "complete"
+                          "observed_at": "2026-08-20T00:00:00Z"
                         }
                       }
                     ],
@@ -106,23 +91,15 @@
                           "amount": "88.00"
                         },
                         "provenance": {
-                          "adapter_id": "fake-adapter",
                           "provider_id": "acct_checking_3",
-                          "surface": "checking",
                           "observed_at": "2026-09-03T00:00:00Z",
-                          "received_at": "2026-09-03T00:00:01Z",
-                          "completeness": "complete"
+                          "received_at": "2026-09-03T00:00:01Z"
                         }
                       }
                     ],
                     "statuses": [
                       {
-                        "resource_id": "checking-3",
-                        "outcome": {
-                          "fetched": {
-                            "page_empty": false
-                          }
-                        }
+                        "resource_id": "checking-3"
                       }
                     ]
                   }
@@ -135,11 +112,7 @@
               "when": {
                 "resources": [
                   {
-                    "resource_id": "checking-2",
-                    "page": {
-                      "kind": "cursor",
-                      "cursor": ""
-                    }
+                    "resource_id": "checking-2"
                   }
                 ]
               },
@@ -151,11 +124,6 @@
                     "statuses": [
                       {
                         "resource_id": "checking-2",
-                        "outcome": {
-                          "fetched": {
-                            "page_empty": true
-                          }
-                        },
                         "page": {
                           "cursor_resumable": "batch_restart",
                           "next": null
@@ -170,11 +138,7 @@
               "when": {
                 "resources": [
                   {
-                    "resource_id": "checking-3",
-                    "page": {
-                      "kind": "cursor",
-                      "cursor": ""
-                    }
+                    "resource_id": "checking-3"
                   }
                 ]
               },
@@ -186,11 +150,6 @@
                     "statuses": [
                       {
                         "resource_id": "checking-3",
-                        "outcome": {
-                          "fetched": {
-                            "page_empty": true
-                          }
-                        },
                         "page": {
                           "cursor_resumable": "batch_restart",
                           "next": null
@@ -237,6 +196,11 @@
               ]
             }
           ]
+        },
+        "provenance": {
+          "adapter_id": "fake-adapter",
+          "surface": "checking",
+          "completeness": "complete"
         }
       }
     ]
@@ -287,6 +251,6 @@
         "code": "invalid_request"
       }
     },
-    "notes": "checking-2 is the legitimate stale-cache case: the adapter never sends received_at (staleness is host-computed from received_at per spec/wire.md, but this fixture supplies observed_at plus the adapter's OWN staleness/completeness claim as evidence; a host is free to recompute staleness itself, but the adapter's declared 'Cached' + the outcome 'stale{as_of}' must both survive to the caller -- a host that silently drops the stale flag because the amount decoded fine fails A3's spirit and A7). checking-3's balances.read is the ADVERSARIAL half and is LITERAL, not simulated: the scripted reply's provenance object actually carries a 'received_at' field, exactly the field spec/wire.md says the adapter MUST omit. A conforming host's deserializer must reject the WHOLE reply with envelope err.code=invalid_request BEFORE ever looking at the amount inside it -- a host whose Provenance struct just silently ignores an unrecognised/extra field (e.g. no deny_unknown_fields, or a hand-rolled parser that only reads the keys it expects) will instead accept 88.00 as checking-3's live balance and fail this case invisibly. checking-3's own status.read call afterward must still succeed (A4 pairing) -- the invalid_request on the balances.read leg must not kill the connection or block checking-3's status.read."
+    "notes": "checking-2 is the legitimate stale-cache case, and its two halves are asserted separately. The ADAPTER's claim rides in the status outcome stale{as_of:2026-08-20T00:00:00Z}, which expect.statuses asserts survives to the caller -- a host that silently drops the stale flag because the amount decoded fine fails A3's spirit and A7. expect.provenance.checking-2 then asserts staleness:'cached'. That is NOT the adapter's claim being echoed: the wire structurally forbids an adapter from sending staleness at all, and the host DERIVES it from the resource's status outcome in the same reply -- stale{as_of} yields Cached, unavailable/gone yield Unavailable, everything else Live (Linus's ruling; see spec/observation.md section 1). The runner reads and asserts this field; it used to delete the key before comparing, which made the expectation dead JSON that read as coverage. A host that hardcodes Live for everything, or that lets an adapter influence the value, fails here.\\n\\nchecking-3's balances.read is the ADVERSARIAL half and is LITERAL, not simulated: the scripted reply's provenance object actually carries a 'received_at' field, exactly the field spec/observation.md says the adapter MUST omit. A conforming host's deserializer must reject the WHOLE reply with envelope err.code=invalid_request BEFORE ever looking at the amount inside it -- a host whose Provenance struct just silently ignores an unrecognised field (no deny_unknown_fields, or a hand-rolled parser that only reads the keys it expects) will instead accept 88.00 as checking-3's live balance and fail this case invisibly. checking-3's own status.read afterward must still succeed (A4 pairing) -- the invalid_request on the balances.read leg must not kill the connection or block checking-3's status.read."
   }
 }

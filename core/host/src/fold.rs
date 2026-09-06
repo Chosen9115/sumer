@@ -4,7 +4,7 @@
 //! place a monotonically increasing `revision: u64` is assigned, and the
 //! one place the fold total order (`received_at, surface, arrival_index`,
 //! `surface` bytewise -- [`sumer_wire::fold_order_key`]) turns a stream of
-//! observations into a per-`local_id` chain and a live set.
+//! observations into a per-`(adapter_id, local_id)` chain and a live set.
 //!
 //! Public and reusable on purpose (frozen contract, section (g)): the
 //! conformance suite calls this module rather than reimplementing
@@ -17,7 +17,7 @@
 //! (the order the host actually received observations on the wire) -- a
 //! restarted or stateless adapter has no other order to give it. The
 //! *chain* -- what `chain()` returns -- is sorted by the fold's total
-//! order instead, which can reorder two same-`local_id` observations from
+//! order instead, which can reorder two same-key observations from
 //! two different surfaces that arrived in the same page (same
 //! `received_at`) by `surface` bytewise. So a chain's revision numbers do
 //! not have to appear in ascending order down the chain when that happens;
@@ -42,17 +42,24 @@ struct Entry {
     revisioned: RevisionedObservation,
 }
 
-/// Accumulates observations from one or more adapters into per-`local_id`
-/// chains, assigning each a `revision` and folding them into a live set.
+/// Accumulates observations from one or more adapters into per-chain
+/// history, assigning each a `revision` and folding them into a live set.
 ///
-/// `local_id` alone is the fold key, deliberately -- **dedup by
-/// `provider_id` alone is forbidden** (spec/observation.md §3):
-/// `provider_id` is optional evidence carried on an observation, not an
-/// identity a pending-only surface is guaranteed to have yet.
+/// **The key is `(adapter_id, local_id)`, never `local_id` alone.**
+/// `local_id` is only a pure function of *one* provider's data, derived by
+/// one adapter's own `local_id_derivation` (spec/observation.md §3), so two
+/// adapters are as free to both emit `"tx-1"` as two adapters are to both
+/// name a resource `"main"` (spec/wire.md §10). Keying on `local_id` alone
+/// lets one adapter's observation overwrite another's, and one adapter's
+/// tombstone delete another's transaction.
+///
+/// Within that key, **dedup by `provider_id` alone is forbidden**
+/// (spec/observation.md §3): `provider_id` is optional evidence carried on
+/// an observation, not an identity a pending-only surface is guaranteed to
+/// have yet.
 #[derive(Default)]
 pub struct Fold {
-    chains: HashMap<String, Vec<Entry>>,
-    revisions: HashMap<(String, String), u64>,
+    chains: HashMap<(String, String), Vec<Entry>>,
     arrival_counter: u64,
 }
 
@@ -66,20 +73,19 @@ impl Fold {
     /// Returns the `revision` assigned to it: the host assigns `revision`
     /// by arrival order per `(adapter_id, local_id)` (spec/observation.md
     /// §3) -- the first observation of a given `local_id` from a given
-    /// adapter is revision 1, the next is 2, and so on.
+    /// adapter is revision 1, the next is 2, and so on. That is exactly the
+    /// length of its chain, which is why there is no second counter to keep
+    /// in step with it.
     pub fn ingest(&mut self, observation: Observation) -> u64 {
+        let arrival_index = self.arrival_counter;
+        self.arrival_counter += 1;
+
         let key = (
             observation.provenance.adapter_id.clone(),
             observation.local_id.clone(),
         );
-        let revision = self.revisions.entry(key).or_insert(0);
-        *revision += 1;
-        let revision = *revision;
-
-        let arrival_index = self.arrival_counter;
-        self.arrival_counter += 1;
-
-        let chain = self.chains.entry(observation.local_id.clone()).or_default();
+        let chain = self.chains.entry(key).or_default();
+        let revision = u64::try_from(chain.len()).unwrap_or(u64::MAX) + 1;
         chain.push(Entry {
             arrival_index,
             revisioned: RevisionedObservation {
@@ -104,50 +110,43 @@ impl Fold {
         revision
     }
 
-    /// The full, ordered observation chain for one `local_id` (fold total
-    /// order, ascending), or an empty slice if nothing has been ingested
-    /// for it. Retained even once tombstoned -- **tombstone is not
+    /// The full, ordered observation chain for one `(adapter_id, local_id)`
+    /// (fold total order, ascending), or an empty slice if nothing has been
+    /// ingested for it. Retained even once tombstoned -- **tombstone is not
     /// terminal**, so nothing is ever dropped from a chain.
     #[must_use]
-    pub fn chain(&self, local_id: &str) -> Vec<&RevisionedObservation> {
+    pub fn chain(&self, adapter_id: &str, local_id: &str) -> Vec<&RevisionedObservation> {
         self.chains
-            .get(local_id)
+            .get(&(adapter_id.to_owned(), local_id.to_owned()))
             .map(|entries| entries.iter().map(|e| &e.revisioned).collect())
             .unwrap_or_default()
     }
 
-    /// Every `local_id` this fold has ever seen an observation for.
-    pub fn local_ids(&self) -> impl Iterator<Item = &str> {
-        self.chains.keys().map(String::as_str)
+    /// Every `(adapter_id, local_id)` this fold has ever seen an
+    /// observation for.
+    pub fn keys(&self) -> impl Iterator<Item = (&str, &str)> {
+        self.chains
+            .keys()
+            .map(|(adapter_id, local_id)| (adapter_id.as_str(), local_id.as_str()))
     }
 
-    /// The live set: for every `local_id`, its most-recent-by-total-order
-    /// observation, filtered to those currently `active`. A `local_id`
-    /// whose latest observation is `tombstoned` is absent here (it is not
-    /// currently live) even though its full history remains in `chain()` --
-    /// and a later `active` observation for the same `local_id` (a
-    /// re-mined transaction) brings it back, since this always looks at
-    /// the *latest* entry, never a cached "is it dead" flag.
+    /// The live set: for every `(adapter_id, local_id)`, its
+    /// most-recent-by-total-order observation, filtered to those currently
+    /// `active`. A chain whose latest observation is `tombstoned` is absent
+    /// here (it is not currently live) even though its full history remains
+    /// in `chain()` -- and a later `active` observation for the same key (a
+    /// re-mined transaction) brings it back, since this always looks at the
+    /// *latest* entry, never a cached "is it dead" flag.
     #[must_use]
-    pub fn live_set(&self) -> HashMap<&str, &RevisionedObservation> {
+    pub fn live_set(&self) -> HashMap<(&str, &str), &RevisionedObservation> {
         self.chains
             .iter()
-            .filter_map(|(local_id, entries)| {
+            .filter_map(|((adapter_id, local_id), entries)| {
                 let latest = entries.last()?;
                 (latest.revisioned.observation.state == ObservationState::Active)
-                    .then_some((local_id.as_str(), &latest.revisioned))
+                    .then_some(((adapter_id.as_str(), local_id.as_str()), &latest.revisioned))
             })
             .collect()
-    }
-
-    /// The most-recent-by-total-order observation for one `local_id`,
-    /// regardless of its state (active or tombstoned).
-    #[must_use]
-    pub fn current(&self, local_id: &str) -> Option<&RevisionedObservation> {
-        self.chains
-            .get(local_id)
-            .and_then(|entries| entries.last())
-            .map(|e| &e.revisioned)
     }
 }
 
@@ -269,7 +268,7 @@ mod tests {
             "checking",
             "2026-01-02T00:00:00Z",
         ));
-        let chain = fold.chain("L1");
+        let chain = fold.chain("a1", "L1");
         assert_eq!(
             chain.len(),
             2,
@@ -279,7 +278,11 @@ mod tests {
         assert_eq!(chain[1].revision, 2);
         let live = fold.live_set();
         assert_eq!(
-            live.get("L1").unwrap().observation.amount.to_string(),
+            live.get(&("a1", "L1"))
+                .unwrap()
+                .observation
+                .amount
+                .to_string(),
             "42.37"
         );
     }
@@ -306,7 +309,7 @@ mod tests {
             "2026-01-02T00:00:00Z",
         ));
         assert!(
-            !fold.live_set().contains_key("L2"),
+            !fold.live_set().contains_key(&("a1", "L2")),
             "tombstoned is not in the live set"
         );
         fold.ingest(obs(
@@ -319,11 +322,11 @@ mod tests {
             "2026-01-03T00:00:00Z",
         ));
         assert!(
-            fold.live_set().contains_key("L2"),
+            fold.live_set().contains_key(&("a1", "L2")),
             "tombstone is not terminal -- a re-mine revives it"
         );
         assert_eq!(
-            fold.chain("L2").len(),
+            fold.chain("a1", "L2").len(),
             3,
             "append-only: nothing was dropped"
         );
@@ -353,7 +356,54 @@ mod tests {
             "s",
             "2026-01-02T00:00:00Z",
         ));
-        assert_eq!(fold.chain("L1").len(), 2);
+        assert_eq!(fold.chain("a1", "L1").len(), 2);
+    }
+
+    #[test]
+    fn two_adapters_sharing_a_local_id_keep_separate_chains() {
+        // `local_id` is only unique within one adapter (its derivation is
+        // per-adapter, spec/observation.md 3). Two adapters that both call
+        // a transaction "L1" must not collide: B must not overwrite A's
+        // amount, and a B-side tombstone must not delete A's transaction.
+        let mut fold = Fold::new();
+        fold.ingest(obs(
+            "acct",
+            "L1",
+            ObservationState::Active,
+            "1000.00",
+            "A",
+            "s",
+            "2026-01-01T00:00:00Z",
+        ));
+        fold.ingest(obs(
+            "acct",
+            "L1",
+            ObservationState::Active,
+            "2000.00",
+            "B",
+            "s",
+            "2026-01-02T00:00:00Z",
+        ));
+        assert_eq!(
+            fold.live_set().len(),
+            2,
+            "one live entry per (adapter_id, local_id), not per local_id"
+        );
+
+        fold.ingest(obs(
+            "acct",
+            "L1",
+            ObservationState::Tombstoned,
+            "2000.00",
+            "B",
+            "s",
+            "2026-01-03T00:00:00Z",
+        ));
+        assert_eq!(
+            fold.live_set().len(),
+            1,
+            "B's tombstone must not delete A's transaction"
+        );
     }
 
     #[test]
@@ -382,7 +432,7 @@ mod tests {
         ));
         assert_eq!(r_b, 1, "revision reflects arrival order");
         assert_eq!(r_a, 2);
-        let chain = fold.chain("L1");
+        let chain = fold.chain("a1", "L1");
         assert_eq!(
             chain[0].observation.surface, "A",
             "fold order sorts by surface bytewise"

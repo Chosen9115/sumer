@@ -21,18 +21,24 @@ mod mux;
 pub mod paging;
 mod process;
 
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
 use mux::Mux;
 use sumer_wire::{
-    Balance, ErrorBody, HelloReply, Observation, ProtocolViolationKind, Reply, ResourceQuery,
-    ResourceStatus, Rfc3339, Staleness, WireErrorCode, OP_BALANCES_READ, OP_HELLO, OP_HISTORY_READ,
-    OP_RESOURCES_LIST, OP_STATUS_READ,
+    Balance, ErrorBody, HelloParams, HelloReply, Observation, ProtocolViolationKind, ReadOutcome,
+    Reply, ResourceQuery, ResourceStatus, Rfc3339, Staleness, WireErrorCode, MAX_OBSERVATION_BYTES,
+    OP_BALANCES_READ, OP_HELLO, OP_HISTORY_READ, OP_RESOURCES_LIST, OP_STATUS_READ,
 };
 
 /// Default per-request deadline (frozen contract): 30 seconds.
 pub const DEFAULT_DEADLINE: Duration = Duration::from_secs(30);
+
+/// The protocol versions this host offers in its hello (spec/wire.md §4).
+/// The adapter must pick one of exactly these; anything else is not a
+/// negotiated version, it is an adapter answering a question nobody asked.
+pub const OFFERED_PROTOCOLS: &[&str] = &["1"];
 
 /// Every way a call into an adapter can fail. Mirrors spec/wire.md §8: a
 /// wire-level `err` (including a reply the host itself could not make
@@ -57,6 +63,10 @@ pub enum HostError {
     ProtocolViolation(ProtocolViolationKind),
     /// The adapter process itself could not be started.
     Spawn(String),
+    /// The connection's monotonic id counter is exhausted. Ids are never
+    /// reused (spec/wire.md §6), so this connection can issue no further
+    /// requests; a new connection starts a new counter.
+    IdsExhausted,
 }
 
 impl std::fmt::Display for HostError {
@@ -69,6 +79,7 @@ impl std::fmt::Display for HostError {
             }
             HostError::ProtocolViolation(kind) => write!(f, "protocol violation: {kind:?}"),
             HostError::Spawn(msg) => write!(f, "could not spawn adapter: {msg}"),
+            HostError::IdsExhausted => write!(f, "adapter connection ran out of request ids"),
         }
     }
 }
@@ -101,7 +112,6 @@ pub struct AdapterHandle {
     hello: HelloReply,
     default_deadline: Duration,
     kill_tx: tokio::sync::mpsc::Sender<Option<ProtocolViolationKind>>,
-    stderr_tail: Arc<std::sync::Mutex<Vec<u8>>>,
 }
 
 impl Drop for AdapterHandle {
@@ -146,14 +156,21 @@ impl AdapterHandle {
     ) -> Result<AdapterHandle, HostError> {
         let spawned =
             process::spawn(&argv, extra_env).map_err(|e| HostError::Spawn(e.to_string()))?;
-        let stderr_tail = spawned.stderr_tail.clone();
 
-        let mux = Mux::spawn(spawned.stdin);
         let (kill_tx, kill_rx) = tokio::sync::mpsc::channel(1);
+        let mux = Mux::spawn(spawned.stdin, kill_tx.clone());
         tokio::spawn(mux::read_loop(mux.clone(), spawned.stdout, kill_tx.clone()));
         tokio::spawn(process::supervise(spawned.child, kill_rx, mux.clone()));
 
-        let hello_params = serde_json::json!({ "protocol": ["1"] });
+        let offered = HelloParams {
+            protocol: OFFERED_PROTOCOLS.iter().map(|v| (*v).to_owned()).collect(),
+        };
+        let hello_params = serde_json::to_value(&offered).map_err(|e| {
+            HostError::Wire(ErrorBody::new(
+                WireErrorCode::Internal,
+                format!("could not serialize hello params: {e}"),
+            ))
+        })?;
         let hello_result = mux
             .call(OP_HELLO.to_owned(), hello_params, default_deadline)
             .await;
@@ -183,6 +200,25 @@ impl AdapterHandle {
             }
         };
 
+        // The adapter must select one of the versions it was offered.
+        // Accepting anything else means running an unnegotiated protocol:
+        // the host would go on to speak "1" at an adapter that just said it
+        // speaks something else, and every later reply would be interpreted
+        // under a contract neither side agreed to.
+        if !OFFERED_PROTOCOLS.contains(&hello.protocol.as_str()) {
+            let _ = kill_tx.try_send(None);
+            return Err(HostError::Wire(
+                ErrorBody::new(
+                    WireErrorCode::UnsupportedProtocol,
+                    format!(
+                        "adapter selected protocol {:?}, which was not offered",
+                        hello.protocol
+                    ),
+                )
+                .with_detail(serde_json::json!({"offered": OFFERED_PROTOCOLS})),
+            ));
+        }
+
         mux.raise_concurrency(hello.max_in_flight.max(1));
 
         Ok(AdapterHandle {
@@ -190,25 +226,12 @@ impl AdapterHandle {
             hello,
             default_deadline,
             kill_tx,
-            stderr_tail,
         })
     }
 
     #[must_use]
     pub fn hello(&self) -> &HelloReply {
         &self.hello
-    }
-
-    /// The adapter's stderr, up to the last `process`-module cap, drained
-    /// in the background for the life of the process. Free-form, never
-    /// parsed (spec/wire.md §3) -- for diagnostics only, e.g. after an
-    /// [`HostError::AdapterCrashed`].
-    #[must_use]
-    pub fn stderr_tail(&self) -> Vec<u8> {
-        self.stderr_tail
-            .lock()
-            .map(|guard| guard.clone())
-            .unwrap_or_default()
     }
 
     /// `resources.list`: no observations, no per-resource status (nothing
@@ -245,14 +268,20 @@ impl AdapterHandle {
                 sumer_wire::BalancesReadParams { resource_ids },
             )
             .await?;
-        let observations = raw
-            .observations
-            .into_iter()
-            .map(|wire| Balance::stamp(wire, received_at.clone(), Staleness::Live))
-            .collect();
+        let staleness = staleness_by_resource(&raw.statuses);
+        let mut statuses = raw.statuses;
+        let observations = drop_oversized(raw.observations, &mut statuses, |b| {
+            (b.resource_id.clone(), None)
+        })
+        .into_iter()
+        .map(|wire| {
+            let stale = staleness_for(&staleness, &wire.resource_id);
+            Balance::stamp(wire, received_at.clone(), stale)
+        })
+        .collect();
         Ok(BalancesRead {
             observations,
-            statuses: raw.statuses,
+            statuses,
         })
     }
 
@@ -267,15 +296,48 @@ impl AdapterHandle {
         let (raw, received_at): (sumer_wire::HistoryReadReply, Rfc3339) = self
             .call_typed_with_receipt(OP_HISTORY_READ, sumer_wire::HistoryReadParams { resources })
             .await?;
-        let observations = raw
-            .observations
-            .into_iter()
-            .map(|wire| Observation::stamp(wire, received_at.clone(), Staleness::Live))
-            .collect();
+        let staleness = staleness_by_resource(&raw.statuses);
+        let mut statuses = raw.statuses;
+        let observations = drop_oversized(raw.observations, &mut statuses, |o| {
+            (o.resource_id.clone(), Some(o.local_id.clone()))
+        })
+        .into_iter()
+        .map(|wire| {
+            let stale = staleness_for(&staleness, &wire.resource_id);
+            Observation::stamp(wire, received_at.clone(), stale)
+        })
+        .collect();
         Ok(HistoryRead {
             observations,
-            statuses: raw.statuses,
+            statuses,
         })
+    }
+
+    /// Sends one request with an arbitrary op string and raw params, and
+    /// returns the envelope verbatim -- `err` included, undecoded.
+    ///
+    /// The four typed reads above cover every op this milestone defines, so
+    /// this exists for the one thing they cannot express: probing an op the
+    /// adapter never declared (`spec/wire.md` §5's `unsupported` path), which
+    /// the conformance suite has to do on a real connection. It goes through
+    /// the same `process::spawn` (env allowlist) and the same
+    /// `FrameDecoder` (frame cap, UTF-8, id lifecycle) as every other call,
+    /// which a second, hand-rolled client would not.
+    ///
+    /// # Errors
+    /// The same host-side outcomes as any other call. An envelope `err` is
+    /// returned as `Ok(Reply::Err {..})`, not `Err`: probing for `err` is
+    /// the point.
+    pub async fn call_raw(
+        &self,
+        op: &str,
+        params: serde_json::Value,
+    ) -> Result<Reply<serde_json::Value>, HostError> {
+        let (reply, _received_at) = self
+            .mux
+            .call(op.to_owned(), params, self.default_deadline)
+            .await?;
+        Ok(reply)
     }
 
     /// Sends one call and decodes its `ok` payload as `R`, discarding the
@@ -302,13 +364,11 @@ impl AdapterHandle {
     /// deserialize, which surfaces here as an ordinary malformed-reply
     /// `invalid_request`, the same path taken by any other shape mismatch).
     ///
-    /// **Staleness in this milestone is always [`Staleness::Live`]**: the
-    /// contract requires the host to compute it from `received_at`, but
-    /// gives no threshold, and explicitly defers "clock-skew policy beyond
-    /// stamping `received_at`" (frozen contract, "Deliberately NOT
-    /// building"). There is no cache layer yet for `Cached`/`Unavailable`
-    /// to describe -- every observation returned here was *just* read live
-    /// off the wire.
+    /// Staleness is stamped alongside it, derived per resource from the
+    /// same reply's `statuses` -- see [`staleness_by_resource`]. This
+    /// function returns the undecorated payload; the two reads that carry
+    /// provenance ([`AdapterHandle::balances_read`],
+    /// [`AdapterHandle::history_read`]) do the stamping.
     async fn call_typed_with_receipt<P: serde::Serialize, R: serde::de::DeserializeOwned>(
         &self,
         op: &str,
@@ -336,6 +396,129 @@ impl AdapterHandle {
                 Ok((parsed, received_at))
             }
         }
+    }
+}
+
+// ---------------------------------------------------------------------
+// Staleness (spec/observation.md §1)
+// ---------------------------------------------------------------------
+
+/// Staleness per `resource_id`, derived from that resource's own outcome in
+/// the same reply.
+///
+/// The host stamps this; the adapter cannot send it (there is no field for
+/// it on [`sumer_wire::ProvenanceWire`]). But "host-stamped" never meant
+/// "host-invented": an adapter that answers `stale { as_of }` has said, in
+/// the vocabulary the contract gives it, that what it is handing over is
+/// not current -- stamping `Live` over that would be the host overruling
+/// evidence it asked for. Everything else is a live read: these
+/// observations came off the wire moments ago, and there is no cache layer
+/// yet that could make them anything else.
+fn staleness_by_resource(statuses: &[ResourceStatus]) -> HashMap<String, Staleness> {
+    statuses
+        .iter()
+        .map(|status| {
+            let staleness = match status.outcome {
+                ReadOutcome::Stale { .. } => Staleness::Cached,
+                // Nothing current exists for this resource at all --
+                // distinct from "old but real", which is `Cached`.
+                ReadOutcome::Unavailable | ReadOutcome::Gone => Staleness::Unavailable,
+                // Listed rather than wildcarded so a new outcome has to
+                // choose: an outcome nobody classified would silently
+                // become `Live`, which is the one value that must never be
+                // a default nobody thought about.
+                ReadOutcome::Fetched { .. }
+                | ReadOutcome::NotFetched
+                | ReadOutcome::RateLimited { .. }
+                | ReadOutcome::ReauthRequired
+                | ReadOutcome::Revoked
+                | ReadOutcome::ScaRequired
+                | ReadOutcome::OversizedObservation { .. } => Staleness::Live,
+            };
+            (status.resource_id.clone(), staleness)
+        })
+        .collect()
+}
+
+/// An observation whose resource named no status at all is `Live` -- it was
+/// still just read off the wire. (The reply is malformed in that case:
+/// every requested `resource_id` appears in `statuses` exactly once. That
+/// is the conformance suite's assertion to make, not a reason to
+/// mis-stamp.)
+fn staleness_for(by_resource: &HashMap<String, Staleness>, resource_id: &str) -> Staleness {
+    by_resource
+        .get(resource_id)
+        .copied()
+        .unwrap_or(Staleness::Live)
+}
+
+// ---------------------------------------------------------------------
+// MAX_OBSERVATION_BYTES enforcement (spec/observation.md §6)
+// ---------------------------------------------------------------------
+
+/// Drops any observation whose serialized size exceeds
+/// [`MAX_OBSERVATION_BYTES`] and reports `oversized_observation` for its
+/// resource, continuing the page with everything that fits.
+///
+/// The adapter is supposed to have done this itself (truncate
+/// `provider_extra`, then omit the record and report it). The host repeats
+/// the omit half because "the adapter promised" is not enforcement: an
+/// adapter that skips the degrade otherwise lands an unbounded record in
+/// host memory and in every consumer downstream of it. The degrade stays a
+/// degrade -- **a resource is never bricked by one large event** -- so the
+/// rest of the page is delivered untouched.
+///
+/// Size is measured on the host's own re-serialization of the decoded
+/// observation, which is the only copy the host can vouch for; it differs
+/// from the adapter's bytes only by JSON whitespace and key order.
+fn drop_oversized<T: serde::Serialize>(
+    observations: Vec<T>,
+    statuses: &mut Vec<ResourceStatus>,
+    key: impl Fn(&T) -> (String, Option<String>),
+) -> Vec<T> {
+    observations
+        .into_iter()
+        .filter(|observation| {
+            let bytes = serde_json::to_vec(observation).map_or(usize::MAX, |v| v.len());
+            if bytes <= MAX_OBSERVATION_BYTES {
+                return true;
+            }
+            let (resource_id, local_id) = key(observation);
+            report_oversized(statuses, resource_id, local_id, bytes);
+            false
+        })
+        .collect()
+}
+
+/// Records an `oversized_observation` outcome for one resource. It replaces
+/// that resource's existing outcome rather than adding a second entry:
+/// **every requested `resource_id` appears in `statuses` exactly once**
+/// (spec/observation.md §6), and the page's paging state (`page`) is kept
+/// so the read stays resumable.
+fn report_oversized(
+    statuses: &mut Vec<ResourceStatus>,
+    resource_id: String,
+    local_id: Option<String>,
+    bytes: usize,
+) {
+    let outcome = ReadOutcome::OversizedObservation {
+        local_id,
+        bytes: u64::try_from(bytes).unwrap_or(u64::MAX),
+    };
+    match statuses
+        .iter_mut()
+        .find(|status| status.resource_id == resource_id)
+    {
+        Some(existing) => existing.outcome = outcome,
+        None => statuses.push(ResourceStatus {
+            resource_id,
+            outcome,
+            provider_detail: None,
+            page: None,
+            credential_expires_at: None,
+            strong_auth_expires_at: None,
+            history_start: None,
+        }),
     }
 }
 

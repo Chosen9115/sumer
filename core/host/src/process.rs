@@ -10,7 +10,7 @@
 //! to set here.
 
 use std::process::Stdio;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 use tokio::io::AsyncReadExt;
 use tokio::process::{Child, ChildStdin, ChildStdout};
@@ -25,12 +25,6 @@ use crate::mux::{Mux, Terminal};
 /// interpreter or script may expect.
 const ENV_ALLOWLIST: &[&str] = &["PATH", "HOME", "LANG", "LC_ALL", "TMPDIR"];
 
-/// Largest number of stderr bytes retained for diagnostics. Stderr is
-/// drained (and the pipe kept empty so a chatty adapter can never block on
-/// a full pipe) regardless of this cap; bytes beyond it are discarded, not
-/// buffered.
-const MAX_STDERR_BYTES: usize = 65_536;
-
 /// A freshly spawned adapter process with its stdio handles already split
 /// out. `stdin`/`stdout` are owned by the caller (the mux's writer and
 /// reader loops); `child` remains for waiting on exit.
@@ -38,11 +32,6 @@ pub struct SpawnedAdapter {
     pub child: Child,
     pub stdin: ChildStdin,
     pub stdout: ChildStdout,
-    /// The last `MAX_STDERR_BYTES` of the adapter's stderr, drained in the
-    /// background. Free-form, never parsed -- see spec/wire.md §3. Shared
-    /// so a caller can inspect it after a crash without racing the drain
-    /// task.
-    pub stderr_tail: Arc<Mutex<Vec<u8>>>,
 }
 
 /// Spawns `argv[0]` with `argv[1..]` as arguments. `extra_env` is layered on
@@ -95,35 +84,24 @@ pub fn spawn(
         .take()
         .ok_or_else(|| std::io::Error::other("adapter child had no stderr pipe"))?;
 
-    let stderr_tail = Arc::new(Mutex::new(Vec::new()));
-    tokio::spawn(drain_stderr(stderr, stderr_tail.clone()));
+    tokio::spawn(drain_stderr(stderr));
 
     Ok(SpawnedAdapter {
         child,
         stdin,
         stdout,
-        stderr_tail,
     })
 }
 
-/// Reads stderr to completion, keeping only the last `MAX_STDERR_BYTES` for
-/// diagnostics. Never parsed, never volume-unbounded: an adapter that
-/// floods stderr cannot grow host memory without limit, and (since the pipe
-/// is always being read) can never block on a full pipe either.
-async fn drain_stderr(mut stderr: tokio::process::ChildStderr, tail: Arc<Mutex<Vec<u8>>>) {
+/// Reads stderr to completion and discards it. Nothing here parses adapter
+/// log output (spec/wire.md §3); the drain exists so a chatty adapter can
+/// never block on a full stderr pipe, and nothing retains the bytes, so it
+/// cannot grow host memory either.
+async fn drain_stderr(mut stderr: tokio::process::ChildStderr) {
     let mut chunk = [0_u8; 4096];
-    loop {
-        match stderr.read(&mut chunk).await {
-            Ok(0) | Err(_) => return,
-            Ok(n) => {
-                if let Ok(mut buf) = tail.lock() {
-                    buf.extend_from_slice(&chunk[..n]);
-                    let overflow = buf.len().saturating_sub(MAX_STDERR_BYTES);
-                    if overflow > 0 {
-                        buf.drain(0..overflow);
-                    }
-                }
-            }
+    while let Ok(n) = stderr.read(&mut chunk).await {
+        if n == 0 {
+            return;
         }
     }
 }
