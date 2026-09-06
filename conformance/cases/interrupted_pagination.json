@@ -1267,58 +1267,93 @@
           "index": 2,
           "label": "exact_interrupted_after"
         },
-        "full_live_set": [
+        "resources": [
           {
-            "local_id": "wallet-page:e1",
-            "state": "active",
-            "posting": "posted",
-            "surface": "onchain",
-            "raw_sign": "provider_positive",
-            "amount": {
-              "asset": "sat",
-              "amount": "10000"
-            }
-          },
-          {
-            "local_id": "wallet-page:e2",
-            "state": "active",
-            "posting": "posted",
-            "surface": "onchain",
-            "raw_sign": "provider_positive",
-            "amount": {
-              "asset": "sat",
-              "amount": "20000"
-            }
-          },
-          {
-            "local_id": "wallet-page:e3",
-            "state": "active",
-            "posting": "posted",
-            "surface": "onchain",
-            "raw_sign": "provider_positive",
-            "amount": {
-              "asset": "sat",
-              "amount": "30000"
-            }
-          },
-          {
-            "local_id": "wallet-page:e4",
-            "state": "active",
-            "posting": "posted",
-            "surface": "onchain",
-            "raw_sign": "provider_positive",
-            "amount": {
-              "asset": "sat",
-              "amount": "40000"
-            }
+            "resource_id": "wallet-page",
+            "kind": "onchain_wallet"
           }
         ],
+        "ledger": {
+          "wallet-page": {
+            "balances": [
+              {
+                "category": "available",
+                "canonical_hint": "available",
+                "amount": {
+                  "asset": "sat",
+                  "amount": "400000"
+                }
+              }
+            ],
+            "history": [
+              {
+                "local_id": "wallet-page:e1",
+                "provider_id": "e1",
+                "state": "active",
+                "posting": "posted",
+                "surface": "onchain",
+                "raw_sign": "provider_positive",
+                "amount": {
+                  "asset": "sat",
+                  "amount": "10000"
+                },
+                "provider_extra": {}
+              },
+              {
+                "local_id": "wallet-page:e2",
+                "provider_id": "e2",
+                "state": "active",
+                "posting": "posted",
+                "surface": "onchain",
+                "raw_sign": "provider_positive",
+                "amount": {
+                  "asset": "sat",
+                  "amount": "20000"
+                },
+                "provider_extra": {}
+              },
+              {
+                "local_id": "wallet-page:e3",
+                "provider_id": "e3",
+                "state": "active",
+                "posting": "posted",
+                "surface": "onchain",
+                "raw_sign": "provider_positive",
+                "amount": {
+                  "asset": "sat",
+                  "amount": "30000"
+                },
+                "provider_extra": {}
+              },
+              {
+                "local_id": "wallet-page:e4",
+                "provider_id": "e4",
+                "state": "active",
+                "posting": "posted",
+                "surface": "onchain",
+                "raw_sign": "provider_positive",
+                "amount": {
+                  "asset": "sat",
+                  "amount": "40000"
+                },
+                "provider_extra": {}
+              }
+            ]
+          }
+        },
+        "live": {
+          "wallet-page": [
+            "wallet-page:e1",
+            "wallet-page:e2",
+            "wallet-page:e3",
+            "wallet-page:e4"
+          ]
+        },
         "resume_cursor": "wallet-page:h100",
         "must_not_reemit_before_resume_cursor": [
           "wallet-page:e1",
           "wallet-page:e2"
         ],
-        "uninterrupted_tail_frame_count_after_resume_cursor": 2,
         "max_post_resume_frame_count": 3
       },
       "batch_restart": {
@@ -1336,48 +1371,80 @@
           "index": 5,
           "label": "batch_restart_interrupted_after"
         },
-        "full_live_set": [
+        "resources": [
           {
-            "local_id": "acct-page:f1",
-            "state": "active",
-            "posting": "posted",
-            "surface": "checking",
-            "raw_sign": "provider_negative",
-            "amount": {
-              "asset": "USD",
-              "amount": "12.00"
-            }
-          },
-          {
-            "local_id": "acct-page:f2",
-            "state": "active",
-            "posting": "posted",
-            "surface": "checking",
-            "raw_sign": "provider_negative",
-            "amount": {
-              "asset": "USD",
-              "amount": "34.00"
-            }
-          },
-          {
-            "local_id": "acct-page:f3",
-            "state": "active",
-            "posting": "posted",
-            "surface": "checking",
-            "raw_sign": "provider_negative",
-            "amount": {
-              "asset": "USD",
-              "amount": "56.00"
-            }
+            "resource_id": "acct-page",
+            "kind": "bank_checking"
           }
         ],
-        "resume_restarts_whole_batch": true,
+        "ledger": {
+          "acct-page": {
+            "balances": [
+              {
+                "category": "available",
+                "canonical_hint": "available",
+                "amount": {
+                  "asset": "USD",
+                  "amount": "500.00"
+                }
+              }
+            ],
+            "history": [
+              {
+                "local_id": "acct-page:f1",
+                "provider_id": "f1",
+                "state": "active",
+                "posting": "posted",
+                "surface": "checking",
+                "raw_sign": "provider_negative",
+                "amount": {
+                  "asset": "USD",
+                  "amount": "12.00"
+                },
+                "provider_extra": {}
+              },
+              {
+                "local_id": "acct-page:f2",
+                "provider_id": "f2",
+                "state": "active",
+                "posting": "posted",
+                "surface": "checking",
+                "raw_sign": "provider_negative",
+                "amount": {
+                  "asset": "USD",
+                  "amount": "34.00"
+                },
+                "provider_extra": {}
+              },
+              {
+                "local_id": "acct-page:f3",
+                "provider_id": "f3",
+                "state": "active",
+                "posting": "posted",
+                "surface": "checking",
+                "raw_sign": "provider_negative",
+                "amount": {
+                  "asset": "USD",
+                  "amount": "56.00"
+                },
+                "provider_extra": {}
+              }
+            ]
+          }
+        },
+        "live": {
+          "acct-page": [
+            "acct-page:f1",
+            "acct-page:f2",
+            "acct-page:f3"
+          ]
+        },
         "redelivered_on_resume": [
           "acct-page:f1",
           "acct-page:f2"
         ]
       }
     },
-    "notes": "Six runs, selected by SUMER_FIXTURE_RUN (0-5); see the 'families' block for which triple of runs belongs to which cursor family. Every run's FIRST history.read carries no `page` field at all -- absent means 'from the start of available history' (spec/observation.md section 5, Ruling A8) -- and every page after it uses only a cursor the adapter itself returned; the suite never invents a cursor value. exact: the *_before run serves page 1 (e1,e2, next cursor h100) then EXITS instead of answering the h100 request -- the runner must kill/observe the crash, spawn *_after fresh, and resend cursor h100; *_after has no rule for anything except cursor h100/h200, so it will visibly fail (FIXTURE BUG stderr line, err.code=internal) if the runner resends anything else, which is the intended trip-wire for 'no event strictly before the resume cursor is re-emitted'. batch_restart: the *_before run serves the WHOLE first batch (f1,f2, next 'continue', batch NOT finished) then exits when asked to continue; because batch_restart only advances the durable cursor on next:null, the correct resume request is the ORIGINAL request -- an ABSENT page again -- and *_after's only rule matches that shape and re-serves f1+f2 before f3, exercising idempotent re-delivery (asserted by redelivered_on_resume) rather than the exact family's no-reemission guarantee. full_live_set names each entry's AMOUNT, state, posting, surface and raw_sign, not just its local_id: A5 compares the complete financial content of the resumed live set against the uninterrupted one, because an adapter that returns exactly the right local_ids carrying entirely different money after a resume is precisely the failure this assertion exists to catch."
+    "notes": "Six runs, selected by SUMER_FIXTURE_RUN (0-5); see the 'families' block for which triple of runs belongs to which cursor family. Every run's FIRST history.read carries no `page` field at all -- absent means 'from the start of available history' (spec/observation.md section 5, Ruling A8) -- and every page after it uses only a cursor the adapter itself returned; the suite never invents a cursor value. exact: the *_before run serves page 1 (e1,e2, next cursor h100) then EXITS instead of answering the h100 request -- the runner must kill/observe the crash, spawn *_after fresh, and resend cursor h100; *_after has no rule for anything except cursor h100/h200, so it will visibly fail (FIXTURE BUG stderr line, err.code=internal) if the runner resends anything else, which is the intended trip-wire for 'no event strictly before the resume cursor is re-emitted'. batch_restart: the *_before run serves the WHOLE first batch (f1,f2, next 'continue', batch NOT finished) then exits when asked to continue; because batch_restart only advances the durable cursor on next:null, the correct resume request is the ORIGINAL request -- an ABSENT page again -- and *_after's only rule matches that shape and re-serves f1+f2 before f3, exercising idempotent re-delivery (asserted by redelivered_on_resume) rather than the exact family's no-reemission guarantee. Each family declares the WHOLE sequence once, in expect.ledger, and its three runs read different amounts of it: the uninterrupted run emits all of it, the killed run a prefix, and the resumed run a suffix (exact) or the whole thing again (batch_restart). How much is owed is the RUNNER's call at four Truncated call sites in case_interrupted_pagination, never a key in here -- a fixture that could declare its own leniency would be the thing under test deciding how hard the test is. Truncated relaxes exactly one half, 'everything declared was emitted': wrong money inside the slice, a record nobody declared, and a non-contiguous slice (e1 then e3, the shape a re-emit-everything adapter cannot produce but a page-skipping one can) all still fail. Every entry names its AMOUNT, state, posting, surface and raw_sign, not just its local_id, for the same reason A5 compares the resumed live set's full financial content against the uninterrupted one: an adapter that returns exactly the right local_ids carrying entirely different money after a resume is precisely the failure this assertion exists to catch, and it is now caught twice -- once in the resumed run's own sequence, once in the folded bracket. expect.live is DECLARED per family, never folded out of expect.ledger, so a wrong fold is a difference instead of a coincidence."
   }
 }

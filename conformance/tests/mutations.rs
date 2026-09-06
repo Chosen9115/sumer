@@ -1,0 +1,646 @@
+//! The mutation battery: the check that every assertion in this suite can
+//! still be **made to fail**.
+//!
+//! # Why this exists
+//!
+//! Seven assertions in this suite were satisfied by a deliberately broken
+//! implementation. Every one of them was found by breaking the adapter and
+//! watching the suite stay green -- none by reading the code. This file is
+//! that habit turned into an artifact: a directory of *mutants*, each one a
+//! small, surgical break, each one required to be caught by a named set of
+//! assertions.
+//!
+//! # The mechanism
+//!
+//! A mutant is `conformance/mutations/<name>.json`:
+//!
+//! ```json
+//! { "fixture": "pending_to_posted",
+//!   "assertions": ["A2"],
+//!   "covers": ["A8"],
+//!   "adapter": null,
+//!   "why": "...",
+//!   "patch": [{"path": "/script/runs/0/.../amount/amount", "value": "42.38"}] }
+//! ```
+//!
+//! * `patch` is applied to a **copy** of the fixture, and may only touch
+//!   `/script/...`. The fake adapter is a script interpreter, so a patched
+//!   script *is* a broken adapter by construction -- this is real mutation,
+//!   not a simulation of one. Patching `expect` would be the opposite:
+//!   weakening the test instead of breaking the thing under test, which is
+//!   rejected here rather than trusted to review.
+//! * The case then runs against its **original, unmutated `expect`**.
+//! * `adapter` names a small monkey-patch wrapper under
+//!   `mutations/adapters/`, for the mutations a static patch cannot express:
+//!   behaving differently on the *second* process invocation, or corrupting
+//!   the adapter's degrade step rather than its data.
+//! * `covers` is the `(fixture, assertion)` pair this mutant claims in
+//!   [`COVERAGE`], when that differs from the assertion ids the failure
+//!   messages actually carry. Two places it differs, both deliberate: the
+//!   six fatal violation kinds are all reported as `A11`, and A8 (full
+//!   history retention) is enforced inside A2's sequence equality. Defaults
+//!   to `assertions`.
+//!
+//! # The two rules that keep this from going hollow
+//!
+//! **1. EXACTNESS.** The set of distinct assertion ids in the resulting
+//! failures must EQUAL `assertions`. A mutant that provokes an *unlisted*
+//! id is too blunt and fails here; a mutant that provokes *none* is a
+//! survivor and fails here. Without exactness, eleven blunt mutants (delete
+//! a resource, kill the adapter) would satisfy a coverage count while
+//! proving nothing about any single assertion's discriminating power -- and
+//! the seven real hollows died to surgical mutations: bytes leaked beside a
+//! truncation marker, the same ids carrying different money. A set of two
+//! ids is fine and expected where one break genuinely violates two things
+//! (an oversized leak is both A10 and the ledger's exact comparison);
+//! exactness means *equal*, not *singleton*.
+//!
+//! **2. BINDING IS PER `(fixture, assertion)`, NEVER A BARE ID.** [`COVERAGE`]
+//! is a table of pairs. Otherwise `pending_to_posted` could quietly stop
+//! asserting A8 while `reorg_vanish`'s A8 mutant kept that id green -- which
+//! is exactly the drift this battery exists to stop.
+//!
+//! # Live and parked
+//!
+//! A mutant whose fixture already fails unmutated cannot demonstrate
+//! anything: the fixture's own noise would answer for it. So this harness
+//! **measures** rather than keeping a list: it runs each fixture unmutated
+//! first, and a fixture whose baseline is not clean has its mutants PARKED,
+//! reported and counted rather than silently skipped. Every fixture's
+//! baseline is clean today and nothing is parked; the path stays because a
+//! regression on `main` must show up as "these mutants can no longer prove
+//! anything", not as a battery that quietly agrees with itself. A parked
+//! mutant is still run, its patch must still apply, and whatever it provokes
+//! on top of the baseline must still be a subset of what it names.
+//!
+//! `cargo test -p sumer-conformance --test mutations -- --nocapture` prints
+//! the whole ledger: what was killed, what is parked and behind what.
+
+#![allow(clippy::unwrap_used, clippy::expect_used)]
+
+use serde::Deserialize;
+use serde_json::Value;
+use std::collections::{BTreeMap, BTreeSet};
+use std::path::{Path, PathBuf};
+
+/// Every wire constraint a mutant can be bound to: the eleven named
+/// assertions of the frozen contract's section (g), plus the six fatal
+/// protocol-violation kinds, which are constraints in their own right (a
+/// host that reports `NotJson` for a non-UTF-8 frame has not detected the
+/// violation, it has guessed).
+const CONSTRAINTS: &[&str] = &[
+    "A1",
+    "A2",
+    "A3",
+    "A4",
+    "A5",
+    "A6",
+    "A7",
+    "A8",
+    "A9",
+    "A10",
+    "A11",
+    "PreHelloOutput",
+    "UnknownId",
+    "DuplicateId",
+    "OversizeFrame",
+    "NotJson",
+    "NonUtf8",
+];
+
+/// Which constraints each fixture is claimed to discriminate. **The unit is
+/// the pair**: `("pending_to_posted", "A8")` and `("reorg_vanish", "A8")`
+/// are two independent claims, and each needs its own mutant. A bare list of
+/// ids could be kept green by one fixture while every other one quietly
+/// stopped asserting anything.
+const COVERAGE: &[(&str, &[&str])] = &[
+    ("duplicate_events", &["A2", "A9"]),
+    ("fdx_lossless", &["A1"]),
+    ("interrupted_pagination", &["A5", "A10"]),
+    ("large_amounts", &["A1", "A2"]),
+    ("null_category", &["A3"]),
+    ("oversized_observation", &["A10"]),
+    (
+        "pending_to_posted",
+        &["A1", "A2", "A6", "A7", "A8", "A9", "A10"],
+    ),
+    (
+        "protocol_violations",
+        &[
+            "A4",
+            "A11",
+            "PreHelloOutput",
+            "UnknownId",
+            "DuplicateId",
+            "OversizeFrame",
+            "NotJson",
+            "NonUtf8",
+        ],
+    ),
+    ("provider_json_number", &["A1", "A4"]),
+    ("reorg_vanish", &["A2"]),
+    ("stale_balance", &["A7"]),
+    ("unsupported_op", &["A4"]),
+];
+
+/// One mutant, as it is written down. Unknown keys are rejected: a typo in
+/// a manifest is a mutant that silently stops mutating.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Mutant {
+    fixture: String,
+    /// The exact set of assertion ids the resulting failures must carry.
+    /// Empty means "this mutation must provoke nothing" -- see
+    /// [`equivalent`](Mutant::equivalent).
+    assertions: Vec<String>,
+    /// The `(fixture, constraint)` pairs this mutant claims in [`COVERAGE`].
+    /// Defaults to `assertions`.
+    #[serde(default)]
+    covers: Option<Vec<String>>,
+    /// A monkey-patch wrapper under `mutations/adapters/`, for mutations a
+    /// static patch cannot express.
+    #[serde(default)]
+    adapter: Option<String>,
+    /// Why this break is worth having a mutant for. Required, and required
+    /// to be non-empty: an empty `assertions` list is only ever legitimate
+    /// when someone has written down why.
+    why: String,
+    patch: Vec<Patch>,
+}
+
+impl Mutant {
+    /// A mutant that must provoke **nothing**: the break it performs is not
+    /// observable through this suite's aperture, and it is kept as a guard
+    /// -- if the aperture ever widens back, this stops being silent and the
+    /// battery goes red.
+    fn equivalent(&self) -> bool {
+        self.assertions.is_empty()
+    }
+
+    fn claims(&self) -> Vec<String> {
+        self.covers
+            .clone()
+            .unwrap_or_else(|| self.assertions.clone())
+    }
+}
+
+/// One JSON-pointer assignment against the fixture's `script`.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Patch {
+    path: String,
+    value: Value,
+}
+
+fn repo_root() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .expect("conformance/ has a parent directory")
+        .to_path_buf()
+}
+
+fn mutations_dir() -> PathBuf {
+    repo_root().join("conformance/mutations")
+}
+
+/// Every manifest, by name (the file stem), sorted.
+fn load_mutants() -> Vec<(String, Mutant)> {
+    let dir = mutations_dir();
+    let mut paths: Vec<PathBuf> = std::fs::read_dir(&dir)
+        .unwrap_or_else(|e| panic!("could not read {dir:?}: {e}"))
+        .filter_map(Result::ok)
+        .map(|e| e.path())
+        .filter(|p| p.extension().and_then(|e| e.to_str()) == Some("json"))
+        .collect();
+    paths.sort();
+    assert!(!paths.is_empty(), "no mutants found under {dir:?}");
+    paths
+        .into_iter()
+        .map(|path| {
+            let name = path
+                .file_stem()
+                .expect("a *.json path has a stem")
+                .to_string_lossy()
+                .into_owned();
+            let text = std::fs::read_to_string(&path)
+                .unwrap_or_else(|e| panic!("could not read {path:?}: {e}"));
+            let mutant: Mutant = serde_json::from_str(&text)
+                .unwrap_or_else(|e| panic!("{path:?} is not a valid mutant manifest: {e}"));
+            (name, mutant)
+        })
+        .collect()
+}
+
+/// Applies one pointer assignment, and **fails loudly on anything that would
+/// leave the fixture unmutated**: a path outside `/script`, a parent that
+/// does not exist, or a value that was already there. A patch that quietly
+/// does nothing is a survivor by construction, which is the one failure mode
+/// this whole file exists to prevent.
+fn apply(fixture: &mut Value, patch: &Patch) -> Result<(), String> {
+    if !patch.path.starts_with("/script/") {
+        return Err(format!(
+            "{}: a mutant may only patch /script/... -- it breaks the ADAPTER, never the \
+             expectations it is judged against",
+            patch.path
+        ));
+    }
+    if let Some(slot) = fixture.pointer_mut(&patch.path) {
+        if *slot == patch.value {
+            return Err(format!(
+                "{}: the patched value is already what the fixture says -- this mutant mutates \
+                 nothing",
+                patch.path
+            ));
+        }
+        *slot = patch.value.clone();
+        return Ok(());
+    }
+    let (parent, last) = patch
+        .path
+        .rsplit_once('/')
+        .ok_or_else(|| format!("{}: not a JSON pointer", patch.path))?;
+    let key = last.replace("~1", "/").replace("~0", "~");
+    match fixture.pointer_mut(parent) {
+        Some(Value::Object(map)) => {
+            map.insert(key, patch.value.clone());
+            Ok(())
+        }
+        _ => Err(format!(
+            "{}: neither this path nor an object at {parent:?} exists -- the fixture moved and \
+             this mutant is now a no-op",
+            patch.path
+        )),
+    }
+}
+
+/// The mutated fixture, written to a scratch file, plus the argv that drives
+/// it. Returns an error rather than panicking so a stale manifest is
+/// reported beside every other failure instead of aborting the run.
+fn materialize(root: &Path, name: &str, mutant: &Mutant) -> Result<(PathBuf, Vec<String>), String> {
+    let case_path = root
+        .join("conformance/cases")
+        .join(format!("{}.json", mutant.fixture));
+    let text = std::fs::read_to_string(&case_path)
+        .map_err(|e| format!("could not read {case_path:?}: {e}"))?;
+    let original: Value =
+        serde_json::from_str(&text).map_err(|e| format!("{case_path:?} is not JSON: {e}"))?;
+    let mut mutated = original.clone();
+    for patch in &mutant.patch {
+        apply(&mut mutated, patch)?;
+    }
+    if mutated == original && mutant.adapter.is_none() {
+        return Err("the patch list left the fixture unchanged".to_owned());
+    }
+
+    let adapter_argv = match &mutant.adapter {
+        None => vec![
+            "python3".to_owned(),
+            root.join("adapters/fake/fake_adapter.py")
+                .to_string_lossy()
+                .into_owned(),
+        ],
+        Some(wrapper) => {
+            let path = mutations_dir().join("adapters").join(wrapper);
+            if !path.is_file() {
+                return Err(format!("adapter wrapper {path:?} does not exist"));
+            }
+            vec!["python3".to_owned(), path.to_string_lossy().into_owned()]
+        }
+    };
+
+    let dir = std::env::temp_dir().join("sumer-mutations");
+    std::fs::create_dir_all(&dir).map_err(|e| format!("could not create {dir:?}: {e}"))?;
+    let path = dir.join(format!("{name}.json"));
+    // A wrapper counts process invocations in a file beside its fixture;
+    // last run's count must not leak into this one.
+    let _ = std::fs::remove_file(dir.join(format!("{name}.json.invocations")));
+    std::fs::write(
+        &path,
+        serde_json::to_string_pretty(&mutated).map_err(|e| e.to_string())?,
+    )
+    .map_err(|e| format!("could not write {path:?}: {e}"))?;
+    Ok((path, adapter_argv))
+}
+
+/// The distinct assertion ids one run produced.
+fn ids(failures: &[sumer_conformance::assert::Failure]) -> BTreeSet<String> {
+    failures.iter().map(|f| f.assertion.clone()).collect()
+}
+
+fn render(set: &BTreeSet<String>) -> String {
+    if set.is_empty() {
+        "{}".to_owned()
+    } else {
+        format!("{{{}}}", set.iter().cloned().collect::<Vec<_>>().join(", "))
+    }
+}
+
+#[tokio::test]
+async fn every_mutant_is_caught_by_exactly_the_assertions_it_names() {
+    if std::process::Command::new("python3")
+        .arg("--version")
+        .output()
+        .is_err()
+    {
+        eprintln!("python3 not found on PATH -- skipping the mutation battery");
+        return;
+    }
+    let root = repo_root();
+    let mutants = load_mutants();
+
+    // Which fixtures are judgeable today. Measured, not listed: a fixture
+    // that fails unmutated cannot demonstrate that a mutation was caught.
+    let mut baseline: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+    for fixture in mutants
+        .iter()
+        .map(|(_, m)| m.fixture.clone())
+        .collect::<BTreeSet<_>>()
+    {
+        let path = root
+            .join("conformance/cases")
+            .join(format!("{fixture}.json"));
+        let argv = vec![
+            "python3".to_owned(),
+            root.join("adapters/fake/fake_adapter.py")
+                .to_string_lossy()
+                .into_owned(),
+        ];
+        let outcome = sumer_conformance::runner::run_case(&argv, &path).await;
+        baseline.insert(fixture, ids(&outcome.failures));
+    }
+
+    let mut report = Vec::new();
+    let mut failures = Vec::new();
+    let (mut live, mut parked, mut equivalent) = (0_u32, 0_u32, 0_u32);
+
+    for (name, mutant) in &mutants {
+        let (path, argv) = match materialize(&root, name, mutant) {
+            Ok(v) => v,
+            Err(e) => {
+                failures.push(format!("{name}: {e}"));
+                continue;
+            }
+        };
+        let expected: BTreeSet<String> = mutant.assertions.iter().cloned().collect();
+        let baseline = baseline.get(&mutant.fixture).cloned().unwrap_or_default();
+        let outcome = sumer_conformance::runner::run_case(&argv, &path).await;
+        let produced = ids(&outcome.failures);
+
+        // A fixture that fails unmutated cannot demonstrate that a mutation
+        // was caught: its own noise would answer for the mutant. What IS
+        // checkable today is that the mutation adds nothing the manifest
+        // does not name -- most of this suite's assertions run inside the
+        // crawl and are not gated behind `expect.ledger`, so a parked
+        // mutant that is already too blunt is caught now rather than in
+        // whichever week its fixture gets converted.
+        if !baseline.is_empty() {
+            parked += 1;
+            let added: BTreeSet<String> = produced.difference(&baseline).cloned().collect();
+            report.push(format!(
+                "PARKED {name}\n         fixture {:?} is not converted yet (it fails unmutated \
+                 with {}), so nothing here can be killed until it is. Declared {}; on top of \
+                 that baseline the mutation adds {} today.",
+                mutant.fixture,
+                render(&baseline),
+                render(&expected),
+                render(&added),
+            ));
+            if !added.is_subset(&expected) {
+                failures.push(format!(
+                    "{name}: TOO BLUNT ALREADY -- on top of its fixture's unmutated baseline {}, \
+                     this mutation provokes {}, which is not a subset of the {} it names\n    \
+                     mutant: {}",
+                    render(&baseline),
+                    render(&added),
+                    render(&expected),
+                    path.display(),
+                ));
+            }
+            continue;
+        }
+
+        if produced == expected {
+            if mutant.equivalent() {
+                equivalent += 1;
+                report.push(format!(
+                    "EQUIV  {name}\n         provokes nothing, by design: {}",
+                    mutant.why
+                ));
+            } else {
+                live += 1;
+                report.push(format!(
+                    "KILLED {name}\n         declared {} == produced {}",
+                    render(&expected),
+                    render(&produced)
+                ));
+            }
+            continue;
+        }
+        let verdict = if produced.is_empty() {
+            "SURVIVED -- the mutation provoked no failure at all"
+        } else if expected.is_empty() {
+            "NOT EQUIVALENT -- this mutant was declared unobservable and was observed"
+        } else if expected.is_subset(&produced) {
+            "TOO BLUNT -- it provoked assertions it does not name"
+        } else {
+            "MISSED -- it did not provoke every assertion it names"
+        };
+        failures.push(format!(
+            "{name}: {verdict}\n    fixture:  {}\n    declared: {}\n    produced: {}\n    why:  \
+             {}\n    mutant:   {}",
+            mutant.fixture,
+            render(&expected),
+            render(&produced),
+            mutant.why,
+            path.display(),
+        ));
+    }
+
+    report.sort();
+    eprintln!(
+        "\nmutation battery: {live} killed, {equivalent} equivalent (declared unobservable), \
+         {parked} parked behind an unconverted fixture, {} mutants total\n{}\n",
+        mutants.len(),
+        report.join("\n")
+    );
+    assert!(
+        failures.is_empty(),
+        "the mutation battery is not sound:\n\n{}\n",
+        failures.join("\n\n")
+    );
+}
+
+/// The coverage table itself, checked in every direction that can rot.
+#[test]
+fn the_coverage_table_is_backed_by_mutants() {
+    let mutants = load_mutants();
+    let claimed: BTreeSet<(&str, &str)> = COVERAGE
+        .iter()
+        .flat_map(|(fixture, ids)| ids.iter().map(move |id| (*fixture, *id)))
+        .collect();
+    let known: BTreeSet<&str> = CONSTRAINTS.iter().copied().collect();
+
+    // 1. The table names only real constraints.
+    for (fixture, id) in &claimed {
+        assert!(
+            known.contains(id),
+            "COVERAGE claims {id:?} for {fixture:?}, which is not a wire constraint"
+        );
+    }
+
+    // 2. Every constraint is claimed by at least one fixture. An unclaimed
+    //    constraint is one nothing in this suite is known to discriminate.
+    for constraint in CONSTRAINTS {
+        assert!(
+            claimed.iter().any(|(_, id)| id == constraint),
+            "no fixture claims {constraint:?} -- nothing here proves any case can tell it apart"
+        );
+    }
+
+    // 3. Every claimed PAIR has a mutant, and every mutant's claim is in the
+    //    table. Pairs, not bare ids: see the note on COVERAGE.
+    let backed: BTreeSet<(String, String)> = mutants
+        .iter()
+        .flat_map(|(_, m)| {
+            m.claims()
+                .into_iter()
+                .map(move |id| (m.fixture.clone(), id))
+        })
+        .collect();
+    for (fixture, id) in &claimed {
+        assert!(
+            backed.contains(&((*fixture).to_owned(), (*id).to_owned())),
+            "COVERAGE claims ({fixture:?}, {id:?}) but no mutant breaks it -- the claim is prose"
+        );
+    }
+    for (fixture, id) in &backed {
+        assert!(
+            claimed.contains(&(fixture.as_str(), id.as_str())),
+            "a mutant claims ({fixture:?}, {id:?}), which COVERAGE does not -- the table is \
+             out of date"
+        );
+    }
+
+    // 4. Every fixture in the suite has at least one mutant, and every
+    //    mutant names a fixture that exists.
+    let cases_dir = repo_root().join("conformance/cases");
+    let fixtures: BTreeSet<String> = std::fs::read_dir(&cases_dir)
+        .unwrap_or_else(|e| panic!("could not read {cases_dir:?}: {e}"))
+        .filter_map(Result::ok)
+        .map(|e| e.path())
+        .filter(|p| p.extension().and_then(|e| e.to_str()) == Some("json"))
+        .filter_map(|p| Some(p.file_stem()?.to_string_lossy().into_owned()))
+        .collect();
+    let mutated: BTreeSet<String> = mutants.iter().map(|(_, m)| m.fixture.clone()).collect();
+    assert_eq!(
+        mutated, fixtures,
+        "every fixture needs at least one mutant, and every mutant needs a real fixture"
+    );
+    assert_eq!(
+        COVERAGE
+            .iter()
+            .map(|(f, _)| (*f).to_owned())
+            .collect::<BTreeSet<_>>(),
+        fixtures,
+        "COVERAGE must have exactly one row per fixture"
+    );
+
+    // 5. A mutant that declares nothing must say why in prose, and a mutant
+    //    that declares something must still say why. `why` is the only field
+    //    a reader has to tell a deliberate no-op from a forgotten one.
+    for (name, mutant) in &mutants {
+        assert!(
+            mutant.why.len() > 20,
+            "mutant {name:?} must explain what break it performs and why it matters"
+        );
+        assert!(
+            !mutant.patch.is_empty() || mutant.adapter.is_some(),
+            "mutant {name:?} breaks nothing: it neither patches the script nor names a wrapper"
+        );
+    }
+}
+
+/// The two EQUIVALENT mutants (`empty_reads_without_discovery`,
+/// `ids_prefixed_without_discovery`) are declared unobservable because this
+/// suite no longer opens a connection whose reads begin without a
+/// `resources.list` -- there is one recorded crawl and it always discovers
+/// first. Their entire remaining value is that they go red the day a
+/// distinguishable second pass comes back.
+///
+/// A guard that cannot fire is dead weight, so this test fires it: each
+/// wrapper is driven directly over exactly such a connection and must
+/// diverge from the honest adapter. If a refactor of `fake_adapter.py` ever
+/// leaves a wrapper's monkey-patch inert, that shows up here rather than as
+/// two mutants silently agreeing they see nothing.
+#[tokio::test]
+async fn the_equivalent_mutants_could_still_fire() {
+    if std::process::Command::new("python3")
+        .arg("--version")
+        .output()
+        .is_err()
+    {
+        eprintln!("python3 not found on PATH -- skipping the equivalence reachability check");
+        return;
+    }
+    let root = repo_root();
+    // A COPY, in the scratch dir. `_wrapper.py` counts process invocations
+    // in a file beside `SUMER_FIXTURE`; pointed at the real fixture it
+    // would leave that marker sitting in `conformance/cases/`.
+    let dir = std::env::temp_dir().join("sumer-mutations");
+    std::fs::create_dir_all(&dir).unwrap_or_else(|e| panic!("could not create {dir:?}: {e}"));
+    let fixture = dir.join("equivalence_probe.json");
+    std::fs::copy(
+        root.join("conformance/cases/pending_to_posted.json"),
+        &fixture,
+    )
+    .unwrap_or_else(|e| panic!("could not stage {fixture:?}: {e}"));
+    let _ = std::fs::remove_file(dir.join("equivalence_probe.json.invocations"));
+
+    // One connection, no `resources.list` before the read: the shape the
+    // deleted "wire pass" had, and the only shape these wrappers react to.
+    async fn undiscovered_read(adapter: &Path, fixture: &Path) -> Vec<String> {
+        let handle = sumer_host::AdapterHandle::spawn(
+            vec!["python3".to_owned(), adapter.to_string_lossy().into_owned()],
+            [
+                (
+                    "SUMER_FIXTURE".to_owned(),
+                    fixture.to_string_lossy().into_owned(),
+                ),
+                ("SUMER_FIXTURE_RUN".to_owned(), "0".to_owned()),
+            ],
+        )
+        .await
+        .unwrap_or_else(|e| panic!("could not spawn {adapter:?}: {e}"));
+        handle
+            .history_read(vec![sumer_wire::ResourceQuery {
+                resource_id: "checking-1".to_owned(),
+                page: None,
+            }])
+            .await
+            .unwrap_or_else(|e| panic!("{adapter:?}: history.read failed: {e}"))
+            .observations
+            .into_iter()
+            .map(|o| o.local_id)
+            .collect()
+    }
+
+    let honest = undiscovered_read(&root.join("adapters/fake/fake_adapter.py"), &fixture).await;
+    assert!(
+        !honest.is_empty(),
+        "the honest adapter must answer an undiscovered read with real data, else this check \
+         proves nothing"
+    );
+    for wrapper in [
+        "empty_without_discovery.py",
+        "ids_prefixed_without_discovery.py",
+    ] {
+        let broken =
+            undiscovered_read(&mutations_dir().join("adapters").join(wrapper), &fixture).await;
+        assert_ne!(
+            broken, honest,
+            "{wrapper} no longer diverges from the honest adapter on a connection that skips \
+             resources.list -- its mutant is declared EQUIVALENT and can no longer fire, so it \
+             is guarding nothing"
+        );
+    }
+}

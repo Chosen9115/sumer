@@ -288,71 +288,90 @@
         }
       }
     ],
-    "balances": {
-      "fdx-checking-1": [
-        {
-          "category": "currentBalance",
-          "canonical_hint": "total",
-          "amount": {
-            "asset": "USD",
-            "amount": "1234.56"
+    "ledger": {
+      "fdx-checking-1": {
+        "balances": [
+          {
+            "category": "currentBalance",
+            "canonical_hint": "total",
+            "amount": {
+              "asset": "USD",
+              "amount": "1234.56"
+            }
+          },
+          {
+            "category": "availableBalance",
+            "canonical_hint": "available",
+            "amount": {
+              "asset": "USD",
+              "amount": "1200.00"
+            }
           }
-        },
-        {
-          "category": "availableBalance",
-          "canonical_hint": "available",
-          "amount": {
-            "asset": "USD",
-            "amount": "1200.00"
+        ],
+        "history": [
+          {
+            "local_id": "fdx-checking-1:txn-0001",
+            "provider_id": "txn-0001",
+            "state": "active",
+            "surface": "fdx",
+            "posting": "pending",
+            "raw_sign": "provider_negative",
+            "amount": {
+              "asset": "USD",
+              "amount": "-42.50"
+            },
+            "provider_extra": {
+              "fdx_status": "PENDING",
+              "fdx_debitCreditMemo": "DEBIT",
+              "fdx_amount_unsigned": "42.50",
+              "fdx_transactionTimestamp": "2026-09-01T10:00:00Z"
+            }
+          },
+          {
+            "local_id": "fdx-checking-1:txn-0002",
+            "provider_id": "txn-0002",
+            "state": "active",
+            "surface": "fdx",
+            "posting": "posted",
+            "raw_sign": "provider_negative",
+            "amount": {
+              "asset": "USD",
+              "amount": "1500.00"
+            },
+            "provider_extra": {
+              "fdx_status": "POSTED",
+              "fdx_debitCreditMemo": "CREDIT",
+              "fdx_amount_unsigned": "1500.00",
+              "fdx_postedTimestamp": "2026-08-31T09:00:00Z",
+              "fdx_transactionTimestamp": "2026-08-31T09:00:00Z"
+            }
+          },
+          {
+            "local_id": "fdx-checking-1:txn-0003",
+            "provider_id": "txn-0003",
+            "state": "active",
+            "surface": "fdx",
+            "posting": "unknown",
+            "raw_sign": "provider_negative",
+            "amount": {
+              "asset": "USD",
+              "amount": "-75.00"
+            },
+            "provider_extra": {
+              "fdx_status": "AUTHORIZATION",
+              "fdx_debitCreditMemo": "DEBIT",
+              "fdx_amount_unsigned": "75.00",
+              "fdx_transactionTimestamp": "2026-09-03T11:00:00Z"
+            }
           }
-        }
-      ]
+        ]
+      }
     },
-    "history_live_set": {
+    "live": {
       "fdx-checking-1": [
-        {
-          "local_id": "fdx-checking-1:txn-0001",
-          "posting": "pending",
-          "amount": {
-            "asset": "USD",
-            "amount": "-42.50"
-          },
-          "provider_extra": {
-            "fdx_status": "PENDING",
-            "fdx_debitCreditMemo": "DEBIT",
-            "fdx_amount_unsigned": "42.50",
-            "fdx_transactionTimestamp": "2026-09-01T10:00:00Z"
-          }
-        },
-        {
-          "local_id": "fdx-checking-1:txn-0002",
-          "posting": "posted",
-          "amount": {
-            "asset": "USD",
-            "amount": "1500.00"
-          },
-          "provider_extra": {
-            "fdx_status": "POSTED",
-            "fdx_debitCreditMemo": "CREDIT",
-            "fdx_amount_unsigned": "1500.00",
-            "fdx_postedTimestamp": "2026-08-31T09:00:00Z",
-            "fdx_transactionTimestamp": "2026-08-31T09:00:00Z"
-          }
-        },
-        {
-          "local_id": "fdx-checking-1:txn-0003",
-          "posting": "unknown",
-          "amount": {
-            "asset": "USD",
-            "amount": "-75.00"
-          },
-          "provider_extra": {
-            "fdx_status": "AUTHORIZATION",
-            "fdx_debitCreditMemo": "DEBIT",
-            "fdx_amount_unsigned": "75.00",
-            "fdx_transactionTimestamp": "2026-09-03T11:00:00Z"
-          }
-        }
+        "fdx-checking-1:txn-0001",
+        "fdx-checking-1:txn-0002",
+        "fdx-checking-1:txn-0003"
       ]
     },
     "fdx_field_map": {
@@ -375,6 +394,6 @@
       "_removed_from_6.3_draft": "account.balanceAsOf, transactions[].accountId, and transactions[].currency all appeared in an earlier draft of this payload sourced from Plaid's browsable 6.3 docs. None exist on 6.4's DepositAccount/Transaction schema objects: balanceAsOf is real in 6.4 but only on InvestmentAccount (not DepositAccount); Transaction carries no accountId at all (the account is scoped by the request path, /accounts/{accountId}/transactions, not repeated per-transaction); Transaction carries no currency field (only foreignCurrency, paired with foreignAmount, for the foreign-amount case this fixture does not exercise). All three were removed from the payload rather than kept as 6.3-only fields, per Ruling A6: 6.4 wins.",
       "balances.read observation.provenance.observed_at": "NOT an FDX-sourced mapping: 6.4's DepositAccount has no per-balance timestamp field (unlike InvestmentAccount's balanceAsOf). Provenance.observed_at is adapter-claimed evidence (spec/observation.md section 1), so this adapter stamps its own fetch-time clock reading here -- there is no source field to lose, so this is not a Lossy entry."
     },
-    "notes": "Every FDX field named in fdx_field_map lands somewhere named there -- either as a first-class Sumer field or, for anything without a Sumer equivalent (account type/category/nickname/masked number, the untouched unsigned amount, the raw debitCreditMemo and status strings), verbatim in provider_extra with an fdx_-prefixed key so it is visibly provenance rather than a Sumer concept. That claim is now MACHINE-CHECKED in both directions: the runner scans every provider_extra.<key> the map names and requires it to have arrived on the wire (nothing is silently dropped), and requires every provider_extra key that DID arrive to be named by the map (nothing arrives undocumented). expect.resources and expect.history_live_set additionally pin each provider_extra's full contents EXACTLY -- key sets and values both -- so a dropped or mangled value fails as loudly as a dropped key. spec/fdx-6.4-mapping.md's LOSSY column, gated by this fixture, is therefore empty for every row this fixture covers because the suite says so, not because the prose does. The prose in each fdx_field_map value stays documentation: the runner reads the provider_extra.<key> targets out of it and nothing else."
+    "notes": "Every FDX field named in fdx_field_map lands somewhere named there -- either as a first-class Sumer field or, for anything without a Sumer equivalent (account type/category/nickname/masked number, the untouched unsigned amount, the raw debitCreditMemo and status strings), verbatim in provider_extra with an fdx_-prefixed key so it is visibly provenance rather than a Sumer concept. That claim is now MACHINE-CHECKED in both directions: the runner scans every provider_extra.<key> the map names and requires it to have arrived on the wire (nothing is silently dropped), and requires every provider_extra key that DID arrive to be named by the map (nothing arrives undocumented). The direction that catches an undocumented key reads every provider_extra the adapter emitted ANYWHERE -- the resources.list descriptor and every observation in expect.ledger's sequences, not only the records that survived folding -- so a key smuggled in on a row that is later superseded or tombstoned is still a key that arrived undocumented. expect.ledger additionally pins each provider_extra's full contents EXACTLY -- key sets and values both -- so a dropped or mangled value fails as loudly as a dropped key, and pins the three transactions' ORDER, which a live-set membership list could not: the AUTHORIZATION row arriving before the POSTED one is a different history, and the same three keys. spec/fdx-6.4-mapping.md's LOSSY column, gated by this fixture, is therefore empty for every row this fixture covers because the suite says so, not because the prose does. The prose in each fdx_field_map value stays documentation: the runner reads the provider_extra.<key> targets out of it and nothing else."
   }
 }

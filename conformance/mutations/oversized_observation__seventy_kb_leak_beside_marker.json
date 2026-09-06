@@ -1,0 +1,19 @@
+{
+  "fixture": "oversized_observation",
+  "assertions": [
+    "A2",
+    "A7",
+    "A10"
+  ],
+  "covers": [
+    "A10"
+  ],
+  "why": "70 KB of the discarded payload is left sitting beside {_truncated, _original_bytes}. The marker is present and correct, so a SUBSET comparison of provider_extra passes while the observation is still far over MAX_OBSERVATION_BYTES -- this is one of the seven, verbatim. Three assertions answer, and all three are the leak: A10 measures the adapter's own frame, the host then omits the record so the ledger loses it (A2), and the host's OWN degrade report names big-truncatable where the fixture says big-untruncatable (A7). The last one is the tell that a host is remediating for an adapter that skipped the degrade.",
+  "adapter": "leak_beside_marker.py",
+  "patch": [
+    {
+      "path": "/script/runs/0/leak_bytes",
+      "value": 70000
+    }
+  ]
+}

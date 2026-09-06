@@ -1,0 +1,14 @@
+{
+  "fixture": "pending_to_posted",
+  "assertions": [
+    "A2"
+  ],
+  "why": "The posted observation carries 42.38 where the provider reported 42.37. One cent, inside a record whose local_id, order and every other field are untouched: if the ledger's per-entry comparison ever degrades to comparing identities, this is what walks through it.",
+  "adapter": null,
+  "patch": [
+    {
+      "path": "/script/runs/0/on/history.read/1/do/0/body/observations/0/amount/amount",
+      "value": "42.38"
+    }
+  ]
+}

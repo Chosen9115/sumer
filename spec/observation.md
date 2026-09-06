@@ -19,26 +19,30 @@ Every observation — a balance line or a history entry — carries a `Provenanc
 
 **`received_at` is host-stamped. An adapter that sends it gets
 `invalid_request`.** The host writes this timestamp itself, at the moment it
-receives the frame, using its own clock. **`observed_at` is adapter-claimed and
-is evidence only** — it is the adapter's own account of when the provider
-observed the value, carried through unmodified, and is never treated as ground
-truth for freshness decisions.
+receives the frame, using its own clock. It is the host's receipt stamp —
+evidence of when the bytes arrived, kept for the audit trail — and it is the
+input a future cache layer will classify a *replayed* observation's staleness
+from (see below). **It is not an input to how staleness is computed today**:
+this milestone reads no observation twice, so nothing yet needs to ask
+`received_at` "is this still fresh."
 
-**Staleness is computed by the host from `received_at`, never from
-`observed_at`.** Why this split is load-bearing rather than a style choice: if
-staleness were computed from an adapter-supplied timestamp, an adapter with a
-skewed system clock — or a compromised or simply buggy one that lies about
-when it observed something — would silently control whether the host displays
-data as `Live` or `Cached`. A skewed clock a few hours fast makes genuinely
-stale data look fresh; a skewed clock a few hours slow makes fresh data look
-stale; either way the host would be trusting a value it has no way to verify.
-By computing staleness only from the host's own receipt time, the worst an
-adapter's clock can do is make its `observed_at` evidence less useful — it can
-never make the host misrepresent freshness.
+**`observed_at` is adapter-claimed and is evidence only** — it is the
+adapter's own account of when the provider observed the value, carried
+through unmodified. **It is never an input to freshness, at any point,
+present or future.** Why this split is load-bearing rather than a style
+choice: if staleness read an adapter-supplied timestamp at all, an adapter
+with a skewed system clock — or a compromised or simply buggy one that lies
+about when it observed something — would silently control whether the host
+displays data as `Live` or `Cached`. A skewed clock a few hours fast makes
+genuinely stale data look fresh; a skewed clock a few hours slow makes fresh
+data look stale; either way the host would be trusting a value it has no way
+to verify. Keeping `observed_at` out of freshness entirely means the worst an
+adapter's clock can do is make its own evidence less useful — it can never
+make the host misrepresent freshness.
 
-**How the host computes it.** Staleness is derived per resource, from that
-resource's own `status` outcome (§6) in the **same reply** the observation
-arrived in:
+**How the host computes it.** Staleness is derived from the resource's own
+`status` outcome (§6) in the **same reply** the observation arrived in —
+never from a timestamp comparison on either side:
 
 | That resource's outcome | Staleness stamped on its observations |
 |---|---|
@@ -51,16 +55,17 @@ Host-stamped has never meant host-invented. An adapter that answers
 what it is handing over is not current; stamping `Live` over that would be
 the host overruling evidence it went and asked for. What the adapter still
 cannot do is *name the staleness itself* — there is no `staleness` field on
-the wire, and an adapter that sends one gets `invalid_request` — so a skewed
-or lying clock still cannot make stale data look fresh. `observed_at` is not
-an input to this at any point.
+the wire, and an adapter that sends one gets `invalid_request`.
 
 Everything not covered by that table is `Live`, and honestly so: those
 observations were read off the wire moments earlier. This milestone has no
 cache layer, so nothing yet replays a stored observation. A host that starts
-doing so MUST classify what it replays from the **stored** `received_at`,
-per the rule above; that is a wider computation than this table, not a
-different one.
+doing so MUST classify what it replays from the **stored** `received_at` —
+comparing it against some freshness threshold to decide `Live` vs. `Cached`,
+which is exactly why `received_at` is host-stamped and retained at all rather
+than discarded once a reply is decoded. That comparison is a wider
+computation than this table, not a different one — and `observed_at` still
+plays no part in it.
 
 ## 2. Balances
 

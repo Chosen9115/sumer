@@ -1,0 +1,17 @@
+{
+  "fixture": "large_amounts",
+  "assertions": [
+    "A1"
+  ],
+  "covers": [
+    "A1"
+  ],
+  "why": "uint256::MAX comes back as the value an IEEE-754 double round-trips to: the same 78 digits, the same magnitude, the low 60-odd digits gone. cmp_same_asset must call this NOT equal -- a comparison that tolerated 'close' would certify a float-backed decoder.",
+  "adapter": null,
+  "patch": [
+    {
+      "path": "/script/runs/0/on/balances.read/0/do/0/body/observations/0/amount/amount",
+      "value": "115792089237316200000000000000000000000000000000000000000000000000000000000000"
+    }
+  ]
+}

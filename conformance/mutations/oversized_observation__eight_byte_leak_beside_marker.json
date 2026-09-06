@@ -1,0 +1,17 @@
+{
+  "fixture": "oversized_observation",
+  "assertions": [
+    "A2"
+  ],
+  "covers": [
+    "A10"
+  ],
+  "why": "The same leak, eight bytes long. It is under the cap, so the size measurement is silent and ONLY the exact (never subset) comparison of provider_extra can catch it. If that comparison is ever relaxed back, the 70 KB mutant still dies and this one walks.",
+  "adapter": "leak_beside_marker.py",
+  "patch": [
+    {
+      "path": "/script/runs/0/leak_bytes",
+      "value": 8
+    }
+  ]
+}

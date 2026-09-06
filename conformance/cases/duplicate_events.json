@@ -187,7 +187,8 @@
   "expect": {
     "assertions": [
       "A2",
-      "A8"
+      "A8",
+      "A9"
     ],
     "resources": [
       {
@@ -195,61 +196,67 @@
         "kind": "onchain_wallet"
       }
     ],
-    "history_live_set": {
+    "ledger": {
+      "wallet-multi": {
+        "balances": [
+          {
+            "category": "available",
+            "canonical_hint": "available",
+            "amount": {
+              "asset": "sat",
+              "amount": "300000"
+            }
+          }
+        ],
+        "history": [
+          {
+            "local_id": "wallet-multi:primary:tx_123",
+            "provider_id": "tx_123",
+            "state": "active",
+            "surface": "primary",
+            "posting": "posted",
+            "amount": {
+              "asset": "sat",
+              "amount": "100000"
+            },
+            "raw_sign": "provider_positive",
+            "provider_extra": {}
+          },
+          {
+            "local_id": "wallet-multi:secondary:tx_123",
+            "provider_id": "tx_123",
+            "state": "active",
+            "surface": "secondary",
+            "posting": "posted",
+            "amount": {
+              "asset": "sat",
+              "amount": "200000"
+            },
+            "raw_sign": "provider_positive",
+            "provider_extra": {}
+          },
+          {
+            "local_id": "wallet-multi:primary:tx_123",
+            "provider_id": "tx_123",
+            "state": "active",
+            "surface": "primary",
+            "posting": "posted",
+            "amount": {
+              "asset": "sat",
+              "amount": "100000"
+            },
+            "raw_sign": "provider_positive",
+            "provider_extra": {}
+          }
+        ]
+      }
+    },
+    "live": {
       "wallet-multi": [
-        {
-          "local_id": "wallet-multi:primary:tx_123",
-          "state": "active",
-          "posting": "posted",
-          "amount": {
-            "asset": "sat",
-            "amount": "100000"
-          }
-        },
-        {
-          "local_id": "wallet-multi:secondary:tx_123",
-          "state": "active",
-          "posting": "posted",
-          "amount": {
-            "asset": "sat",
-            "amount": "200000"
-          }
-        }
+        "wallet-multi:primary:tx_123",
+        "wallet-multi:secondary:tx_123"
       ]
     },
-    "chains": {
-      "wallet-multi:primary:tx_123": [
-        {
-          "provider_id": "tx_123",
-          "surface": "primary",
-          "amount": {
-            "asset": "sat",
-            "amount": "100000"
-          }
-        },
-        {
-          "provider_id": "tx_123",
-          "surface": "primary",
-          "amount": {
-            "asset": "sat",
-            "amount": "100000"
-          }
-        }
-      ],
-      "wallet-multi:secondary:tx_123": [
-        {
-          "provider_id": "tx_123",
-          "surface": "secondary",
-          "amount": {
-            "asset": "sat",
-            "amount": "200000"
-          }
-        }
-      ]
-    },
-    "live_set_size": {
-      "wallet-multi": 2
-    },
-    "notes": "The forbidden-rule guard: provider_id 'tx_123' appears on TWO DIFFERENT SURFACES ('primary' and 'secondary') naming two UNRELATED events (100000 sat vs 200000 sat) -- a coincidence the fixture makes deliberate. A host that dedups by provider_id alone (spec/wire.md c: 'DEDUP BY provider_id ALONE IS FORBIDDEN') collapses these into one event and reports a live set of size 1 (whichever observation arrived last wins), losing 100000 or 200000 sat's worth of history. The correct key is local_id, which already encodes the surface, so the live set has exactly 2 entries. Separately, wallet-multi:primary:tx_123 is ALSO emitted twice, byte-identically, simulating an idempotent provider re-send within the same page -- expect.chains lists both arrivals (A8: arrival order and count are retained even when content is unchanged), while the live set (A2) still shows exactly one live entry for that local_id since both arrivals describe the same final state."
+    "notes": "The forbidden-rule guard: provider_id 'tx_123' appears on TWO DIFFERENT SURFACES ('primary' and 'secondary') naming two UNRELATED events (100000 sat vs 200000 sat) -- a coincidence the fixture makes deliberate. A host that dedups by provider_id alone (spec/wire.md c: 'DEDUP BY provider_id ALONE IS FORBIDDEN') collapses these into one event, and expect.live -- DECLARED as two entries, not derived by folding this ledger -- says so. The correct key is local_id, which already encodes the surface.\n\nThe third history entry is wallet-multi:primary:tx_123 AGAIN, byte-identical: an idempotent provider re-send inside one page. The ledger is a SEQUENCE, so all three arrivals are declared in arrival order and the re-send is retained (A8) rather than collapsed -- while the live set still holds exactly one entry for that local_id, since both arrivals describe the same state. Sequence equality is also what makes the second-run id swap visible: swapping the two local_ids leaves the id SET, the counts and the live set all identical, and only the id-to-record association in this ordered sequence contradicts it (A9)."
   }
 }

@@ -1,0 +1,22 @@
+{
+  "fixture": "interrupted_pagination",
+  "assertions": [
+    "A2",
+    "A5"
+  ],
+  "covers": [
+    "A5"
+  ],
+  "why": "The resumed process re-emits e3 and e4 with the right local_ids and the wrong money. The live set folded across the kill and the resume then has identical KEYS to the uninterrupted one -- which is precisely what the old A5 compared, and precisely why it could not see this.",
+  "adapter": null,
+  "patch": [
+    {
+      "path": "/script/runs/2/on/history.read/0/do/0/body/observations/0/amount/amount",
+      "value": "39999"
+    },
+    {
+      "path": "/script/runs/2/on/history.read/1/do/0/body/observations/0/amount/amount",
+      "value": "49999"
+    }
+  ]
+}

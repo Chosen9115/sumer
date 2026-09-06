@@ -1,0 +1,20 @@
+{
+  "fixture": "null_category",
+  "assertions": [
+    "A1"
+  ],
+  "covers": [
+    "A3"
+  ],
+  "why": "The held balance the provider could not report comes back as 0.00 instead of null. A zero is a claim -- it says the money is not there -- and this is the mutation that proves an unknown amount is not satisfied by an asserted zero.",
+  "adapter": null,
+  "patch": [
+    {
+      "path": "/script/runs/0/on/balances.read/0/do/0/body/observations/0/amount",
+      "value": {
+        "asset": "USD",
+        "amount": "0.00"
+      }
+    }
+  ]
+}

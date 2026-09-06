@@ -25,6 +25,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
+pub use mux::Exchange;
 use mux::Mux;
 use sumer_wire::{
     Balance, Degraded, ErrorBody, HelloParams, HelloReply, Observation, ProtocolViolationKind,
@@ -113,6 +114,9 @@ pub struct AdapterHandle {
     hello: HelloReply,
     default_deadline: Duration,
     kill_tx: tokio::sync::mpsc::Sender<Option<ProtocolViolationKind>>,
+    /// `None` unless this handle was built with [`AdapterHandle::spawn_recorded`]
+    /// (or its `_with_deadline` sibling) -- see [`AdapterHandle::transcript`].
+    transcript: Option<Arc<mux::Transcript>>,
 }
 
 impl Drop for AdapterHandle {
@@ -155,11 +159,49 @@ impl AdapterHandle {
         extra_env: impl IntoIterator<Item = (String, String)>,
         default_deadline: Duration,
     ) -> Result<AdapterHandle, HostError> {
+        AdapterHandle::spawn_impl(argv, extra_env, default_deadline, false).await
+    }
+
+    /// As [`AdapterHandle::spawn`], additionally recording every
+    /// request/reply that crosses this connection so the conformance
+    /// suite can derive raw wire evidence from the same execution that
+    /// produces the typed reads below -- see [`AdapterHandle::transcript`]
+    /// and [`mux::Transcript`]. Production adapters never call this: it
+    /// exists only for the suite.
+    pub async fn spawn_recorded(
+        argv: Vec<String>,
+        extra_env: impl IntoIterator<Item = (String, String)>,
+    ) -> Result<AdapterHandle, HostError> {
+        AdapterHandle::spawn_recorded_with_deadline(argv, extra_env, DEFAULT_DEADLINE).await
+    }
+
+    /// As [`AdapterHandle::spawn_recorded`], with an explicit default
+    /// deadline instead of [`DEFAULT_DEADLINE`] -- see
+    /// [`AdapterHandle::spawn_with_deadline`].
+    pub async fn spawn_recorded_with_deadline(
+        argv: Vec<String>,
+        extra_env: impl IntoIterator<Item = (String, String)>,
+        default_deadline: Duration,
+    ) -> Result<AdapterHandle, HostError> {
+        AdapterHandle::spawn_impl(argv, extra_env, default_deadline, true).await
+    }
+
+    async fn spawn_impl(
+        argv: Vec<String>,
+        extra_env: impl IntoIterator<Item = (String, String)>,
+        default_deadline: Duration,
+        recorded: bool,
+    ) -> Result<AdapterHandle, HostError> {
         let spawned =
             process::spawn(&argv, extra_env).map_err(|e| HostError::Spawn(e.to_string()))?;
 
         let (kill_tx, kill_rx) = tokio::sync::mpsc::channel(1);
-        let mux = Mux::spawn(spawned.stdin, kill_tx.clone());
+        let (mux, transcript) = if recorded {
+            let (mux, transcript) = Mux::spawn_recorded(spawned.stdin, kill_tx.clone());
+            (mux, Some(transcript))
+        } else {
+            (Mux::spawn(spawned.stdin, kill_tx.clone()), None)
+        };
         let reader = tokio::spawn(mux::read_loop(mux.clone(), spawned.stdout, kill_tx.clone()));
         tokio::spawn(process::supervise(
             spawned.child,
@@ -230,12 +272,25 @@ impl AdapterHandle {
             hello,
             default_deadline,
             kill_tx,
+            transcript,
         })
     }
 
     #[must_use]
     pub fn hello(&self) -> &HelloReply {
         &self.hello
+    }
+
+    /// A snapshot of every request/reply recorded on this connection so
+    /// far, in dispatch order -- empty unless this handle was built with
+    /// [`AdapterHandle::spawn_recorded`] (or its `_with_deadline`
+    /// sibling), which is the only case that ever populates it.
+    #[must_use]
+    pub fn transcript(&self) -> Vec<Exchange> {
+        self.transcript
+            .as_ref()
+            .map(|t| t.snapshot())
+            .unwrap_or_default()
     }
 
     /// `resources.list`: no observations, no per-resource status (nothing

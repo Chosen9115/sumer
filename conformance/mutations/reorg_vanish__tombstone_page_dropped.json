@@ -1,0 +1,17 @@
+{
+  "fixture": "reorg_vanish",
+  "assertions": [
+    "A2"
+  ],
+  "covers": [
+    "A2"
+  ],
+  "why": "The middle page of the reorg chain -- the tombstone -- is dropped, so the adapter reports active then active and the vanish never happened. The final LIVE SET is byte-identical either way; only retaining the whole history in emission order can contradict it.",
+  "adapter": null,
+  "patch": [
+    {
+      "path": "/script/runs/0/on/history.read/1/do/0/body/observations",
+      "value": []
+    }
+  ]
+}

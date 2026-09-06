@@ -199,8 +199,12 @@
   },
   "expect": {
     "assertions": [
+      "A1",
       "A2",
-      "A8"
+      "A6",
+      "A8",
+      "A9",
+      "A10"
     ],
     "resources": [
       {
@@ -208,45 +212,52 @@
         "kind": "bank_checking"
       }
     ],
-    "history_live_set": {
-      "checking-1": [
-        {
-          "local_id": "checking-1:pend_abc",
-          "state": "active",
-          "posting": "posted",
-          "amount": {
-            "asset": "USD",
-            "amount": "42.37"
+    "ledger": {
+      "checking-1": {
+        "balances": [
+          {
+            "category": "available",
+            "canonical_hint": "available",
+            "amount": {
+              "asset": "USD",
+              "amount": "957.63"
+            }
+          }
+        ],
+        "history": [
+          {
+            "local_id": "checking-1:pend_abc",
+            "provider_id": "pend_abc",
+            "state": "active",
+            "posting": "pending",
+            "amount": {
+              "asset": "USD",
+              "amount": "42.00"
+            },
+            "raw_sign": "provider_negative",
+            "provider_extra": {}
           },
-          "raw_sign": "provider_negative"
-        }
+          {
+            "local_id": "checking-1:pend_abc",
+            "provider_id": "post_xyz",
+            "supersedes_provider_id": "pend_abc",
+            "state": "active",
+            "posting": "posted",
+            "amount": {
+              "asset": "USD",
+              "amount": "42.37"
+            },
+            "raw_sign": "provider_negative",
+            "provider_extra": {}
+          }
+        ]
+      }
+    },
+    "live": {
+      "checking-1": [
+        "checking-1:pend_abc"
       ]
     },
-    "chains": {
-      "checking-1:pend_abc": [
-        {
-          "local_id": "checking-1:pend_abc",
-          "provider_id": "pend_abc",
-          "state": "active",
-          "posting": "pending",
-          "amount": {
-            "asset": "USD",
-            "amount": "42.00"
-          }
-        },
-        {
-          "local_id": "checking-1:pend_abc",
-          "provider_id": "post_xyz",
-          "supersedes_provider_id": "pend_abc",
-          "state": "active",
-          "posting": "posted",
-          "amount": {
-            "asset": "USD",
-            "amount": "42.37"
-          }
-        }
-      ]
-    },
-    "notes": "pending and posted share ONE stable local_id; only provider_id changes. Deriving local_id from provider_id would break exactly here, because provider_id is what changes at posting -- which is why the contract forbids dedup by provider_id alone. supersedes_provider_id is audit evidence, not folding input: the fold keys on local_id."
+    "notes": "pending and posted share ONE stable local_id; only provider_id changes. Deriving local_id from provider_id would break exactly here, because provider_id is what changes at posting -- which is why the contract forbids dedup by provider_id alone. supersedes_provider_id is audit evidence, not folding input: the fold keys on local_id. expect.ledger states the ORDER the two observations must arrive in (pending BEFORE posted), which a live-set membership check could not: swap the two pages and the live set is still one entry with the same local_id. expect.live is DECLARED, not derived by folding expect.ledger -- deriving it would compare Fold against itself."
   }
 }

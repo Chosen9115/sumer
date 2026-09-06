@@ -172,19 +172,26 @@ mod tests {
 
     #[tokio::test]
     async fn an_established_violation_outranks_a_process_that_already_exited() {
-        // The deterministic form of the race: the child is already gone
-        // (so `child.wait()` is the only ready branch when `supervise`
-        // starts), and the reader loop publishes the violation it read out
-        // of the child's last bytes a moment later. An adapter that emits
-        // a malformed frame and exits in the same breath produces exactly
-        // this schedule; `AdapterCrashed` would then latch first and the
+        // No sleep: this is deliberately a race, not a fixed schedule, and
+        // it is deterministic anyway. `supervise`'s `child.wait()` branch
+        // awaits the reader task's `JoinHandle` before it ever calls
+        // `kill_rx.try_recv()` -- so if that branch wins the race, the
+        // reader (below) has *already* published its violation by the
+        // time `try_recv` runs, by construction of the join, not by
+        // timing. If the `kill_rx.recv()` branch wins instead, it reads
+        // the same `Some(kind)` message directly. Both branches publish
+        // `Terminal::Violation` either way, so which one actually wins
+        // this particular run cannot change the outcome -- which is
+        // exactly what makes a wall-clock sleep unnecessary here: an
+        // adapter that emits a malformed frame and exits in the same
+        // breath must not have `AdapterCrashed` latch first and reject the
         // truer reason -- the host killed it for a violation it can name
-        // -- would be rejected as a late second opinion.
+        // -- as a late second opinion, regardless of which branch the
+        // scheduler happens to pick.
         let spawned = spawn(&["true".to_owned()], std::iter::empty()).unwrap();
         let (kill_tx, kill_rx) = tokio::sync::mpsc::channel(1);
         let mux = Mux::spawn(spawned.stdin, kill_tx.clone());
         let reader = tokio::spawn(async move {
-            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
             let _ = kill_tx
                 .send(Some(sumer_wire::ProtocolViolationKind::NotJson))
                 .await;

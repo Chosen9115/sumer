@@ -1,0 +1,17 @@
+{
+  "fixture": "protocol_violations",
+  "assertions": [
+    "A11"
+  ],
+  "covers": [
+    "OversizeFrame"
+  ],
+  "why": "The padded reply shrinks from 1.2 MB to a few hundred bytes: a valid, correctly-shaped balances.read reply that is simply not oversized. MAX_FRAME_BYTES has to be enforced on raw byte length independently of validity, and this is what proves the check is measuring length at all.",
+  "adapter": null,
+  "patch": [
+    {
+      "path": "/script/runs/3/on/balances.read/0/do/0/pad/0/bytes",
+      "value": 100
+    }
+  ]
+}

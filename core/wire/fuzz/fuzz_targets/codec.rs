@@ -8,12 +8,13 @@
 //!     (enforced by construction: `FrameDecoder::new` reserves exactly that
 //!     capacity once and never grows it further);
 //!   - split-invariance: feeding the fuzz input as one chunk and as a
-//!     sequence of 1-byte chunks must produce the same number of frames and
-//!     agree on whether a violation occurred.
+//!     sequence of 1-byte chunks must produce the identical frame sequence
+//!     (contents, not just a matching count) and agree on the exact
+//!     violation, if any (its `kind`, not just whether one occurred).
 //!
-//! Run with `cargo fuzz run codec` from `core/wire/fuzz/` (requires the
-//! `cargo-fuzz` subcommand and a nightly toolchain -- see this crate's PR
-//! report for why that could not be exercised in this environment).
+//! Run with `cargo fuzz run codec` from `core/wire/` (requires the
+//! `cargo-fuzz` subcommand and a nightly toolchain; wired into
+//! `.github/workflows/nightly.yml`).
 
 #![no_main]
 
@@ -35,14 +36,18 @@ fuzz_target!(|data: &[u8]| {
         split_result = split.push(std::slice::from_ref(byte), &mut split_frames);
     }
 
+    // Contents, not just counts: a decoder that mangles a frame's bytes
+    // while still splitting the input into the right number of pieces
+    // must not pass. Likewise the violation's exact `kind`, not just
+    // whether one occurred at all -- a decoder that reports the right
+    // *number* of errors but classifies one of them wrong (`NotJson`
+    // where the other found `NonUtf8`, say) must not pass either.
     assert_eq!(
-        whole_frames.len(),
-        split_frames.len(),
-        "whole-input and byte-by-byte decoding produced different frame counts"
+        whole_frames, split_frames,
+        "whole-input and byte-by-byte decoding produced different frame contents"
     );
     assert_eq!(
-        whole_result.is_err(),
-        split_result.is_err(),
-        "whole-input and byte-by-byte decoding disagreed on whether a violation occurred"
+        whole_result, split_result,
+        "whole-input and byte-by-byte decoding disagreed on the violation"
     );
 });

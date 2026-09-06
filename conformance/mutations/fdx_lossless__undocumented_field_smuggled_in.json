@@ -1,0 +1,17 @@
+{
+  "fixture": "fdx_lossless",
+  "assertions": [
+    "A1"
+  ],
+  "covers": [
+    "A1"
+  ],
+  "why": "An extra provider_extra key rides in on the resource that the FDX mapping table documents nowhere. The table is checked in both directions on purpose -- 'nothing is silently dropped' AND 'nothing arrives undocumented' -- and only the second direction can see a field nobody wrote down.",
+  "adapter": null,
+  "patch": [
+    {
+      "path": "/script/runs/0/on/resources.list/0/do/0/body/resources/0/provider_extra/fdx_undocumented_extra",
+      "value": "a field the mapping table never mentions"
+    }
+  ]
+}

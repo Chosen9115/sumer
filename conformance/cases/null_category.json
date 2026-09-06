@@ -142,23 +142,29 @@
         "kind": "bank_checking"
       }
     ],
-    "balances": {
-      "checking-4": [
-        {
-          "category": "held",
-          "canonical_hint": "held",
-          "amount": null
-        },
-        {
-          "category": "available",
-          "canonical_hint": "available",
-          "amount": {
-            "asset": "USD",
-            "amount": "612.44"
+    "ledger": {
+      "checking-4": {
+        "balances": [
+          {
+            "category": "held",
+            "canonical_hint": "held",
+            "amount": null
+          },
+          {
+            "category": "available",
+            "canonical_hint": "available",
+            "amount": {
+              "asset": "USD",
+              "amount": "612.44"
+            }
           }
-        }
-      ]
+        ],
+        "history": []
+      }
     },
-    "notes": "Exactly one category (held) is null -- UNKNOWN, never zero -- and exactly one (available) carries an asserted non-null value. A host that emits null for every category (or defaults an absent/unparseable amount to null across the board) passes a naive 'is amount ever null' check but fails here because 'available' MUST come through as exactly 612.44, not null and not 0.00. Conversely a host that treats every category as a plain number and coerces the null 'held' entry to 0 (Unknown != zero, spec/wire.md c) also fails."
+    "live": {
+      "checking-4": []
+    },
+    "notes": "Exactly one category (held) is null -- UNKNOWN, never zero -- and exactly one (available) carries an asserted non-null value. A host that emits null for every category (or defaults an absent/unparseable amount to null across the board) passes a naive 'is amount ever null' check but fails here because 'available' MUST come through as exactly 612.44, not null and not 0.00. Conversely a host that treats every category as a plain number and coerces the null 'held' entry to 0 (Unknown != zero, spec/wire.md c) also fails. As an ordered ledger the sequence is also an order claim: held (unknown) BEFORE available (612.44), exactly two lines, nothing else. History and live set are empty and declared so."
   }
 }

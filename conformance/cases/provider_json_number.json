@@ -208,7 +208,8 @@
   },
   "expect": {
     "assertions": [
-      "A1"
+      "A1",
+      "A4"
     ],
     "resources": [
       {
@@ -216,43 +217,48 @@
         "kind": "onchain_wallet"
       }
     ],
-    "balances": {
-      "wallet-decimal": [
-        {
-          "category": "token_balance_wei_bare_int",
-          "canonical_hint": null,
-          "amount": {
-            "asset": "eth-wei",
-            "amount": "115792089237316195423570985008687907853269984665640564039457584007913129639935"
+    "ledger": {
+      "wallet-decimal": {
+        "balances": [
+          {
+            "category": "token_balance_wei_bare_int",
+            "canonical_hint": null,
+            "amount": {
+              "asset": "eth-wei",
+              "amount": "115792089237316195423570985008687907853269984665640564039457584007913129639935"
+            }
+          },
+          {
+            "category": "token_balance_wei_float_token",
+            "canonical_hint": null,
+            "amount": {
+              "asset": "eth-wei-reported-as-float",
+              "amount": "115792089237316195423570985008687907853269984665640564039457584007913129639935.0"
+            }
+          },
+          {
+            "category": "precise_fraction",
+            "canonical_hint": null,
+            "amount": {
+              "asset": "USDC-precise",
+              "amount": "123456789012345678.987654321"
+            }
+          },
+          {
+            "category": "high_precision_debit",
+            "canonical_hint": null,
+            "amount": {
+              "asset": "USD",
+              "amount": "-12345678901234567890123456789.01"
+            }
           }
-        },
-        {
-          "category": "token_balance_wei_float_token",
-          "canonical_hint": null,
-          "amount": {
-            "asset": "eth-wei-reported-as-float",
-            "amount": "115792089237316195423570985008687907853269984665640564039457584007913129639935.0"
-          }
-        },
-        {
-          "category": "precise_fraction",
-          "canonical_hint": null,
-          "amount": {
-            "asset": "USDC-precise",
-            "amount": "123456789012345678.987654321"
-          }
-        },
-        {
-          "category": "high_precision_debit",
-          "canonical_hint": null,
-          "amount": {
-            "asset": "USD",
-            "amount": "-12345678901234567890123456789.01"
-          }
-        }
-      ]
+        ],
+        "history": []
+      }
     },
-    "notes": "Two separate things are proven here, and neither is prose.\n\n(1) EXACTNESS THROUGH THE ADAPTER. The raw provider payload is embedded in THIS fixture as an escaped JSON STRING (script.on.balances\\.read[0].do[0].provider_payload_json) specifically so the outer conformance-runner's own JSON parsing of THIS fixture file never touches the float tokens either. fake_adapter.py parses that string itself with json.loads(text, parse_float=Decimal) and formats every extracted value with format(d, 'f') per spec/money.md section 3. Four tokens, four shapes: a bare 78-digit JSON integer (Python's json module hands this straight to int(), arbitrary precision); the SAME 78-digit magnitude written with a trailing '.0' so the scanner classifies it as a float token and parse_float actually engages (an IEEE-754 double provably cannot round-trip it); a 27-significant-digit decimal fraction (float(...) truncates it to '123456789012345680'); and a 31-significant-digit DEBIT that the adapter must NEGATE. That last one is a decimal-context trap rather than a float trap and no earlier fixture had one: Python's default context rounds at 28 digits, so `-d` silently yields -12345678901234567890123456790 while copy_negate() yields the exact -12345678901234567890123456789.01. expect.grammar_check pins the digit count and scale so the rounding cannot pass as 'close enough'.\n\n(2) A BARE JSON NUMBER ON THE WIRE IS REJECTED. The second balances.read on this same connection replies with a body written to stdout VERBATIM (reply_ok_raw), carrying \"amount\": {\"asset\": \"USD\", \"amount\": 10.25} -- a JSON NUMBER, not a string, exactly where an AmountWire belongs. spec/money.md section 2 requires that to be rejected AT THE DESERIALIZER, before any Sumer-specific validation runs, because a JSON number is an IEEE-754 double by definition. expect.envelope_errors requires err.code=invalid_request for the whole reply, and the runner then re-issues resources.list to prove the rejection did not take the connection with it. Before this leg existed, this fixture's name promised a wire-level rule that only its prose asserted.",
+    "live": {
+      "wallet-decimal": []
+    },
     "grammar_check": {
       "high_precision_debit_digit_count": 31,
       "high_precision_debit_scale": 2,
@@ -262,6 +268,7 @@
       "wallet-decimal_balances_read": {
         "code": "invalid_request"
       }
-    }
+    },
+    "notes": "Two separate things are proven here, and neither is prose.\n\n(1) EXACTNESS THROUGH THE ADAPTER. The raw provider payload is embedded in THIS fixture as an escaped JSON STRING (script.on.balances\\.read[0].do[0].provider_payload_json) specifically so the outer conformance-runner's own JSON parsing of THIS fixture file never touches the float tokens either. fake_adapter.py parses that string itself with json.loads(text, parse_float=Decimal) and formats every extracted value with format(d, 'f') per spec/money.md section 3. Four tokens, four shapes: a bare 78-digit JSON integer (Python's json module hands this straight to int(), arbitrary precision); the SAME 78-digit magnitude written with a trailing '.0' so the scanner classifies it as a float token and parse_float actually engages (an IEEE-754 double provably cannot round-trip it); a 27-significant-digit decimal fraction (float(...) truncates it to '123456789012345680'); and a 31-significant-digit DEBIT that the adapter must NEGATE. That last one is a decimal-context trap rather than a float trap and no earlier fixture had one: Python's default context rounds at 28 digits, so `-d` silently yields -12345678901234567890123456790 while copy_negate() yields the exact -12345678901234567890123456789.01. expect.grammar_check pins the digit count and scale so the rounding cannot pass as 'close enough'.\n\n(2) A BARE JSON NUMBER ON THE WIRE IS REJECTED. The second balances.read on this same connection replies with a body written to stdout VERBATIM (reply_ok_raw), carrying \"amount\": {\"asset\": \"USD\", \"amount\": 10.25} -- a JSON NUMBER, not a string, exactly where an AmountWire belongs. spec/money.md section 2 requires that to be rejected AT THE DESERIALIZER, before any Sumer-specific validation runs, because a JSON number is an IEEE-754 double by definition. expect.envelope_errors requires err.code=invalid_request for the whole reply, and the runner then re-issues resources.list to prove the rejection did not take the connection with it. Before this leg existed, this fixture's name promised a wire-level rule that only its prose asserted.\n\n(3) THE LEDGER. The four amounts are declared as an ORDERED balances sequence of exactly four lines. A fifth line, a dropped line, or two lines swapped is a failure here on its own, independently of any digit being wrong. The second balances.read -- the bare-JSON-number leg -- is issued by expect.envelope_errors and its reply is rejected at the envelope, so it contributes nothing to this sequence; that is the point (a repaired reply shows up as a missing rejection, not as extra evidence). History and live set are empty and declared so."
   }
 }

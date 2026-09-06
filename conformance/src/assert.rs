@@ -16,7 +16,7 @@
 //! used.
 
 use serde_json::Value;
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use sumer_money::{Amount, AssetId};
 
 /// One failed assertion.
@@ -168,6 +168,188 @@ pub fn assert_status_coverage(
             format!("statuses names {extra:?}, which was never requested"),
         ));
     }
+}
+
+// ---------------------------------------------------------------------
+// Shared JSON shaping helpers. These used to live in `runner.rs`, where
+// only the drivers could reach them; `exec.rs` and `ledger.rs` judge the
+// same values and need the same rendering, so they live here with the
+// rest of the comparison primitives.
+// ---------------------------------------------------------------------
+
+/// A fixture that names an `expect` key in the wrong shape must fail
+/// loudly. Quietly returning instead is how an assertion stops being able
+/// to fail -- several of this suite's assertions had already got there by
+/// other routes.
+pub fn expect_object<'a>(
+    value: &'a Value,
+    what: &str,
+    failures: &mut Vec<Failure>,
+) -> Option<&'a serde_json::Map<String, Value>> {
+    value.as_object().or_else(|| {
+        failures.push(Failure::new(
+            "setup",
+            format!("{what} must be an object, got {}", brief(value)),
+        ));
+        None
+    })
+}
+
+pub fn expect_array<'a>(
+    value: &'a Value,
+    what: &str,
+    failures: &mut Vec<Failure>,
+) -> Option<&'a Vec<Value>> {
+    value.as_array().or_else(|| {
+        failures.push(Failure::new(
+            "setup",
+            format!("{what} must be an array, got {}", brief(value)),
+        ));
+        None
+    })
+}
+
+pub fn expect_str<'a>(
+    value: &'a Value,
+    what: &str,
+    failures: &mut Vec<Failure>,
+) -> Option<&'a str> {
+    value.as_str().or_else(|| {
+        failures.push(Failure::new(
+            "setup",
+            format!("{what} must be a string, got {}", brief(value)),
+        ));
+        None
+    })
+}
+
+pub fn expect_u64(value: &Value, what: &str, failures: &mut Vec<Failure>) -> Option<u64> {
+    value.as_u64().or_else(|| {
+        failures.push(Failure::new(
+            "setup",
+            format!(
+                "{what} must be a non-negative integer, got {}",
+                brief(value)
+            ),
+        ));
+        None
+    })
+}
+
+/// Caps a JSON value's rendering so a failure message stays readable when
+/// the offending value is a leaked 70 KB blob.
+#[must_use]
+pub fn brief(value: &Value) -> String {
+    let rendered = value.to_string();
+    if rendered.len() <= 240 {
+        return rendered;
+    }
+    let head: String = rendered.chars().take(240).collect();
+    format!("{head}... [{} bytes total]", rendered.len())
+}
+
+/// Serializes a wire observation (or balance line) for comparison against
+/// a fixture's declared entry.
+#[must_use]
+pub fn to_json<T: serde::Serialize>(value: &T) -> Value {
+    serde_json::to_value(value).unwrap_or(Value::Null)
+}
+
+/// The same observation with the one field nothing can predict removed:
+/// `provenance.received_at`, a fresh clock reading on every run.
+///
+/// `staleness` deliberately **stays**. It is host-derived, not adapter-sent,
+/// but the host derives it per resource from that resource's own outcome
+/// (spec/observation.md §1's freshness table), so it is a genuine
+/// per-observation claim and a reproducible one: two runs of the same
+/// fixture stamp it identically. It used to be stripped here alongside
+/// `received_at`, which made it assertable in `expect.provenance` (balance
+/// lines, compared without this view) and nowhere else -- and cost
+/// `oversized_observation` the per-observation `staleness: cached` claim
+/// that is exactly what broke when a degrade overwrote a stale outcome.
+#[must_use]
+pub fn stable_view(json: &Value) -> Value {
+    let mut json = json.clone();
+    if let Some(prov) = json
+        .pointer_mut("/provenance")
+        .and_then(Value::as_object_mut)
+    {
+        prov.remove("received_at");
+    }
+    json
+}
+
+/// Compares `expected` against `actual` as a subset -- with one exception:
+/// `provider_extra` must match **exactly**.
+///
+/// A subset comparison cannot express "and nothing else", and
+/// `provider_extra` is the one field where that is the whole assertion: A10
+/// step 1 says the field is *replaced* by `{"_truncated": true,
+/// "_original_bytes": N}`, and `fdx_lossless` says every FDX field lands
+/// there verbatim and nothing else does. An adversarial review proved the
+/// subset form accepts 70 KB of leaked payload sitting beside the
+/// truncation marker.
+pub fn diff_observation(actual: &Value, expected: &Value, path: &str, diffs: &mut Vec<String>) {
+    let mut expected = expected.clone();
+    if let Value::Object(map) = &mut expected {
+        if let Some(expected_extra) = map.remove("provider_extra") {
+            let actual_extra = actual.get("provider_extra").cloned().unwrap_or(Value::Null);
+            if actual_extra != expected_extra {
+                diffs.push(format!(
+                    "{path}.provider_extra must be EXACTLY {}, got {}",
+                    brief(&expected_extra),
+                    brief(&actual_extra)
+                ));
+            }
+        }
+    }
+    json_subset_diff(actual, &expected, path, diffs);
+}
+
+/// How two values for one `local_id` disagree. An observation *history* is
+/// an array, and rendering two whole arrays side by side just truncates
+/// into noise -- so a length mismatch says so, and a content mismatch names
+/// the first index that differs.
+#[must_use]
+pub fn disagreement(actual: &Value, expected: &Value) -> String {
+    if let (Value::Array(a), Value::Array(e)) = (actual, expected) {
+        if a.len() != e.len() {
+            return format!(
+                "{} observation(s) in this execution, {} in the other",
+                a.len(),
+                e.len()
+            );
+        }
+        if let Some((i, (a_i, e_i))) = a.iter().zip(e).enumerate().find(|(_, (x, y))| x != y) {
+            return format!("observation {i} differs: {} != {}", brief(a_i), brief(e_i));
+        }
+    }
+    format!("{} != {}", brief(actual), brief(expected))
+}
+
+/// Every way two keyed content maps can disagree, one line per key.
+#[must_use]
+pub fn content_diff(
+    actual: &BTreeMap<String, Value>,
+    expected: &BTreeMap<String, Value>,
+) -> Vec<String> {
+    let mut out = Vec::new();
+    for (key, expected_obs) in expected {
+        match actual.get(key) {
+            None => out.push(format!("{key:?}: missing")),
+            Some(actual_obs) if actual_obs != expected_obs => {
+                out.push(format!(
+                    "{key:?}: {}",
+                    disagreement(actual_obs, expected_obs)
+                ));
+            }
+            Some(_) => {}
+        }
+    }
+    for key in actual.keys().filter(|k| !expected.contains_key(*k)) {
+        out.push(format!("{key:?}: unexpected, not in the other execution"));
+    }
+    out
 }
 
 #[cfg(test)]

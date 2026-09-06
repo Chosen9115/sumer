@@ -1,15 +1,36 @@
 //! The CI gate for Milestone 0: the conformance suite versus the reference
-//! Python adapter (`adapters/fake/fake_adapter.py`). Every one of the
-//! twelve fixtures under `conformance/cases/` must pass with zero
-//! assertion failures, or this milestone's most valuable artifact -- the
-//! suite itself -- has nothing behind it.
+//! Python adapter (`adapters/fake/fake_adapter.py`).
+//!
+//! Two things are asserted, and the second is why the list below exists at
+//! all: every fixture under `conformance/cases/` passes with **zero**
+//! assertion failures, and the set of files on disk equals [`CASES`]. A
+//! fixture dropped into the directory without being named here is a red
+//! build rather than a case nobody notices is unrun.
 //!
 //! Requires `python3` on `PATH`; skips (rather than failing red) when it is
 //! not found, since that is an environment gap, not a suite regression.
 
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
+use std::collections::BTreeSet;
 use std::path::PathBuf;
+
+/// Every fixture this gate knows about. Must equal the `*.json` files in
+/// `conformance/cases/`, exactly.
+const CASES: &[&str] = &[
+    "duplicate_events",
+    "fdx_lossless",
+    "interrupted_pagination",
+    "large_amounts",
+    "null_category",
+    "oversized_observation",
+    "pending_to_posted",
+    "protocol_violations",
+    "provider_json_number",
+    "reorg_vanish",
+    "stale_balance",
+    "unsupported_op",
+];
 
 /// `CARGO_MANIFEST_DIR` is `<repo>/conformance`; the fixtures and the
 /// Python adapter both live one level up, at the repo root.
@@ -47,13 +68,17 @@ async fn fake_adapter_passes_every_case() {
         .filter(|p| p.extension().and_then(|e| e.to_str()) == Some("json"))
         .collect();
     case_paths.sort();
+    let on_disk: BTreeSet<String> = case_paths
+        .iter()
+        .filter_map(|p| Some(p.file_stem()?.to_string_lossy().into_owned()))
+        .collect();
     assert_eq!(
-        case_paths.len(),
-        12,
-        "expected all twelve conformance cases under {cases_dir:?}, found {case_paths:?}"
+        on_disk,
+        CASES.iter().map(|s| (*s).to_owned()).collect(),
+        "the fixtures in {cases_dir:?} and the CASES list have drifted apart"
     );
 
-    let mut failed_cases = Vec::new();
+    let mut broken = Vec::new();
     for path in &case_paths {
         let outcome = sumer_conformance::runner::run_case(&argv, path).await;
         if !outcome.failures.is_empty() {
@@ -66,11 +91,11 @@ async fn fake_adapter_passes_every_case() {
                     f.message
                 );
             }
-            failed_cases.push(outcome.case);
+            broken.push(outcome.case);
         }
     }
     assert!(
-        failed_cases.is_empty(),
-        "conformance cases failed: {failed_cases:?} (see stderr above for the concrete diffs)"
+        broken.is_empty(),
+        "conformance cases failed: {broken:?} (see stderr above for the concrete diffs)"
     );
 }

@@ -1,0 +1,7 @@
+{
+  "fixture": "pending_to_posted",
+  "assertions": [],
+  "why": "The subtler form of the same root cause: local_ids are prefixed with a junk namespace, but only on a connection whose reads began without a resources.list. Same aperture, same verdict -- unobservable today because there is no second pass to diverge from, and red the moment one comes back. Its ability to fire at all is checked directly by `the_equivalent_mutants_could_still_fire` in tests/mutations.rs, which drives this wrapper over exactly such a connection and requires it to diverge from the honest adapter -- a guard nobody can fire is dead weight, so it is fired.",
+  "adapter": "ids_prefixed_without_discovery.py",
+  "patch": []
+}

@@ -140,6 +140,78 @@ pub struct Mux {
     /// the hello call); [`Mux::raise_concurrency`] tops it up once the
     /// adapter's declared value is known.
     semaphore: Arc<Semaphore>,
+    /// `None` on every production connection ([`Mux::spawn`]); only
+    /// [`Mux::spawn_recorded`] fills this in. See [`Transcript`].
+    transcript: Option<Arc<Transcript>>,
+}
+
+/// One request/reply pair as it passed through [`Mux::call`].
+///
+/// **The transcript is DISPATCH order**: an `Exchange` is pushed the
+/// instant `call` hands a request to the mux, before anything about its
+/// reply -- if it ever gets one at all -- is known. **Reply CONTENT is
+/// only ordered the same way when dispatch is itself serial.** An adapter
+/// declaring `max_in_flight` above `1` can answer out of the order its
+/// requests were dispatched in, so on such a connection two entries'
+/// `frame`/`received_at` can fill in in a different order than the
+/// entries themselves appear in the vector.
+#[derive(Debug, Clone)]
+pub struct Exchange {
+    pub op: String,
+    pub params: Value,
+    pub frame: Option<String>,
+    pub received_at: Option<Rfc3339>,
+}
+
+/// Raw request/reply evidence for one adapter connection, recorded from
+/// the SAME execution that produces the host's typed replies -- never a
+/// second, separate pass an adapter could distinguish (e.g. by fixture
+/// run index) and behave differently on. Built only by
+/// [`Mux::spawn_recorded`]; a production connection ([`Mux::spawn`]) has
+/// none, and records nothing.
+///
+/// **A discarded, tombstoned reply is never recorded.** [`Mux::deliver`]
+/// drops a reply naming a tombstoned id before it reaches any caller --
+/// including this transcript -- and that drop is legally not a violation
+/// (spec/wire.md §6: "the connection survives"). An oversized or
+/// otherwise non-conforming observation riding in on a reply that arrives
+/// after its own deadline is therefore invisible to measurement forever.
+/// This is an accepted hole, not a bug to fix: its aperture is bounded by
+/// the deadline that caused the tombstone in the first place, never
+/// unbounded. It is written down here so a future reviewer does not
+/// rediscover it as a surprise.
+#[derive(Default)]
+pub(crate) struct Transcript(Mutex<Vec<Exchange>>);
+
+impl Transcript {
+    /// Appends a not-yet-answered exchange and returns its index.
+    fn push(&self, op: String, params: Value) -> usize {
+        let mut inner = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        inner.push(Exchange {
+            op,
+            params,
+            frame: None,
+            received_at: None,
+        });
+        inner.len() - 1
+    }
+
+    /// Fills in the reply half of a previously-pushed exchange. A no-op if
+    /// `index` is somehow out of range (never expected in practice: this
+    /// is only ever called with an index this same `Transcript` just
+    /// handed out).
+    fn fill(&self, index: usize, frame: String, received_at: Rfc3339) {
+        let mut inner = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(exchange) = inner.get_mut(index) {
+            exchange.frame = Some(frame);
+            exchange.received_at = Some(received_at);
+        }
+    }
+
+    /// A snapshot of everything recorded so far, in dispatch order.
+    pub(crate) fn snapshot(&self) -> Vec<Exchange> {
+        self.0.lock().unwrap_or_else(|e| e.into_inner()).clone()
+    }
 }
 
 struct QueuedRequest {
@@ -156,10 +228,35 @@ impl Mux {
     /// for the hello call, which is sent through the same machinery as any
     /// other call); call [`Mux::raise_concurrency`] once hello succeeds to
     /// open it up to the adapter's declared value.
+    ///
+    /// Records nothing: production traffic has no [`Transcript`]. Use
+    /// [`Mux::spawn_recorded`] for a connection the conformance suite
+    /// needs raw wire evidence from.
     #[must_use]
     pub fn spawn(
         stdin: ChildStdin,
         kill_tx: mpsc::Sender<Option<ProtocolViolationKind>>,
+    ) -> Arc<Mux> {
+        Mux::spawn_inner(stdin, kill_tx, None)
+    }
+
+    /// As [`Mux::spawn`], additionally recording every request/reply that
+    /// passes through [`Mux::call`] into the returned [`Transcript`] --
+    /// see that type's docs for why this exists and its one accepted gap.
+    #[must_use]
+    pub(crate) fn spawn_recorded(
+        stdin: ChildStdin,
+        kill_tx: mpsc::Sender<Option<ProtocolViolationKind>>,
+    ) -> (Arc<Mux>, Arc<Transcript>) {
+        let transcript = Arc::new(Transcript::default());
+        let mux = Mux::spawn_inner(stdin, kill_tx, Some(transcript.clone()));
+        (mux, transcript)
+    }
+
+    fn spawn_inner(
+        stdin: ChildStdin,
+        kill_tx: mpsc::Sender<Option<ProtocolViolationKind>>,
+        transcript: Option<Arc<Transcript>>,
     ) -> Arc<Mux> {
         let (tx, rx) = mpsc::channel(OUTBOUND_QUEUE_CAPACITY);
         let semaphore = Arc::new(Semaphore::new(1));
@@ -171,6 +268,7 @@ impl Mux {
             }),
             outbox: tx,
             semaphore: semaphore.clone(),
+            transcript,
         });
         tokio::spawn(pump(mux.clone(), rx, stdin, semaphore, kill_tx));
         mux
@@ -312,6 +410,14 @@ impl Mux {
         if let Some(t) = self.terminal() {
             return Err(t.into());
         }
+        // Pushed here, at dispatch, with no reply yet -- so a request that
+        // never gets one (tombstoned, or the connection ends first) still
+        // shows up in the transcript instead of a killed run silently
+        // under-reporting its final page.
+        let recorded = self
+            .transcript
+            .as_ref()
+            .map(|t| t.push(op.clone(), params.clone()));
         let (responder, rx) = oneshot::channel();
         let entry = QueuedRequest {
             op,
@@ -323,7 +429,13 @@ impl Mux {
         if self.outbox.send(entry).await.is_err() {
             return Err(self.terminal_error());
         }
-        rx.await.unwrap_or_else(|_| Err(self.terminal_error()))
+        let result = rx.await.unwrap_or_else(|_| Err(self.terminal_error()));
+        if let (Some(transcript), Some(index)) = (&self.transcript, recorded) {
+            if let Ok((frame, received_at)) = &result {
+                transcript.fill(index, frame.clone(), received_at.clone());
+            }
+        }
+        result
     }
 
     /// The reader loop's entry point for one decoded frame. `hello_done`

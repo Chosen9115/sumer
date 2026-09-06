@@ -1,0 +1,17 @@
+{
+  "fixture": "provider_json_number",
+  "assertions": [
+    "A4"
+  ],
+  "covers": [
+    "A4"
+  ],
+  "why": "The reply that puts a bare JSON NUMBER where an AmountWire belongs is repaired into a well-formed string, so the invalid_request the fixture demands never happens. The assertion under test is not 'was it rejected' but 'was it rejected AT ALL' -- a runner that only looked for the absence of a crash would go green here.",
+  "adapter": null,
+  "patch": [
+    {
+      "path": "/script/runs/0/on/balances.read/1/do/0/body_json",
+      "value": "{\"observations\":[{\"resource_id\":\"wallet-decimal\",\"category\":\"available\",\"canonical_hint\":null,\"amount\":{\"asset\":\"USD\",\"amount\":\"10.25\"},\"provenance\":{\"adapter_id\":\"fake-adapter\",\"provider_id\":\"0xEXAMPLEDECIMALWALLET\",\"surface\":\"onchain\",\"observed_at\":\"2026-09-01T00:00:00Z\",\"completeness\":\"complete\"}}],\"statuses\":[{\"resource_id\":\"wallet-decimal\",\"outcome\":{\"fetched\":{\"page_empty\":false}}}]}"
+    }
+  ]
+}

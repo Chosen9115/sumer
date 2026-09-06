@@ -1,0 +1,31 @@
+{
+  "fixture": "protocol_violations",
+  "assertions": [
+    "A11"
+  ],
+  "covers": [
+    "NotJson"
+  ],
+  "why": "The garbage line becomes an invalid-UTF-8 line: still fatal, still a violation, but the WRONG KIND. A suite that accepted any ProtocolViolation here would be certifying a host that cannot tell a decoding failure from an encoding one.",
+  "adapter": null,
+  "patch": [
+    {
+      "path": "/script/runs/4/on/balances.read/0/do/0/op",
+      "value": "stdout_raw_bytes"
+    },
+    {
+      "path": "/script/runs/4/on/balances.read/0/do/0/bytes",
+      "value": [
+        123,
+        34,
+        105,
+        100,
+        34,
+        58,
+        255,
+        254,
+        10
+      ]
+    }
+  ]
+}

@@ -1,0 +1,78 @@
+{
+  "fixture": "protocol_violations",
+  "assertions": [
+    "A11"
+  ],
+  "covers": [
+    "A11"
+  ],
+  "why": "balances.read(res-a) is answered on time instead of being held past its deadline, and the late reply to the tombstoned id is withdrawn with it. Nothing is ever tombstoned, so nothing is ever discarded, and A11's OTHER half -- a late reply to a dead id is dropped and the connection survives it -- has nothing left to prove. The six fatal kinds all report as A11; this is the one A11 claim that is not a fatal kind.",
+  "adapter": null,
+  "patch": [
+    {
+      "path": "/script/runs/1/on/balances.read/0/do",
+      "value": [
+        {
+          "op": "reply_ok",
+          "body": {
+            "observations": [
+              {
+                "resource_id": "res-a",
+                "category": "available",
+                "canonical_hint": "available",
+                "amount": {
+                  "asset": "USD",
+                  "amount": "1.00"
+                },
+                "provenance": {
+                  "provider_id": "provider_res_a"
+                }
+              }
+            ],
+            "statuses": [
+              {
+                "resource_id": "res-a"
+              }
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "path": "/script/runs/1/on/history.read/1/do",
+      "value": [
+        {
+          "op": "reply_ok",
+          "body": {
+            "observations": [],
+            "statuses": [
+              {
+                "resource_id": "res-b",
+                "page": {
+                  "cursor_resumable": "exact",
+                  "next": null
+                }
+              }
+            ]
+          }
+        },
+        {
+          "op": "reply_deferred",
+          "which": "oldest",
+          "body": {
+            "observations": [],
+            "statuses": [
+              {
+                "resource_id": "res-a",
+                "page": {
+                  "cursor_resumable": "exact",
+                  "next": null
+                }
+              }
+            ]
+          }
+        }
+      ]
+    }
+  ]
+}

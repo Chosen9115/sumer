@@ -1,0 +1,27 @@
+{
+  "fixture": "pending_to_posted",
+  "assertions": [
+    "A2",
+    "A10"
+  ],
+  "covers": [
+    "A10"
+  ],
+  "why": "The pending observation goes out with a 70 KB description and no degrade at all. A10 must see it on the adapter's own frame -- the host omits it at decode, so a suite measuring the decoded form would certify this adapter as conformant while the record vanished (which is the A2 half of the failure here).",
+  "adapter": null,
+  "patch": [
+    {
+      "path": "/script/runs/0/on/history.read/0/do/0/pad",
+      "value": [
+        {
+          "path": [
+            "observations",
+            0,
+            "description"
+          ],
+          "bytes": 70000
+        }
+      ]
+    }
+  ]
+}

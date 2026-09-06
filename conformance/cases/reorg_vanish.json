@@ -261,51 +261,69 @@
         "kind": "onchain_wallet"
       }
     ],
-    "history_live_set": {
-      "wallet-btc": [
-        {
-          "local_id": "wallet-btc:txid_reorg_1",
-          "state": "active",
-          "posting": "posted",
-          "amount": {
-            "asset": "sat",
-            "amount": "5000000"
+    "ledger": {
+      "wallet-btc": {
+        "balances": [
+          {
+            "category": "confirmed_balance",
+            "canonical_hint": "confirmed",
+            "amount": {
+              "asset": "sat",
+              "amount": "5000000"
+            }
+          }
+        ],
+        "history": [
+          {
+            "local_id": "wallet-btc:txid_reorg_1",
+            "provider_id": "txid_reorg_1",
+            "state": "active",
+            "tombstone_reason": null,
+            "surface": "onchain",
+            "posting": "pending",
+            "amount": {
+              "asset": "sat",
+              "amount": "5000000"
+            },
+            "raw_sign": "provider_positive",
+            "provider_extra": {}
           },
-          "raw_sign": "provider_positive"
-        }
+          {
+            "local_id": "wallet-btc:txid_reorg_1",
+            "provider_id": "txid_reorg_1",
+            "state": "tombstoned",
+            "tombstone_reason": "reorged_out",
+            "surface": "onchain",
+            "posting": "pending",
+            "amount": {
+              "asset": "sat",
+              "amount": "5000000"
+            },
+            "raw_sign": "provider_positive",
+            "provider_extra": {}
+          },
+          {
+            "local_id": "wallet-btc:txid_reorg_1",
+            "provider_id": "txid_reorg_1",
+            "state": "active",
+            "tombstone_reason": null,
+            "surface": "onchain",
+            "posting": "posted",
+            "amount": {
+              "asset": "sat",
+              "amount": "5000000"
+            },
+            "raw_sign": "provider_positive",
+            "provider_extra": {}
+          }
+        ]
+      }
+    },
+    "live": {
+      "wallet-btc": [
+        "wallet-btc:txid_reorg_1"
       ]
     },
-    "chains": {
-      "wallet-btc:txid_reorg_1": [
-        {
-          "state": "active",
-          "posting": "pending",
-          "tombstone_reason": null,
-          "amount": {
-            "asset": "sat",
-            "amount": "5000000"
-          }
-        },
-        {
-          "state": "tombstoned",
-          "posting": "pending",
-          "tombstone_reason": "reorged_out",
-          "amount": {
-            "asset": "sat",
-            "amount": "5000000"
-          }
-        },
-        {
-          "state": "active",
-          "posting": "posted",
-          "tombstone_reason": null,
-          "amount": {
-            "asset": "sat",
-            "amount": "5000000"
-          }
-        }
-      ]
-    },
-    "notes": "This is the centrepiece case: ONE local_id (wallet-btc:txid_reorg_1) goes active(pending) -> TOMBSTONED(reorged_out) -> active(posted). Tombstone is NOT terminal -- expect.chains lists all three arrivals in order. A host that treats state:tombstoned as a permanent deletion, or that only retains the final observation, fails A8 even if its final live set (A2) happens to look right. The final live-set entry keeps the SAME local_id throughout (unlike pending_to_posted.json, where posting creates a new local_id) -- that is deliberate: bank pending->posted forks identity, bitcoin re-mining does not, and the fold must handle both under one model per spec/wire.md."
+    "notes": "The centrepiece: ONE local_id (wallet-btc:txid_reorg_1) goes active(pending) -> TOMBSTONED(reorged_out) -> active(posted), one observation per page, and expect.ledger declares all three IN THAT ORDER. Tombstone is NOT terminal. The whole chain is the assertion: an adapter that drops the middle page reports active then active, the vanish never happened, and its final live set is byte-identical to the correct one -- only sequence equality over the full retained history (A8, enforced inside A2) can contradict it. Emitting the three in the wrong order (tombstone last) is likewise a different sequence and likewise fails. The local_id is the SAME throughout, unlike pending_to_posted.json where posting forks identity: bank pending->posted forks, bitcoin re-mining does not, and one fold must handle both. expect.live is DECLARED as the single surviving id, not derived by folding the sequence above."
   }
 }

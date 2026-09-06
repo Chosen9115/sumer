@@ -11,8 +11,8 @@
 //!   status.read     {"resource_ids":[...]} -> StatusReadReply
 
 use sumer_wire::{
-    BalancesReadReply, CanonicalHint, HelloReply, HistoryReadReply, ReadOutcome, Reply,
-    ResourcesListReply, StatusReadReply,
+    BalancesReadReply, CanonicalHint, Completeness, HelloReply, HistoryReadReply, ReadOutcome,
+    Reply, ResourcesListReply, StatusReadReply,
 };
 
 fn must<T, E: std::fmt::Debug>(r: Result<T, E>) -> T {
@@ -140,6 +140,25 @@ fn history_read_oversized_frame_from_real_adapter_deserializes() {
             // observations, not four) but still reported in statuses.
             assert_eq!(ok.observations.len(), 3);
             assert_eq!(ok.observations[0].resource_id, "wallet-oversized");
+            // The middle observation is the one the adapter truncated
+            // rather than omitted (spec/observation.md §6 step 1): a
+            // decoder that instead discarded `provider_extra` outright and
+            // substituted `completeness: Complete` would still pass a test
+            // that only counted observations, so pin down both the exact
+            // truncation marker shape and the `partial` completeness it
+            // must carry.
+            let truncated = &ok.observations[1];
+            assert_eq!(truncated.local_id, "wallet-oversized:big-truncatable");
+            assert_eq!(
+                serde_json::Value::Object(truncated.provider_extra.clone()),
+                serde_json::json!({"_truncated": true, "_original_bytes": 120028}),
+                "provider_extra must be exactly the truncation marker, nothing more"
+            );
+            assert_eq!(
+                truncated.provenance.completeness,
+                Completeness::Partial,
+                "a truncated observation's provenance must say so"
+            );
             assert_eq!(ok.statuses.len(), 1);
             let status = &ok.statuses[0];
             assert_eq!(status.resource_id, "wallet-oversized");

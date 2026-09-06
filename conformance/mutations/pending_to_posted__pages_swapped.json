@@ -1,0 +1,62 @@
+{
+  "fixture": "pending_to_posted",
+  "assertions": [
+    "A2"
+  ],
+  "covers": [
+    "A8"
+  ],
+  "why": "The posted record arrives on page 1 and the pending one on page 2 -- the same two records, the same single local_id, the same live set, the wrong order. A8 (full history, in emission order) lives inside A2's sequence equality, and a membership check could not see this at all: fold both orders and you get one identical live entry.",
+  "adapter": null,
+  "patch": [
+    {
+      "path": "/script/runs/0/on/history.read/0/do/0/body/observations",
+      "value": [
+        {
+          "resource_id": "checking-1",
+          "local_id": "checking-1:pend_abc",
+          "provider_id": "post_xyz",
+          "supersedes_provider_id": "pend_abc",
+          "state": "active",
+          "surface": "checking",
+          "posting": "posted",
+          "amount": {
+            "asset": "USD",
+            "amount": "42.37"
+          },
+          "raw_sign": "provider_negative",
+          "description": "EXAMPLE MERCHANT PURCHASE (fixture placeholder)",
+          "provider_extra": {},
+          "provenance": {
+            "provider_id": "post_xyz",
+            "observed_at": "2026-09-02T09:00:00Z"
+          }
+        }
+      ]
+    },
+    {
+      "path": "/script/runs/0/on/history.read/1/do/0/body/observations",
+      "value": [
+        {
+          "resource_id": "checking-1",
+          "local_id": "checking-1:pend_abc",
+          "provider_id": "pend_abc",
+          "state": "active",
+          "surface": "checking",
+          "posting": "pending",
+          "amount": {
+            "asset": "USD",
+            "amount": "42.00"
+          },
+          "raw_sign": "provider_negative",
+          "description": "EXAMPLE MERCHANT PURCHASE (fixture placeholder)",
+          "provider_extra": {},
+          "provenance": {
+            "provider_id": "pend_abc",
+            "observed_at": "2026-09-01T09:00:00Z"
+          }
+        }
+      ]
+    }
+  ]
+}

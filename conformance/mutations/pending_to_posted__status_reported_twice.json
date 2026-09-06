@@ -1,0 +1,31 @@
+{
+  "fixture": "pending_to_posted",
+  "assertions": [
+    "A7"
+  ],
+  "why": "status.read answers with two entries for the one resource it was asked about. Every requested resource_id must appear in statuses exactly once (spec/observation.md section 6); a coverage check that only asked 'is it present?' would be satisfied by both entries.",
+  "adapter": null,
+  "patch": [
+    {
+      "path": "/script/runs/0/on/status.read/0/do/0/body/statuses",
+      "value": [
+        {
+          "resource_id": "checking-1",
+          "outcome": {
+            "fetched": {
+              "page_empty": false
+            }
+          }
+        },
+        {
+          "resource_id": "checking-1",
+          "outcome": {
+            "fetched": {
+              "page_empty": false
+            }
+          }
+        }
+      ]
+    }
+  ]
+}
