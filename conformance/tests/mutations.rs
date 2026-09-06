@@ -36,15 +36,24 @@
 //!   the adapter's degrade step rather than its data.
 //! * `covers` is the `(fixture, assertion)` pair this mutant claims in
 //!   [`COVERAGE`], when that differs from the assertion ids the failure
-//!   messages actually carry. It is not free text: every id in it must
-//!   either be one this mutant's failures actually carry, or reach one
-//!   through `COVERS_VIA` -- the documented indirections, and only those.
-//!   They exist because some constraints have no failure label of their
-//!   own: the six fatal violation kinds are all reported as `A11`, A8
-//!   (full history retention) is enforced inside A2's sequence equality,
-//!   A3 (unknown is never zero) inside A1's balances comparison, and A10's
-//!   content half inside A2's exact `provider_extra` comparison. Defaults
-//!   to `assertions`.
+//!   messages actually carry. It is not free text; it is bound two
+//!   different ways, because two different things are being claimed:
+//!   * **A violation KIND is bound to the mechanism, not the label.**
+//!     All nine fatal kinds file under `A11`, so the label proves only
+//!     that *something* fatal happened. A mutant claiming
+//!     `StdinEofIgnored` must produce a failure whose `mechanism` is
+//!     `StdinEofIgnored` -- the kind the run actually reported, or the
+//!     kind the fixture expected and did not get. Claiming one kind while
+//!     provoking another (garbage on the wire, say) no longer type-checks
+//!     as coverage.
+//!   * **An id with no failure label of its own** reaches one through
+//!     [`COVERS_VIA`]: A8 (full history retention) is enforced inside A2's
+//!     sequence equality, A3 (unknown is never zero) inside A1's balances
+//!     comparison, and A10's content half inside A2's exact
+//!     `provider_extra` comparison. These three are label-level only --
+//!     see "the limits" below for what that does not establish.
+//!
+//!   Defaults to `assertions`.
 //!
 //! # The three rules that keep this from going hollow
 //!
@@ -76,22 +85,40 @@
 //! reach an id the mutant actually provokes) makes the same claim
 //! impossible to write down in the first place.
 //!
-//! # The limit exactness does NOT cover -- a review obligation
+//! # The limits this machinery does NOT cover -- review obligations
 //!
-//! Exactness is checked against **the set a manifest declares**. It catches
-//! a mutant that grows an unlisted id under a fixed manifest; it cannot
-//! catch a manifest widened to match a blunter mutant. Adding `"A2"` to a
-//! mutant's `assertions` because it "also trips A2" is indistinguishable,
-//! mechanically, from a mutant that legitimately violates two things. No
-//! machinery here can tell the two apart: the difference is whether the
-//! second id names a *distinct* break or the collateral damage of a blunt
-//! one.
+//! **1. A widened manifest.** Exactness is checked against **the set a
+//! manifest declares**. It catches a mutant that grows an unlisted id under
+//! a fixed manifest; it cannot catch a manifest widened to match a blunter
+//! mutant. Adding `"A2"` to a mutant's `assertions` because it "also trips
+//! A2" is indistinguishable, mechanically, from a mutant that legitimately
+//! violates two things. No machinery here can tell the two apart: the
+//! difference is whether the second id names a *distinct* break or the
+//! collateral damage of a blunt one.
 //!
 //! So: **widening a declared set is a review decision, not a fix.** If a
 //! mutant stops matching its manifest, the first question is whether the
 //! mutation got blunter, and the manifest's `why` must say which -- see the
 //! CONSTRAINTS in `CLAUDE.md`. This is written down rather than pretended
 //! away.
+//!
+//! **2. Substitution inside one label, for the three [`COVERS_VIA`] rows.**
+//! `A8`, `A3` and `A10` are bound to a LABEL (`A2`, `A1`, `A2`), not to a
+//! mechanism: nothing here checks that the A2 failure a mutant claiming A8
+//! provoked was about history retention rather than, say, a drifted amount
+//! in the same sequence comparison. Both are A2. The violation kinds used
+//! to have this same hole and no longer do (they are bound to
+//! `Failure::mechanism`); these three still do, because the assertions
+//! behind them produce one undifferentiated diff and inventing a mechanism
+//! label per diff shape would be machinery inventing a distinction the
+//! assertion itself does not make. What holds them is the `why` field and
+//! review, and that is stated here rather than implied to be checked.
+//!
+//! **3. Nothing binds a mutant to the SPECIFIC field it broke.** Exactness
+//! and the mechanism binding both work on sets of ids; a mutant that
+//! patches a different pointer than its `why` describes, and trips the same
+//! ids, reads as identical. The patch list is in the manifest, next to the
+//! prose, for exactly this reason.
 //!
 //! # Live and parked
 //!
@@ -116,44 +143,40 @@ use serde_json::Value;
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
-/// Every wire constraint a mutant can be bound to: the eleven named
-/// assertions of the frozen contract's section (g), plus the seven fatal
-/// protocol-violation kinds, which are constraints in their own right (a
-/// host that reports `NotJson` for a non-UTF-8 frame has not detected the
-/// violation, it has guessed).
-const CONSTRAINTS: &[&str] = &[
-    "A1",
-    "A2",
-    "A3",
-    "A4",
-    "A5",
-    "A6",
-    "A7",
-    "A8",
-    "A9",
-    "A10",
-    "A11",
+/// The eleven named assertions of the frozen contract's section (g).
+const ASSERTIONS: &[&str] = &[
+    "A1", "A2", "A3", "A4", "A5", "A6", "A7", "A8", "A9", "A10", "A11",
+];
+
+/// The fatal protocol-violation kinds, which are constraints in their own
+/// right (a host that reports `NotJson` for a non-UTF-8 frame has not
+/// detected the violation, it has guessed). Every one of them is reported
+/// under the `A11` label, so a claim naming one is bound to the failure's
+/// `mechanism` instead -- see the module docs.
+const VIOLATION_KINDS: &[&str] = &[
     "PreHelloOutput",
     "UnknownId",
     "DuplicateId",
     "OversizeFrame",
     "NotJson",
     "NonUtf8",
+    "UnterminatedFrame",
     "StdinEofIgnored",
+    "StdoutHeldOpen",
 ];
 
-/// The complete list of indirections a mutant's `covers` may use: an id it
-/// claims, paired with the id its own failure messages carry instead.
+/// Every wire constraint a mutant can be bound to.
+fn constraints() -> impl Iterator<Item = &'static str> {
+    ASSERTIONS.iter().chain(VIOLATION_KINDS).copied()
+}
+
+/// The complete list of LABEL indirections a mutant's `covers` may use: an
+/// id it claims, paired with the id its own failure messages carry instead.
+/// Three rows, and each one is a fact about a constraint that has no
+/// failure label of its own:
 ///
-/// Every entry is a fact about how a failure is *labelled*, never licence
-/// to claim something unrelated. There are four families:
-///
-/// * the seven fatal violation kinds -- all reported as `A11`; the kind
-///   itself is checked by `assert_violation_kind` (or, for
-///   `StdinEofIgnored`, by the close boundary in `exec::finish`), which
-///   files under `A11`;
-/// * `A8` (full history retention, in order) -- no label of its own,
-///   enforced by A2's sequence equality;
+/// * `A8` (full history retention, in order) -- enforced by A2's sequence
+///   equality;
 /// * `A3` (unknown is never zero) -- enforced by the balances sequence
 ///   comparison, which files under `A1`;
 /// * `A10`'s *content* half (`provider_extra` is exactly the truncation
@@ -161,22 +184,19 @@ const CONSTRAINTS: &[&str] = &[
 ///   comparison, which files under `A2`. A10's *size* half does file under
 ///   `A10`, which is why an over-cap leak produces both.
 ///
-/// Anything outside this table must be an id the mutant actually provokes.
-/// Adding a row is a claim that some assertion has no failure label of its
-/// own -- true four times here, and to be shown, not assumed, the next
-/// time.
-const COVERS_VIA: &[(&str, &str)] = &[
-    ("PreHelloOutput", "A11"),
-    ("UnknownId", "A11"),
-    ("DuplicateId", "A11"),
-    ("OversizeFrame", "A11"),
-    ("NotJson", "A11"),
-    ("NonUtf8", "A11"),
-    ("StdinEofIgnored", "A11"),
-    ("A8", "A2"),
-    ("A3", "A1"),
-    ("A10", "A2"),
-];
+/// **The violation kinds are deliberately NOT in this table.** They used to
+/// be, as seven rows pointing at `A11`, and that was a licence rather than
+/// a fact: any mutant that provoked any fatal violation could claim any
+/// kind, because the label they all share was the only thing checked. They
+/// are bound to the failure's `mechanism` instead -- the kind the run
+/// reported, or the kind the fixture expected and did not get -- which is
+/// the thing the claim is actually about.
+///
+/// A row here says "this constraint is enforced under another id's label",
+/// and what it does NOT say is that the specific failure was about this
+/// constraint: see limit 2 in the module docs. Adding a row is a review
+/// decision, to be shown rather than assumed.
+const COVERS_VIA: &[(&str, &str)] = &[("A8", "A2"), ("A3", "A1"), ("A10", "A2")];
 
 /// Which constraints each fixture is claimed to discriminate. **The unit is
 /// the pair**: `("pending_to_posted", "A8")` and `("reorg_vanish", "A8")`
@@ -201,7 +221,10 @@ const COVERAGE: &[(&str, &[&str])] = &[
             "A9",
             "A10",
             "A11",
+            "NotJson",
+            "UnterminatedFrame",
             "StdinEofIgnored",
+            "StdoutHeldOpen",
         ],
     ),
     (
@@ -407,6 +430,17 @@ fn ids(failures: &[sumer_conformance::assert::Failure]) -> BTreeSet<String> {
     failures.iter().map(|f| f.assertion.clone()).collect()
 }
 
+/// The distinct violation MECHANISMS one run produced -- the specific
+/// `ProtocolViolationKind` each `A11` failure was established by or about.
+/// This is what a `covers` claim naming a kind is checked against: `A11`
+/// alone is the label nine different breaks share.
+fn mechanisms(failures: &[sumer_conformance::assert::Failure]) -> BTreeSet<String> {
+    failures
+        .iter()
+        .filter_map(|f| f.mechanism.clone())
+        .collect()
+}
+
 fn render(set: &BTreeSet<String>) -> String {
     if set.is_empty() {
         "{}".to_owned()
@@ -465,6 +499,23 @@ async fn every_mutant_is_caught_by_exactly_the_assertions_it_names() {
         let baseline = baseline.get(&mutant.fixture).cloned().unwrap_or_default();
         let outcome = sumer_conformance::runner::run_case(&argv, &path).await;
         let produced = ids(&outcome.failures);
+        // A claim naming a violation KIND has to be backed by the kind the
+        // execution actually reported (or expected and did not get), not
+        // merely by the `A11` label every kind shares. Without this a
+        // mutant provoking ordinary JSON garbage could claim
+        // `StdinEofIgnored` and every check here would still pass.
+        let produced_kinds = mechanisms(&outcome.failures);
+        for id in mutant.claims() {
+            if VIOLATION_KINDS.contains(&id.as_str()) && !produced_kinds.contains(&id) {
+                failures.push(format!(
+                    "{name}: claims coverage of the violation kind {id:?}, but this run \
+                     established {} -- a kind claim is bound to the mechanism, not to the A11 \
+                     label all of them share\n    mutant:   {}",
+                    render(&produced_kinds),
+                    path.display(),
+                ));
+            }
+        }
 
         // A fixture that fails unmutated cannot demonstrate that a mutation
         // was caught: its own noise would answer for the mutant. What IS
@@ -558,7 +609,7 @@ fn the_coverage_table_is_backed_by_mutants() {
         .iter()
         .flat_map(|(fixture, ids)| ids.iter().map(move |id| (*fixture, *id)))
         .collect();
-    let known: BTreeSet<&str> = CONSTRAINTS.iter().copied().collect();
+    let known: BTreeSet<&str> = constraints().collect();
 
     // 1. The table names only real constraints.
     for (fixture, id) in &claimed {
@@ -570,9 +621,9 @@ fn the_coverage_table_is_backed_by_mutants() {
 
     // 2. Every constraint is claimed by at least one fixture. An unclaimed
     //    constraint is one nothing in this suite is known to discriminate.
-    for constraint in CONSTRAINTS {
+    for constraint in constraints() {
         assert!(
-            claimed.iter().any(|(_, id)| id == constraint),
+            claimed.iter().any(|(_, id)| *id == constraint),
             "no fixture claims {constraint:?} -- nothing here proves any case can tell it apart"
         );
     }
@@ -661,11 +712,17 @@ fn the_coverage_table_is_backed_by_mutants() {
             let via = COVERS_VIA.iter().any(|(claimed, reported_as)| {
                 *claimed == id && mutant.assertions.iter().any(|a| a == reported_as)
             });
+            // A violation kind is filed under `A11`; WHICH kind is checked
+            // against the failure's mechanism when the battery actually
+            // runs it, since only the run knows what it provoked.
+            let kind = VIOLATION_KINDS.contains(&id.as_str())
+                && mutant.assertions.iter().any(|a| a == "A11");
             assert!(
-                direct || via,
+                direct || via || kind,
                 "mutant {name:?} claims coverage of {id:?}, but its failures carry {:?} and \
-                 {id:?} is not one of the indirections COVERS_VIA documents. A claim \
-                 unconnected to what the mutation provokes is prose",
+                 {id:?} is neither one of the indirections COVERS_VIA documents nor a violation \
+                 kind reported under an A11 the mutant names. A claim unconnected to what the \
+                 mutation provokes is prose",
                 mutant.assertions,
             );
         }

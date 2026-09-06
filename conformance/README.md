@@ -274,9 +274,9 @@ claim would be worse than the hole.
 ## An execution has an end, and the end is judged
 
 The crawl closes its connection before it judges: the child's stdin is
-dropped, the adapter exits, the reader loop drains every byte it wrote
-before that EOF, and the terminal reason is read. A connection that ended
-in a protocol violation fails the execution.
+dropped, the adapter exits, the reader loop decodes every byte it wrote and
+finalizes the framing at that end of stream, and the terminal reason is
+read. A connection that ended in a protocol violation fails the execution.
 
 Without that boundary an execution had no end at all. The host delivers a
 valid reply *before* it reports a violation in whatever follows it, so an
@@ -286,6 +286,24 @@ nobody was still waiting on — and the case passed. Adding one more probe
 read after the crawl would only have moved that hole one reply further out;
 `pending_to_posted__garbage_after_the_final_reply` is the mutant that holds
 the boundary itself.
+
+**The end of the stream is what is certified, not the end of the process**,
+because the two are not the same fact and treating them as one left two
+holes a reviewer executed:
+
+- trailing garbage with **no** terminating LF sat in the decoder as an
+  in-progress frame, the reader returned at EOF without judging it, and the
+  case passed — the one byte between `garbage\n` and `garbage` was the
+  whole difference. Framing is now finalized at end of stream
+  (`UnterminatedFrame`), and both shapes have a mutant
+  (`..._garbage_after_the_final_reply`, `..._unterminated_garbage_after_the_final_reply`);
+- a writer the adapter FORKED inherits stdout and outlives it, so awaiting
+  the process established nothing about the stream: the host reported an
+  ordinary exit and the writer's frames landed after the verdict. A stdout
+  still open once the host stops waiting is now `StdoutHeldOpen`
+  (`pending_to_posted__writer_outlives_the_adapter`), and it is deliberately
+  a different kind from `StdinEofIgnored` — that one names a process still
+  running, and an adapter that exited on time must never be failed for it.
 
 ## A9's requirement: two executions, and the whole history
 
@@ -341,7 +359,7 @@ its stated mitigation, not just its happy-path check:
 | A8 | Full history retention, in emission order, as part of A2's sequence | Keeping only the final state |
 | A9 | `local_id` purity across two independent, fully judged executions, gated on request-shape equality, compared as record-to-id associations over the full observation history | A freshly generated UUID per run, a derivation that reuses the same ids for different records on the second run, one that mis-identifies only a record that is later superseded or tombstoned (identical live set, different history), *and* an adapter that empties both executions so they agree (each execution still fails its own ledger) |
 | A10 | The oversized-observation two-step degrade, five ways at once, driven by genuinely oversized input, measured on the adapter's own frames from **every** execution | Truncating (or dropping) the whole page over one bad record, leaving leaked payload beside the truncation marker (`provider_extra` is compared exactly), reporting the degrade *as* the resource's outcome so its freshness is erased, *and* skipping the degrade entirely and letting the host omit the record for you |
-| A11 | Fatal violations kill; a tombstoned reply is discarded and the connection survives; and every crawl is judged up to its **close**, not up to the last reply someone was waiting for | A host that kills the connection on *any* anomaly, *and* an adapter that answers the whole measured crawl and only then breaks the protocol, including by refusing to exit when its stdin closes |
+| A11 | Fatal violations kill; a tombstoned reply is discarded and the connection survives; and every crawl is judged up to its **close**, not up to the last reply someone was waiting for | A host that kills the connection on *any* anomaly, *and* an adapter that answers the whole measured crawl and only then breaks the protocol — by refusing to exit when its stdin closes, by leaving trailing bytes no newline ever terminated, or by leaving a forked writer holding stdout after it exits |
 
 ## Honest limits of black-box testing
 

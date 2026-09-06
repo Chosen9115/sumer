@@ -29,6 +29,15 @@ pub struct Failure {
     pub assertion: String,
     /// The concrete, human-readable difference.
     pub message: String,
+    /// The specific MECHANISM this failure establishes, where the
+    /// assertion id is broader than it: every one of the fatal protocol
+    /// violations is filed under `A11`, so the id alone cannot tell a
+    /// connection that died of trailing garbage from one that refused to
+    /// exit at stdin EOF. This carries the `ProtocolViolationKind` the
+    /// execution actually reported, so a coverage claim can be bound to
+    /// what it proves rather than to a label seven different breaks share.
+    /// `None` where the assertion id is already the whole story.
+    pub mechanism: Option<String>,
 }
 
 impl Failure {
@@ -37,6 +46,23 @@ impl Failure {
         Failure {
             assertion: assertion.into(),
             message: message.into(),
+            mechanism: None,
+        }
+    }
+
+    /// An `A11` failure bound to the violation KIND it is evidence about.
+    ///
+    /// Where a fixture expected a specific kind, that is the kind: a check
+    /// that `OversizeFrame` is detected is evidence about `OversizeFrame`
+    /// whether the run produced one or produced nothing at all. Where
+    /// nothing was expected and a violation happened anyway (the close
+    /// boundary), it is the kind the run reported.
+    #[must_use]
+    pub fn violation(kind: impl Into<String>, message: impl Into<String>) -> Failure {
+        Failure {
+            assertion: "A11".to_owned(),
+            message: message.into(),
+            mechanism: Some(kind.into()),
         }
     }
 }

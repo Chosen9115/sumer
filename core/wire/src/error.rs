@@ -23,12 +23,13 @@ pub enum WireErrorCode {
 /// is no "sorry, protocol violation" envelope -- the process is finished.
 ///
 /// [`crate::codec::FrameDecoder`] can only ever produce `OversizeFrame`,
-/// `NonUtf8`, or `NotJson` (frame-level corruption). `UnknownId`,
-/// `DuplicateId`, `PreHelloOutput`, and `StdinEofIgnored` are host-loop
-/// classifications built on top of the decoded frames (id bookkeeping, the
-/// pre-hello-output rule, and what the process does once the host has
-/// closed its stdin) and are enforced by the host, not by this crate's
-/// framer.
+/// `NonUtf8`, or `NotJson` (frame-level corruption). `UnterminatedFrame`,
+/// `UnknownId`, `DuplicateId`, `PreHelloOutput`, `StdinEofIgnored`, and
+/// `StdoutHeldOpen` are host-loop classifications built on top of the
+/// decoded frames (the decoder's leftover bytes at end of stream, id
+/// bookkeeping, the pre-hello-output rule, and what the process and its
+/// stdout do once the host has closed its stdin) and are enforced by the
+/// host, not by this crate's framer.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ProtocolViolationKind {
     /// The frame (excluding its terminating LF) exceeded
@@ -38,6 +39,12 @@ pub enum ProtocolViolationKind {
     NonUtf8,
     /// The frame was valid UTF-8 but not a syntactically valid JSON value.
     NotJson,
+    /// The adapter's stdout reached end of stream with bytes still buffered
+    /// that no LF ever terminated (spec/wire.md §2). They are not a frame
+    /// and never became one: the stream stopped in the middle of one. The
+    /// host neither judged them nor may discard them -- unjudged output is
+    /// exactly what the close boundary exists to make impossible.
+    UnterminatedFrame,
     /// A reply named an id above the counter high-water mark, or an
     /// impossible gap: no request ever issued that id.
     UnknownId,
@@ -51,6 +58,15 @@ pub enum ProtocolViolationKind {
     /// here answers no request and reaches no caller, so the connection
     /// cannot be judged to have ended cleanly; it did not end.
     StdinEofIgnored,
+    /// The adapter process exited, but its stdout was still open when the
+    /// host stopped waiting for it: something that inherited the write end
+    /// outlived the process (spec/wire.md §7 -- "drop whatever you are
+    /// still holding"). Awaiting the process therefore did NOT establish
+    /// end of stream, so the host cannot say it read everything the
+    /// connection produced. Distinct from [`ProtocolViolationKind::StdinEofIgnored`]
+    /// on purpose: there the process is still running; here it exited and
+    /// the stream outlived it.
+    StdoutHeldOpen,
 }
 
 #[cfg(test)]

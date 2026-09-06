@@ -6,7 +6,7 @@
   "covers": [
     "A11"
   ],
-  "why": "balances.read(res-a) is answered on time instead of being held past its deadline, and the late reply to the tombstoned id is withdrawn with it. Nothing is ever tombstoned, so nothing is ever discarded, and A11's OTHER half -- a late reply to a dead id is dropped and the connection survives it -- has nothing left to prove. The six fatal kinds all report as A11; this is the one A11 claim that is not a fatal kind.",
+  "why": "balances.read(res-a) is answered on time instead of being held past its deadline, and the late reply to the tombstoned id is withdrawn with it. Nothing is ever tombstoned, so nothing is ever discarded, and A11's OTHER half -- a late reply to a dead id is dropped and the connection survives it -- has nothing left to prove. Every fatal kind reports as A11; this is the one A11 claim that is not a fatal kind, which is why it names no mechanism.",
   "adapter": null,
   "patch": [
     {

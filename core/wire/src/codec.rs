@@ -120,8 +120,11 @@ impl FrameDecoder {
 
     /// Bytes buffered for the frame currently in progress (no terminating
     /// LF has arrived yet). Non-empty at end-of-stream means a truncated
-    /// final frame; classifying that (e.g. as `AdapterCrashed`) is a
-    /// host-loop decision, not this decoder's.
+    /// final frame; classifying that is a host-loop decision, not this
+    /// decoder's -- the host reads it as
+    /// [`ProtocolViolationKind::UnterminatedFrame`], because bytes it
+    /// received and never judged are exactly what a close boundary must
+    /// not drain silently.
     #[must_use]
     pub fn pending_bytes(&self) -> usize {
         self.buf.len()

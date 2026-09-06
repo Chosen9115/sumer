@@ -821,3 +821,81 @@ async fn an_adapter_that_ignores_stdin_eof_is_a_protocol_violation() {
         other => panic!("expected StdinEofIgnored, got {other:?}"),
     }
 }
+
+#[tokio::test]
+async fn trailing_garbage_with_a_newline_is_caught_at_the_close() {
+    // The control for the test below: the same bytes, LF-terminated. The
+    // decoder frames them, `NotJson` is reported, and the close boundary
+    // sees a violation.
+    let script = format!(
+        "{PRELUDE}\nhello_ok(read())\nfor line in sys.stdin:\n    pass\n\
+         sys.stdout.write('}} not a frame, and not the answer to anything\\n')\nsys.stdout.flush()\n"
+    );
+    let handle = spawn(&script, Duration::from_secs(5))
+        .await
+        .expect("handshake");
+    match handle.close().await {
+        Some(Terminal::Violation(ProtocolViolationKind::NotJson)) => {}
+        other => panic!("expected NotJson, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn trailing_garbage_without_a_newline_is_caught_at_the_close() {
+    // The same bytes with the LF removed. Nothing frames them, so the
+    // decoder holds them as an in-progress frame and the stream ends
+    // mid-frame -- output the host received, never judged, and drained by
+    // the boundary that is supposed to be the end of the evidence.
+    let script = format!(
+        "{PRELUDE}\nhello_ok(read())\nfor line in sys.stdin:\n    pass\n\
+         sys.stdout.write('}} not a frame, and not the answer to anything')\nsys.stdout.flush()\n"
+    );
+    let handle = spawn(&script, Duration::from_secs(5))
+        .await
+        .expect("handshake");
+    match handle.close().await {
+        Some(Terminal::Violation(ProtocolViolationKind::UnterminatedFrame)) => {}
+        other => panic!("expected UnterminatedFrame, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn a_writer_that_outlives_the_adapter_is_not_a_clean_close() {
+    // The adapter exits at stdin EOF, but a process it forked inherited
+    // the stdout write end and writes long after. Awaiting the process
+    // does not establish end of stream: the host cannot certify it read
+    // everything, so it must not report an ordinary exit.
+    let script = format!(
+        "{PRELUDE}\nimport os, time\nhello_ok(read())\nfor line in sys.stdin:\n    pass\n\
+         if os.fork() == 0:\n    time.sleep(1.5)\n    \
+         sys.stdout.write('not JSON\\n')\n    sys.stdout.flush()\n    os._exit(0)\n"
+    );
+    let handle = spawn(&script, Duration::from_secs(5))
+        .await
+        .expect("handshake");
+    match handle.close().await {
+        Some(Terminal::Violation(ProtocolViolationKind::StdoutHeldOpen)) => {}
+        other => panic!("expected StdoutHeldOpen, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn an_exited_adapter_is_never_blamed_for_ignoring_stdin_eof() {
+    // Same shape, but with a deadline shorter than the drain bound, so the
+    // close gives up while the drain is still running. The process exited
+    // -- promptly and cooperatively -- and blaming it for staying alive
+    // past stdin EOF would be an honest adapter failing for a lie. The
+    // three facts are distinct: the process exited, the stream never
+    // ended, the drain ran out of time.
+    let script = format!(
+        "{PRELUDE}\nimport os, time\nhello_ok(read())\nfor line in sys.stdin:\n    pass\n\
+         if os.fork() == 0:\n    time.sleep(2)\n    os._exit(0)\n"
+    );
+    let handle = spawn(&script, Duration::from_millis(300))
+        .await
+        .expect("handshake");
+    match handle.close().await {
+        Some(Terminal::Violation(ProtocolViolationKind::StdoutHeldOpen)) => {}
+        other => panic!("expected StdoutHeldOpen, got {other:?}"),
+    }
+}

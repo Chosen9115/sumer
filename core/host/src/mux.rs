@@ -390,11 +390,18 @@ impl Mux {
     /// the caller judges what it has, and anything the adapter writes
     /// afterwards -- a malformed frame, a second answer to an id already
     /// answered -- lands (or does not) in whatever order the scheduler
-    /// happens to pick. After this call the adapter's exit closes its
-    /// stdout, the reader loop drains every remaining byte before it sees
-    /// that EOF, and `supervise` latches the terminal reason. So "the
-    /// connection ended clean" becomes a fact that can be waited for and
-    /// checked, rather than a race nobody looks at.
+    /// happens to pick. After this call a conforming adapter exits, its
+    /// exit closes its stdout, the reader loop decodes every remaining byte
+    /// and finalizes the framing at that end of stream, and `supervise`
+    /// latches the terminal reason. So "the connection ended clean" becomes
+    /// a fact that can be waited for and checked, rather than a race nobody
+    /// looks at.
+    ///
+    /// **The exit is not the end of the stream**, and neither the reader
+    /// loop nor `supervise` pretends otherwise: a process that inherited
+    /// the adapter's stdout keeps it open past the exit, which is reported
+    /// as [`ProtocolViolationKind::StdoutHeldOpen`] rather than waited out
+    /// and called an ordinary exit. See [`crate::AdapterHandle::close`].
     ///
     /// Requests already queued are still sent: this is a close, not a
     /// cancel. Idempotent, and safe on a connection that is already gone.
@@ -647,6 +654,14 @@ fn build_frame(id: RequestId, op: &str, params: &Value) -> Result<String, serde_
 /// recovery point, spec/wire.md §2) and returns; [`crate::process::supervise`]
 /// -- the sole owner of the `Child` handle -- does the actual killing and
 /// finishes the mux with the matching [`Terminal::Violation`].
+///
+/// **Framing is finalized at end of stream.** A decoder still holding bytes
+/// when stdout ends stopped in the middle of a frame: those bytes were
+/// received and never judged, and returning without looking at them let the
+/// boundary drain output it had no verdict on
+/// ([`ProtocolViolationKind::UnterminatedFrame`]). The one byte between
+/// `garbage\n` and `garbage` used to be the whole difference between a
+/// caught violation and a clean exit.
 pub async fn read_loop(
     mux: Arc<Mux>,
     mut stdout: tokio::process::ChildStdout,
@@ -657,13 +672,34 @@ pub async fn read_loop(
     let mut decoder = sumer_wire::FrameDecoder::new();
     let mut hello_done = false;
     let mut buf = [0_u8; 8192];
+    // Pre-hello, the host cannot tell a banner from a malformed frame
+    // (spec/wire.md §3), so every frame-level cause collapses to one kind.
+    let classify = |hello_done: bool, kind| {
+        if hello_done {
+            kind
+        } else {
+            ProtocolViolationKind::PreHelloOutput
+        }
+    };
     loop {
         let n = match stdout.read(&mut buf).await {
-            Ok(0) | Err(_) => {
-                // EOF or a read error: not itself a protocol violation --
-                // `supervise` (racing the same child) will classify this as
-                // a crash once it reaps the exit status. Nothing left to
-                // read here either way.
+            Ok(0) => {
+                // End of stream. The exit itself is not a violation --
+                // `supervise` classifies that once it reaps the status --
+                // but an in-progress frame at this point is: nothing will
+                // ever terminate it, and it is not the host's to discard.
+                if decoder.pending_bytes() > 0 {
+                    let _ = kill_tx.try_send(Some(classify(
+                        hello_done,
+                        ProtocolViolationKind::UnterminatedFrame,
+                    )));
+                }
+                return;
+            }
+            Err(_) => {
+                // A read error says the pipe is gone, not what the adapter
+                // did: whatever is buffered may have been truncated by the
+                // failure itself, so it is not held against the adapter.
                 return;
             }
             Ok(n) => n,
@@ -678,12 +714,7 @@ pub async fn read_loop(
             }
         }
         if let Err(kind) = push_result {
-            let kind = if hello_done {
-                kind
-            } else {
-                ProtocolViolationKind::PreHelloOutput
-            };
-            let _ = kill_tx.try_send(Some(kind));
+            let _ = kill_tx.try_send(Some(classify(hello_done, kind)));
             return;
         }
     }

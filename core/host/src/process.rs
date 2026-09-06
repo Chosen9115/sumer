@@ -10,6 +10,7 @@
 //! to set here.
 
 use std::process::Stdio;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use tokio::io::AsyncReadExt;
@@ -25,10 +26,17 @@ use crate::mux::{Mux, Terminal};
 /// interpreter or script may expect.
 const ENV_ALLOWLIST: &[&str] = &["PATH", "HOME", "LANG", "LC_ALL", "TMPDIR"];
 
-/// How long a natural exit waits for the reader loop to drain the child's
-/// last bytes before concluding nothing explains the exit. Normally
-/// instant: the exit closed stdout, so the reader is one EOF from
-/// returning.
+/// How long a natural exit waits for the reader loop to reach end of
+/// stream. Normally instant: the exit closed stdout, so the reader is one
+/// EOF from returning. It is not instant when something that inherited the
+/// write end outlives the process -- and that case is now reported
+/// ([`ProtocolViolationKind::StdoutHeldOpen`]) rather than waited out and
+/// then papered over as an ordinary exit.
+///
+/// ponytail: a fixed bound, not the connection's deadline. An honest drain
+/// finishes in microseconds; raising this only buys patience for a stream
+/// that is already unjudgeable. Make it a parameter if a real adapter ever
+/// needs more than a second to close a pipe it already stopped writing to.
 const READER_DRAIN: std::time::Duration = std::time::Duration::from_secs(1);
 
 /// A freshly spawned adapter process with its stdio handles already split
@@ -127,6 +135,14 @@ async fn drain_stderr(mut stderr: tokio::process::ChildStderr) {
 ///   first reason, so the truer one would arrive too late to matter.
 ///   There is no auto-restart (frozen contract, section (f)): a crashed
 ///   adapter stays crashed for the life of the handle.
+/// - Natural exit whose stdout does **not** reach end of stream within
+///   [`READER_DRAIN`] -> [`ProtocolViolationKind::StdoutHeldOpen`]. The
+///   process exiting is not the stream ending: a process that inherited
+///   the write end keeps it open, and what it writes next arrives after
+///   any verdict latched here. Reporting `Crashed(code)` in that case
+///   would certify a complete drain that did not happen -- which is
+///   exactly how a forked writer's garbage used to reach the wire after a
+///   passing verdict.
 /// - `Some(Some(kind))` on `kill_tx` -> the child is killed and the mux is
 ///   finished with [`Terminal::Violation`].
 /// - Channel closed, or `Some(None)` -> a deliberate, non-violation
@@ -136,28 +152,42 @@ async fn drain_stderr(mut stderr: tokio::process::ChildStderr) {
 /// [`Mux::finish`] is idempotent (only the first reason sticks), so a race
 /// between these two paths -- the process happens to exit right as a kill
 /// is requested -- can never produce two conflicting terminal reasons.
+///
+/// The three facts this function keeps apart, because collapsing them is
+/// how an honest adapter gets blamed for the wrong thing: **the process
+/// exited** (`exited`, published the instant it is reaped), **the stream
+/// validated to its end** (the reader join completing), and **the drain
+/// ran out of time** (the [`READER_DRAIN`] timeout). `exited` is what lets
+/// [`crate::AdapterHandle::close`] tell "still running past stdin EOF"
+/// from "exited, stream outlived it" instead of labelling both
+/// `StdinEofIgnored`.
 pub async fn supervise(
     mut child: Child,
     mut kill_rx: tokio::sync::mpsc::Receiver<Option<sumer_wire::ProtocolViolationKind>>,
     mux: Arc<Mux>,
     reader: tokio::task::JoinHandle<()>,
+    exited: Arc<AtomicBool>,
 ) {
     tokio::select! {
         status = child.wait() => {
             let code = status.ok().and_then(|s| s.code());
-            // ponytail: bounded rather than an unconditional await --
-            // stdout EOF is guaranteed by the exit only if nothing the
-            // child forked still holds the write end. If one does, the
-            // crash is reported a second late instead of never.
-            let _ = tokio::time::timeout(READER_DRAIN, reader).await;
+            exited.store(true, Ordering::SeqCst);
+            let drained = tokio::time::timeout(READER_DRAIN, reader).await.is_ok();
             match kill_rx.try_recv() {
                 Ok(Some(kind)) => mux.finish(Terminal::Violation(kind)),
+                // The reader is still reading a stdout the exit did not
+                // close. Nothing establishes what else may arrive, so
+                // nothing here may say the connection ended cleanly.
+                _ if !drained => mux.finish(Terminal::Violation(
+                    sumer_wire::ProtocolViolationKind::StdoutHeldOpen,
+                )),
                 _ => mux.finish(Terminal::Crashed(code)),
             };
         }
         msg = kill_rx.recv() => {
             let _ = child.start_kill();
             let _ = child.wait().await;
+            exited.store(true, Ordering::SeqCst);
             if let Some(Some(kind)) = msg {
                 mux.finish(Terminal::Violation(kind));
             }
@@ -197,7 +227,14 @@ mod tests {
                 .await;
         });
 
-        supervise(spawned.child, kill_rx, mux.clone(), reader).await;
+        supervise(
+            spawned.child,
+            kill_rx,
+            mux.clone(),
+            reader,
+            Arc::new(AtomicBool::new(false)),
+        )
+        .await;
 
         match mux.terminal() {
             Some(Terminal::Violation(sumer_wire::ProtocolViolationKind::NotJson)) => {}

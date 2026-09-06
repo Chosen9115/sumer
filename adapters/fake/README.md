@@ -42,7 +42,10 @@ Close stdin (Ctrl-D, or the end of the pipe) and it exits. That is
 `while True:` around `sys.stdin.readline()`, which is the shape that spins
 forever on the empty string EOF returns. The mutation battery breaks
 exactly that (`mutations/adapters/stays_alive_after_stdin_eof.py`) and
-requires the host to report `ProtocolViolation::StdinEofIgnored`.
+requires the host to report `ProtocolViolation::StdinEofIgnored`. Its two
+siblings are the same boundary from the other side: an adapter that exits but
+leaves trailing bytes no LF ever terminated (`UnterminatedFrame`), and one
+that exits but leaves a forked writer holding stdout (`StdoutHeldOpen`).
 
 ## The fixture schema
 

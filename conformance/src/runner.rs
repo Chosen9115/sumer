@@ -471,15 +471,15 @@ async fn case_protocol_violations(
                 Err(HostError::ProtocolViolation(kind)) => {
                     assert_violation_kind(kind, expected_kind.as_deref(), &label, failures);
                 }
-                Err(e) => failures.push(Failure::new(
-                    "A11",
+                Err(e) => failures.push(expected_violation(
+                    expected_kind.as_deref(),
                     format!(
                         "{label}: expected spawn to fail with a ProtocolViolation, got a \
                          different error: {e}"
                     ),
                 )),
-                Ok(_) => failures.push(Failure::new(
-                    "A11",
+                Ok(_) => failures.push(expected_violation(
+                    expected_kind.as_deref(),
                     format!(
                         "{label}: expected spawn to fail with a ProtocolViolation, but it \
                          succeeded"
@@ -550,17 +550,30 @@ fn assert_violation_kind(
     let actual_name = format!("{actual:?}");
     match expected {
         Some(exp) if exp == actual_name => {}
-        Some(exp) => failures.push(Failure::new(
-            "A11",
+        Some(exp) => failures.push(Failure::violation(
+            exp,
             format!("{label}: expected ProtocolViolation::{exp}, got {actual_name}"),
         )),
-        None => failures.push(Failure::new(
-            "A11",
+        None => failures.push(Failure::violation(
+            actual_name.clone(),
             format!(
                 "{label}: got ProtocolViolation::{actual_name}, but the fixture named no expected \
                  kind"
             ),
         )),
+    }
+}
+
+/// An `A11` failure for a run whose fixture named the violation kind it
+/// expected: the failure is evidence about THAT kind, including -- in fact
+/// especially -- when the run produced no violation at all. Every "the
+/// violation stopped happening" mutant lands here, and a coverage claim
+/// naming a kind is checked against this binding rather than against the
+/// `A11` label all nine kinds share.
+fn expected_violation(kind: Option<&str>, message: String) -> Failure {
+    match kind {
+        Some(k) => Failure::violation(k, message),
+        None => Failure::new("A11", message),
     }
 }
 
@@ -632,13 +645,16 @@ async fn check_violation_after_resources_list(
     let handle = match spawn_run(argv, path, run_idx, deadline).await {
         Ok(h) => h,
         Err(e) => {
-            failures.push(Failure::new("A11", format!("{label}: spawn failed: {e}")));
+            failures.push(expected_violation(
+                expectation.kind,
+                format!("{label}: spawn failed: {e}"),
+            ));
             return;
         }
     };
     if let Err(e) = handle.resources_list().await {
-        failures.push(Failure::new(
-            "A11",
+        failures.push(expected_violation(
+            expectation.kind,
             format!("{label}: resources.list unexpectedly failed: {e}"),
         ));
         return;
@@ -646,15 +662,20 @@ async fn check_violation_after_resources_list(
     if needs_poll {
         match wait_for_violation(&handle, Duration::from_secs(3)).await {
             Ok(kind) => assert_violation_kind(kind, expectation.kind, label, failures),
-            Err(msg) => failures.push(Failure::new("A11", format!("{label}: {msg}"))),
+            Err(msg) => {
+                failures.push(expected_violation(
+                    expectation.kind,
+                    format!("{label}: {msg}"),
+                ));
+            }
         }
     } else {
         match handle.balances_read(vec!["res-a".to_owned()]).await {
             Err(HostError::ProtocolViolation(kind)) => {
                 assert_violation_kind(kind, expectation.kind, label, failures);
             }
-            other => failures.push(Failure::new(
-                "A11",
+            other => failures.push(expected_violation(
+                expectation.kind,
                 format!("{label}: expected a ProtocolViolation on balances.read, got {other:?}"),
             )),
         }
@@ -788,8 +809,8 @@ async fn check_survivable_then_kill(
         Err(HostError::ProtocolViolation(kind)) => {
             assert_violation_kind(kind, expected_kind, label, failures);
         }
-        other => failures.push(Failure::new(
-            "A11",
+        other => failures.push(expected_violation(
+            expected_kind,
             format!(
                 "{label}: expected the final status.read to trigger a ProtocolViolation, got \
                  {other:?}"

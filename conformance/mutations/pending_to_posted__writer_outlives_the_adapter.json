@@ -1,0 +1,13 @@
+{
+  "fixture": "pending_to_posted",
+  "assertions": [
+    "A11"
+  ],
+  "covers": [
+    "A11",
+    "StdoutHeldOpen"
+  ],
+  "why": "The adapter answers the whole crawl honestly, then forks a writer that inherits its stdout and exits immediately -- the parent is gone, the stream is not. Awaiting the process therefore establishes nothing about end of stream: the host used to give the reader one second, latch Crashed(0), and certify a complete drain it had not performed, so the garbage the forked writer put on the wire afterwards was never judged. A close that cannot see the end of the stream is not a close, and it is now reported as StdoutHeldOpen rather than as an ordinary exit.",
+  "adapter": "writer_outlives_the_adapter.py",
+  "patch": []
+}

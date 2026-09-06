@@ -42,6 +42,18 @@
 //! Adding one more probe read would only move that boundary; closing at it
 //! removes it.
 //!
+//! **What the close establishes is exactly three things**, and they are
+//! kept apart because collapsing them is how an honest adapter gets blamed
+//! and a broken one gets away: the process exited; its stdout reached end
+//! of stream, with the framing finalized there (unterminated bytes are
+//! `UnterminatedFrame`, not something to drain); and, where either did not
+//! happen inside the connection's deadline, WHICH of the two did not --
+//! `StdinEofIgnored` for a process still running, `StdoutHeldOpen` for a
+//! stream that outlived the process it belonged to. `finish` accepts any
+//! `Terminal::Violation` as this execution's failure and records the KIND
+//! it was (`Failure::mechanism`), so a coverage claim about one of them is
+//! bound to the mechanism rather than to the `A11` label all nine share.
+//!
 //! # The honest limit
 //!
 //! What is **structural** here -- impossible to forget, because a type or
@@ -628,6 +640,16 @@ pub(crate) async fn run_crawl(
 /// every adapter, not just the cooperative ones -- which is what makes it
 /// a boundary.
 ///
+/// Two narrower escapes are closed the same way, and both were live until
+/// a reviewer executed them: trailing garbage with **no** terminating LF
+/// (the decoder held it, the reader returned at EOF without judging it,
+/// and the case passed -- now `UnterminatedFrame`), and a writer FORKED by
+/// the adapter that inherits stdout and writes after its parent is reaped
+/// (awaiting the process established nothing about the stream -- now
+/// `StdoutHeldOpen`). What a close certifies is the end of the STREAM, not
+/// the end of the process, and where it cannot see that end it says so
+/// instead of certifying anyway.
+///
 /// It costs one deadline of wall clock to observe, since not-having-exited
 /// is only knowable once the deadline has passed. A fixture that contains
 /// such an adapter pays for it with `conformance_hints.deadline_ms`
@@ -653,14 +675,16 @@ async fn finish(
     // a case that cannot reach this function would be a hole with a comment
     // on it.
     if let Some(Terminal::Violation(kind)) = handle.close().await {
-        failures.push(Failure::new(
-            "A11",
+        failures.push(Failure::violation(
+            format!("{kind:?}"),
             format!(
                 "{}: the connection ended in ProtocolViolation::{kind:?} -- the adapter answered \
                  everything it was asked and then broke the protocol on the way out. An execution \
                  is judged up to its CLOSE, not up to the last thing someone happened to be \
-                 waiting for: output after the last measured reply is still output, and a process \
-                 that will not exit at stdin EOF has not closed at all",
+                 waiting for: output after the last measured reply is still output (whether or \
+                 not it ends in a newline), a process that will not exit at stdin EOF has not \
+                 closed at all, and a stdout still open after the process is gone is a stream \
+                 whose end nobody has seen",
                 exec.label
             ),
         ));

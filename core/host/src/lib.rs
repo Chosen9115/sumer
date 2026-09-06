@@ -120,6 +120,10 @@ pub struct AdapterHandle {
     /// [`process::supervise`]'s task: the one place a terminal reason is
     /// ever latched. `None` once [`AdapterHandle::close`] has taken it.
     supervisor: Option<tokio::task::JoinHandle<()>>,
+    /// Set by [`process::supervise`] the instant the child is reaped.
+    /// Evidence about the PROCESS only -- never about the stream, which can
+    /// outlive it (see [`AdapterHandle::close`]).
+    exited: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl Drop for AdapterHandle {
@@ -206,11 +210,13 @@ impl AdapterHandle {
             (Mux::spawn(spawned.stdin, kill_tx.clone()), None)
         };
         let reader = tokio::spawn(mux::read_loop(mux.clone(), spawned.stdout, kill_tx.clone()));
+        let exited = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let supervisor = tokio::spawn(process::supervise(
             spawned.child,
             kill_rx,
             mux.clone(),
             reader,
+            exited.clone(),
         ));
 
         let offered = HelloParams {
@@ -277,6 +283,7 @@ impl AdapterHandle {
             kill_tx,
             transcript,
             supervisor: Some(supervisor),
+            exited,
         })
     }
 
@@ -301,11 +308,9 @@ impl AdapterHandle {
     ///
     /// Closing the child's stdin (see [`mux::Mux::begin_close`]) makes a
     /// well-behaved adapter exit; its exit closes stdout; the reader loop
-    /// drains every remaining byte before it sees that EOF; and
-    /// [`process::supervise`] then latches the terminal reason. Awaiting
-    /// that supervisor task is therefore not a guess about timing -- it is
-    /// the point after which no further evidence can arrive on this
-    /// connection.
+    /// decodes every remaining byte and finalizes the framing at that end
+    /// of stream; and [`process::supervise`] then latches the terminal
+    /// reason.
     ///
     /// This is what makes "the adapter answered everything I asked and
     /// then broke the protocol" observable at all. Without a close there is
@@ -313,14 +318,33 @@ impl AdapterHandle {
     /// reader has even parsed what follows it, so a caller that judges and
     /// walks away never learns the connection died of a violation.
     ///
-    /// An adapter that is still running when `default_deadline` expires has
-    /// broken the rule that gives this boundary its meaning -- spec/wire.md
-    /// §7: **an adapter MUST exit when its stdin reaches EOF**. It is
-    /// reported as [`ProtocolViolationKind::StdinEofIgnored`], not as
-    /// `None`: everything such a process writes from here answers no
-    /// request and reaches no caller, so a caller told "it ended, reason
-    /// unknown" would be told the connection ended, which is precisely what
-    /// did not happen. `Drop` (below) kills the process on the way out.
+    /// # What this boundary does and does not establish
+    ///
+    /// Awaiting the supervisor is **not** by itself proof that the stream
+    /// ended -- a process that inherited the adapter's stdout write end
+    /// keeps it open after the adapter is reaped, and a bounded wait for a
+    /// stream that never ends is a wait that gives up. So three distinct
+    /// facts are kept apart here, and each has its own outcome:
+    ///
+    /// * **The process exited and its stdout reached end of stream.** Every
+    ///   byte it ever wrote was decoded and judged; the terminal reason is
+    ///   whatever that evidence produced --
+    ///   `Terminal::Crashed(status)` for a cooperative exit, a
+    ///   `Terminal::Violation` if the last bytes broke the protocol.
+    /// * **The process exited, the stream did not end** (in
+    ///   `process::READER_DRAIN`, or by the time this deadline expires):
+    ///   [`ProtocolViolationKind::StdoutHeldOpen`]. The host cannot say it
+    ///   read everything, and saying the connection ended cleanly would be
+    ///   certifying a drain it did not perform.
+    /// * **The process is still running** when `default_deadline` expires:
+    ///   [`ProtocolViolationKind::StdinEofIgnored`] -- spec/wire.md §7,
+    ///   **an adapter MUST exit when its stdin reaches EOF**. This kind is
+    ///   about the PROCESS, and it is assigned only on evidence about the
+    ///   process (`exited`), never on the supervisor merely taking too
+    ///   long: an adapter that exited promptly and left a slow drain
+    ///   behind it would otherwise be blamed for a rule it kept.
+    ///
+    /// `Drop` (below) kills whatever is left on the way out.
     ///
     /// `None` keeps the meaning it always had -- no terminal reason was
     /// ever latched, i.e. a deliberate non-violation shutdown. A
@@ -334,12 +358,17 @@ impl AdapterHandle {
                 .await
                 .is_err()
             {
-                // `finish` is first-wins, so this can only ever be the
-                // reason when nothing truer was latched: a violation the
-                // reader loop already named, or the exit the supervisor
-                // would have reported, outranks it by having arrived first.
-                self.mux
-                    .finish(Terminal::Violation(ProtocolViolationKind::StdinEofIgnored));
+                // The supervisor did not finish. Two very different things
+                // look like that from here, and `exited` is what tells them
+                // apart -- see the doc comment. `finish` is first-wins, so
+                // either can only ever be the reason when nothing truer was
+                // latched.
+                let kind = if self.exited.load(std::sync::atomic::Ordering::SeqCst) {
+                    ProtocolViolationKind::StdoutHeldOpen
+                } else {
+                    ProtocolViolationKind::StdinEofIgnored
+                };
+                self.mux.finish(Terminal::Violation(kind));
             }
         }
         self.mux.terminal()

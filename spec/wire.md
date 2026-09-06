@@ -86,6 +86,15 @@ This case is a `ProtocolViolation` host-side outcome (`OversizeFrame`,
 `NotJson`, or `NonUtf8`), never a wire `err` — the connection is already
 considered unrecoverable, so there is nothing to reply to.
 
+**Framing is finalized at end of stream.** A frame is bytes *and* the LF that
+terminates them, so bytes still unterminated when stdout ends are not a
+frame and never became one: the stream stopped in the middle of one. That is
+`UnterminatedFrame`, a fatal host-side outcome like the three above. The host
+does not judge those bytes (it cannot — it has half a frame) and does not
+discard them either, because discarding them is how output the adapter really
+did write disappears without a verdict: `garbage\n` after the last reply is a
+caught `NotJson`, and `garbage` without the LF must not be a clean exit.
+
 ## 3. stdout / stderr discipline
 
 `stdout` is framed JSON and nothing else, for the lifetime of the process.
@@ -288,14 +297,25 @@ coming. That is the defined end of a connection, and the only one this
 protocol has: there is no `goodbye` frame and no shutdown op, because a
 frame is something an adapter can fail to read, and a closed pipe is not.
 
-An adapter still running after stdin EOF is **unjudgeable**. The host issued
-its last id before the close, so nothing the adapter writes afterwards
-answers a request, and there is no caller left for it to reach: it is output
-that cannot be attributed, accepted, or refused by anyone. A conformance
-suite cannot decide whether such a connection ended clean, because it never
-ends. It is also a **leaked process** — with no auto-restart and no cancel
-frame, closing the connection is the only lever the host has left, and an
-adapter that ignores it has taken that lever away.
+**The host abandons whatever is still outstanding at the close, and that is
+a policy, not a physical fact.** Requests already issued keep their ids and
+stdout stays open, so an adapter *could* answer them after stdin EOF; the
+host has simply decided not to wait, and hangs up. It is written this way
+because the alternative — an open-ended drain of work the host has stopped
+asking about — has no defined end and no cancel frame to bound it, and
+because a caller that has already been told `AdapterCrashed`/`Timeout` for
+those ids cannot be un-told. So: **the host stops reading for answers at the
+close, and an answer that arrives after it reaches nobody.** Not because it
+could not have been sent, but because nothing is listening.
+
+Given that policy, an adapter still running after stdin EOF is
+**unjudgeable**: its output can no longer be attributed, accepted, or
+refused by anyone, and a conformance suite cannot decide whether such a
+connection ended clean, because it never ends. It is also a **leaked
+process** — with no auto-restart and no cancel frame, closing the connection
+is the only lever the host has left, and an adapter that ignores it has
+taken that lever away. That is what the MUST rests on: process leak and
+judgeability, not an impossibility of answering.
 
 The host's side of the bargain: it stops sending, closes stdin, and then
 waits for the process to exit for as long as that connection's own deadline
@@ -307,7 +327,18 @@ would for any other terminal violation.
 
 Exiting means exiting: flush what you have already written, drop whatever
 you are still holding, and return. Work that was in flight when EOF arrived
-does not get to finish — its reply has nowhere to go.
+does not get to finish — by the policy above, its reply has nowhere to go.
+
+**Dropping what you are holding includes stdout.** A process that inherited
+the adapter's stdout write end — a forked worker, a child left running —
+keeps that stream open after the adapter itself is reaped, and what it
+writes lands after the host has already concluded. The host therefore treats
+the process exiting and the stream ending as two separate facts: after the
+exit it waits — briefly, and bounded like everything else here — for end of
+stream, and a stdout still open when it stops waiting is a `StdoutHeldOpen`
+violation. It is not `StdinEofIgnored` — that names a
+process still running, and blaming a process that exited on time for staying
+alive would fail an honest adapter for a lie.
 
 **Per language, because the default behaviour differs and this is exactly
 where an implementer gets it wrong.** The bug is always the same shape: a
@@ -354,7 +385,8 @@ wire, from a request that could not be processed at all. It must not be.
 
 Host-side outcomes — `Timeout`, `AdapterCrashed{status}`, `IdsExhausted`
 (§6), and `ProtocolViolation{kind}` (`OversizeFrame`, `NotJson`, `NonUtf8`,
-`UnknownId`, `DuplicateId`, `PreHelloOutput`, `StdinEofIgnored`) — never
+`UnterminatedFrame`, `UnknownId`, `DuplicateId`, `PreHelloOutput`,
+`StdinEofIgnored`, `StdoutHeldOpen`) — never
 appear on the wire at all. They are things the host concludes *about* the
 adapter (or its absence of an answer), not something the adapter emits.
 
