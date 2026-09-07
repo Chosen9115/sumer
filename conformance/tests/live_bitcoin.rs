@@ -309,7 +309,7 @@ async fn check_the_invariants() -> bool {
     let built =
         std::process::Command::new(std::env::var("CARGO").unwrap_or_else(|_| "cargo".into()))
             .args(["build", "-p", "sumer-bitcoin-adapter"])
-            .current_dir(&root)
+            .current_dir(env!("CARGO_MANIFEST_DIR"))
             .status();
     match built {
         Ok(status) if status.success() => {}
