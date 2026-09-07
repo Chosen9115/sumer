@@ -21,7 +21,14 @@ jobs:
       # dtolnay/rust-toolchain: maintained, minimal, installs an exact
       # toolchain + components in one step (no separate rustup calls).
       - name: Install stable Rust
-        uses: dtolnay/rust-toolchain@stable
+        # PINNED, deliberately. With `-D warnings` on a floating toolchain, a
+        # Rust release can turn `main` red with no change to the code -- which
+        # is exactly what happened when 1.98 shipped `chunks_exact_to_as_chunks`.
+        # A required check must fail only for something in the diff. New lints
+        # are still wanted, so nightly.yml floats on `stable` and reports them
+        # as an issue instead of blocking a PR; bumping this pin is then a
+        # deliberate commit with the fixes beside it.
+        uses: dtolnay/rust-toolchain@1.98.0
         with:
           toolchain: stable
           components: rustfmt, clippy

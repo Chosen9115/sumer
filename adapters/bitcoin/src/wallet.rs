@@ -285,10 +285,13 @@ pub fn sha256_hex(msg: &[u8]) -> String {
     }
     padded.extend_from_slice(&bit_len.to_be_bytes());
 
-    for block in padded.chunks_exact(64) {
+    // `as_chunks` over `chunks_exact`: it yields fixed-size arrays, so the
+    // word read is infallible. The old form needed `try_into().unwrap_or([0;4])`,
+    // a fallback that would have hashed zeros rather than failing.
+    for block in padded.as_chunks::<64>().0 {
         let mut w = [0u32; 64];
-        for (i, word) in block.chunks_exact(4).enumerate() {
-            w[i] = u32::from_be_bytes(word.try_into().unwrap_or([0; 4]));
+        for (i, word) in block.as_chunks::<4>().0.iter().enumerate() {
+            w[i] = u32::from_be_bytes(*word);
         }
         for i in 16..64 {
             let s0 = w[i - 15].rotate_right(7) ^ w[i - 15].rotate_right(18) ^ (w[i - 15] >> 3);
