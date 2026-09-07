@@ -5,20 +5,13 @@
 //! connection, and every resource of one adapter is swept over the same
 //! one.
 //!
-//! **Freshness is derived, not marked.** A balance line is `live` iff the
-//! read that wrote it is still its adapter's current one. The read is
-//! opened once per adapter per refresh, before the spawn -- before
-//! anything that can fail -- so a resource that was not read has no new
-//! row and is stale *by construction*: a `balances.read` that failed, a
-//! reply that left a category out, a resource the adapter stopped listing,
-//! a `status.read` that never returned, a process that would not start,
-//! and every failure nobody has thought of yet all produce the same
-//! nothing, and nothing is exactly the right answer.
-//!
-//! This replaces a marker row written on each failing path. Four
-//! adversarial rounds found four such paths that had been missed, which is
-//! what a rule that has to be re-applied by hand at every exit looks like.
-//! There is now no code to omit.
+//! **The read is opened before the spawn** -- before anything here that can
+//! fail. That ordering is the whole of balance freshness: a resource this
+//! refresh did not read has no row carrying the current read, so it is
+//! stale by construction, on every failure path including the ones nobody
+//! enumerated. `spec/observation.md` §2 states the rule;
+//! `adr/0006-host-side-retraction.md` decision 8 records the marker scheme
+//! it replaced and why that shape could not work.
 
 use sumer_host::AdapterHandle;
 use sumer_wire::ReadOutcome;
@@ -78,11 +71,8 @@ pub async fn refresh(store: &mut Store, options: &RefreshOptions) -> Result<Refr
         {
             continue;
         }
-        // The read opens BEFORE the spawn, because the spawn is one of the
-        // things that can fail. Nothing else in this function has to know
-        // that: a refresh that never reaches an adapter writes no balance
-        // row carrying this read, and every figure it did not refresh is
-        // stale by construction rather than by remembering.
+        // Before the spawn, which is one of the things that can fail
+        // (`spec/observation.md` §2).
         store::open_balance_read(store.conn(), &adapter.adapter_id)?;
         let handle = match AdapterHandle::spawn(adapter.argv.clone(), []).await {
             Ok(handle) => handle,
@@ -134,11 +124,9 @@ pub async fn refresh_adapter(
     options: SweepOptions,
 ) -> Result<AdapterRefresh> {
     let mut errors = Vec::new();
-    // Same reason as in `refresh`, for the same cost: one line, on the one
-    // path that always runs. Opening a second read for a refresh that
-    // already opened one changes nothing -- only the current value is ever
-    // compared against -- so this is not a duplicate rule, it is the rule
-    // holding for the callers that spawn their own connection.
+    // The same rule holding for the callers that spawn their own
+    // connection. A second open in one refresh changes nothing: §2
+    // constrains the ordering, not the count.
     let read_id = store::open_balance_read(store.conn(), adapter_id)?;
     let hello = handle.hello();
     // **The connection must be the adapter we opened it for.**
@@ -203,11 +191,25 @@ pub async fn refresh_adapter(
     match handle.balances_read(resource_ids.clone()).await {
         Ok(read) => {
             for balance in &read.observations {
-                let outcome = read
+                // **A stored outcome is always the one the adapter
+                // reported** (`spec/observation.md` §2). The host refuses a
+                // reply that observes a resource it did not request, and
+                // every requested resource carries exactly one status (§6),
+                // so this lookup finds one; if it ever did not, the honest
+                // answer is to say so rather than to invent an outcome and
+                // stamp a figure with a freshness nobody gave it.
+                let status = read
                     .statuses
                     .iter()
                     .find(|s| s.resource_id == balance.resource_id)
-                    .map_or_else(|| "unknown".to_owned(), |s| outcome_label(&s.outcome));
+                    .ok_or_else(|| {
+                        StoreError::Host(format!(
+                            "balances.read reply carried a balance for resource {:?} with no \
+                             status of its own",
+                            balance.resource_id
+                        ))
+                    })?;
+                let outcome = outcome_label(&status.outcome);
                 store::append_balance(store.conn(), adapter_id, read_id, balance, &outcome)?;
             }
         }

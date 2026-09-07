@@ -185,8 +185,8 @@ pub struct BalanceRow {
     pub outcome: String,
     /// Whether the read that wrote this row is still this adapter's
     /// current one ([`open_balance_read`]). `false` says "no read since
-    /// has refreshed this line" -- the row is a record of what was true
-    /// then, not a claim about now, and nothing may render it `live`.
+    /// has refreshed this line": the row is a record of what was true
+    /// then, and nothing may render it `live` (spec/observation.md §2).
     pub from_latest_read: bool,
 }
 
@@ -888,16 +888,13 @@ pub fn retractions_for(
 
 /// Opens a READ for this adapter and returns its id.
 ///
-/// Called once, unconditionally, at the start of every refresh of an
-/// adapter -- before the spawn, before the hello, before anything that can
-/// fail. Everything a refresh manages to read is stamped with the id it
-/// returns; everything it does not read simply keeps an older one, and
-/// [`BalanceRow::from_latest_read`] is then false for it without any
-/// failure path having had to remember to say so.
-///
-/// Opening a read twice for one refresh is harmless by construction: only
-/// the CURRENT value is ever compared against, so an extra bump changes
-/// nothing except the integers involved.
+/// Called unconditionally at the start of every refresh of an adapter,
+/// before anything that can fail, and never anywhere else. Everything the
+/// refresh manages to read is stamped with the id it returns; everything
+/// it does not keeps an older one, and [`BalanceRow::from_latest_read`] is
+/// false for it. `spec/observation.md` §2 has the rule and why the
+/// ordering is the whole of it -- including why calling this twice in one
+/// refresh is harmless.
 pub fn open_balance_read(conn: &Connection, adapter_id: &str) -> Result<i64> {
     Ok(conn.query_row(
         "UPDATE adapter SET balance_read = balance_read + 1

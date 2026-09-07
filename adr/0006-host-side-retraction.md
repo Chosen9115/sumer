@@ -276,6 +276,22 @@ what is on screen goes stale rather than staying `live` with another adapter's
 number on it. Under the marker scheme that refusal would have owed a marker
 path of its own — a sixth path to enumerate.
 
+**And one admission rule the derivation did not cover.** Deriving freshness
+answers *which read wrote this row*; it says nothing about which rows are
+allowed in. A reply that volunteered a balance for a resource just dropped from
+a **successful** listing passed every check there was — coverage validates the
+*requested* resources, and the provenance was honest — so the line was admitted
+carrying a host-synthesized outcome and the `Live` staleness a missing status
+entry defaults to, and rendered `live`. The alternative considered was to keep
+accepting such figures and define what a host does with a balance for a
+resource it has no `resource` row for: a storage case, a rendering case, and a
+standing way for an unlisted resource to look current. Refusing the reply
+instead (`spec/observation.md` §2) adds no case at all — a `balances.read`
+names exactly the resources the listing produced, so an accepted balance always
+has a row and an adapter-reported outcome — and it inherits the derivation's
+own safety property: a refused read writes no row, so what is on screen goes
+stale rather than wrong.
+
 ## Why the host-side version needs no delivery gate
 
 This is the whole reason the capability is here and not in the adapter.

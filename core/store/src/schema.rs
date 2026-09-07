@@ -39,13 +39,13 @@ use rusqlite::Connection;
 /// inconsistency `user_version` exists to refuse. Nothing is released, so
 /// the cost is a `sumer` profile no one has yet.
 ///
-/// **3**: balance freshness is DERIVED rather than marked. `adapter` gained
-/// `balance_read` and `balance` gained `read_id` (see the tables below);
-/// the host-authored `unread:` marker rows that used to answer the same
-/// question are gone. A pre-3 database holds balance rows with no read to
-/// attribute them to, which is exactly the "figure from a read nobody can
-/// name" this version exists to make impossible -- so it is refused, not
-/// guessed at.
+/// **3**: balance freshness is DERIVED rather than marked
+/// (`spec/observation.md` §2). `adapter` gained `balance_read` and
+/// `balance` gained `read_id` (see the tables below); the host-authored
+/// `unread:` marker rows that used to answer the same question are gone.
+/// A pre-3 database holds balance rows with no read to attribute them to
+/// -- a figure from a read nobody can name, which is what this version
+/// exists to make impossible -- so it is refused, not guessed at.
 pub const USER_VERSION: i64 = 3;
 
 const DDL: &str = r"
@@ -57,14 +57,11 @@ CREATE TABLE adapter (
     -- on the per-sweep hello value only).
     local_id_derivation TEXT,
     needs_reauth        INTEGER NOT NULL DEFAULT 0,
-    -- The READ that is current for this adapter: bumped once, before
-    -- anything that can fail, every time a refresh of this adapter begins.
-    -- A balance line is fresh iff its `read_id` is this value, so a read
-    -- that failed -- anywhere, for any reason, including reasons nobody
-    -- enumerated -- writes no row carrying it and every figure it did not
-    -- refresh stops reading `live` by construction. `0` is the value no
-    -- balance row can ever carry (`open_balance_read` returns 1 first), so
-    -- an adapter that has never been refreshed has nothing fresh.
+    -- The READ that is current for this adapter, bumped at the start of
+    -- every refresh of it (spec/observation.md §2). A balance line is
+    -- fresh iff its `read_id` is this value. `0` is the value no balance
+    -- row can ever carry (`open_balance_read` returns 1 first), so an
+    -- adapter that has never been refreshed has nothing fresh.
     balance_read        INTEGER NOT NULL DEFAULT 0
 ) STRICT;
 
@@ -149,8 +146,7 @@ CREATE TABLE balance (
     balance_id       INTEGER PRIMARY KEY,
     adapter_id       TEXT NOT NULL,
     -- Which read produced this line (`adapter.balance_read` at the time).
-    -- This is the whole of freshness: the row is `live` iff this still
-    -- equals its adapter's current read.
+    -- The row is fresh iff this still equals its adapter's current read.
     read_id          INTEGER NOT NULL,
     resource_id      TEXT NOT NULL,
     category         TEXT NOT NULL,

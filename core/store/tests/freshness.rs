@@ -109,3 +109,106 @@ async fn a_failure_before_balances_read_does_not_leave_the_figure_live() {
          alone: {line}"
     );
 }
+
+/// The whole balance history of one category, oldest first.
+fn rows(store: &sumer_store::Store, category: &str) -> Vec<BalanceRow> {
+    sumer_store::store::balance_history(store.conn(), support::ADAPTER_ID, support::RESOURCE_ID)
+        .unwrap()
+        .into_iter()
+        .filter(|row| row.category == category)
+        .collect()
+}
+
+/// What `sumer balances` prints for a category.
+fn line(store: &sumer_store::Store, category: &str) -> String {
+    let history = rows(store, category);
+    sumer_store::render::balance_line(category, &history.iter().collect::<Vec<_>>())
+}
+
+/// **A balance for a resource the call never asked about is refused, not
+/// stamped `live` on an outcome nobody gave** (spec/observation.md §6).
+///
+/// The adapter lists the account, is read, and then its next SUCCESSFUL
+/// listing drops the account -- so the next `balances.read` asks about
+/// nothing at all. The reply volunteers a figure for the dropped account
+/// anyway, with honest provenance and no status entry for it.
+///
+/// Every check the reply passed was pointed the other way: coverage
+/// validates the REQUESTED resources (none), and the provenance names the
+/// connection's own adapter. So the line was stored against the current
+/// read, with a host-synthesized `unknown` outcome and the `Live` staleness
+/// that a resource with no status defaulted to -- and `sumer balances`
+/// printed a figure as `live` on a freshness claim no §6 outcome ever made.
+#[tokio::test]
+async fn a_balance_for_a_resource_nobody_asked_about_is_refused() {
+    if !support::python3_available() {
+        return;
+    }
+    let scratch = Scratch::new("volunteered-balance");
+    let fixture = fixture(
+        &scratch,
+        vec![
+            Run::new(Vec::new()).balances(vec![balance("available", Some("42.00"))]),
+            // A successful listing that no longer mentions the account,
+            // and a reply that speaks about it regardless.
+            Run::new(Vec::new())
+                .lists(&[])
+                .balances(vec![balance("available", Some("999.00"))])
+                .balance_statuses(serde_json::json!([])),
+        ],
+    );
+    let mut store = store(&scratch);
+    refresh_run(&mut store, &fixture, 0, SweepOptions::default()).await;
+    assert!(line(&store, "available").contains("live"), "the first read");
+    let before = rows(&store, "available").len();
+
+    refresh_run(&mut store, &fixture, 1, SweepOptions::default()).await;
+
+    assert_eq!(
+        rows(&store, "available").len(),
+        before,
+        "a figure whose freshness no status established never enters the store"
+    );
+    let available = line(&store, "available");
+    assert!(
+        !available.contains("999.00"),
+        "and it never reaches the screen: {available}"
+    );
+    assert!(
+        !available.contains("live") && available.contains("42.00"),
+        "what is left is the last figure that WAS asked for, stale: {available}"
+    );
+}
+
+/// The control: a resource that is still listed and does carry a status is
+/// read, stored and rendered `live` exactly as before. The rule above
+/// refuses a reply that speaks out of turn -- not a reply that answers.
+#[tokio::test]
+async fn a_listed_and_statused_balance_is_still_stored() {
+    if !support::python3_available() {
+        return;
+    }
+    let scratch = Scratch::new("statused-balance");
+    let fixture = fixture(
+        &scratch,
+        vec![Run::new(Vec::new())
+            .balances(vec![balance("available", Some("42.00"))])
+            .balance_statuses(
+                serde_json::json!([{"resource_id": support::RESOURCE_ID, "outcome": {"fetched": {"page_empty": false}}}]),
+            )],
+    );
+    let mut store = store(&scratch);
+    refresh_run(&mut store, &fixture, 0, SweepOptions::default()).await;
+
+    let stored = rows(&store, "available");
+    assert_eq!(stored.len(), 1, "the figure the adapter reported is stored");
+    assert_eq!(
+        stored[0].outcome, "fetched",
+        "with the outcome the adapter gave it, not one the host made up"
+    );
+    let available = line(&store, "available");
+    assert!(
+        available.contains("42.00") && available.contains("live"),
+        "and it renders live: {available}"
+    );
+}

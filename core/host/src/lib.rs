@@ -426,25 +426,30 @@ impl AdapterHandle {
             params.resource_ids.iter().map(String::as_str),
             &raw.statuses,
         )?;
-        // **A balance must come from the adapter on the other end of this
-        // connection.** `provenance.adapter_id` is the adapter's own claim
-        // about who observed the figure; the hello is its claim about who
-        // it is. When those disagree the connection has contradicted
-        // itself, and the contradiction is detectable HERE, one layer above
-        // the store -- where the caller's `adapter_id` is all that is left
-        // and the figure would simply be filed under it, silently
-        // reattributing another provider's money.
+        // **A balances reply answers for this connection's adapter, about
+        // the resources this call asked for, and nothing else.** Two shapes
+        // are refused, and the whole reply with each of them
+        // (`spec/observation.md` §2):
         //
-        // The whole reply is refused, not the one line. Unlike a history
-        // page -- which is judged downstream by a gate that can disqualify a
-        // sweep and still keep what was honest (`spec/observation.md` §8.1
-        // condition 8) -- a balances reply has no such judge: everything
-        // after this decodes into rows nobody re-examines. Dropping the one
-        // line would leave the rest to be stored as if the connection had
-        // never lied, and nothing downstream could tell. Refusing it is
-        // also SAFE by construction now that freshness is derived: a
-        // refused read writes no row, so every figure it did not refresh
-        // reads stale rather than wrong.
+        // - a balance whose `provenance.adapter_id` is not the connection's
+        //   own. The contradiction is detectable only here: one layer down
+        //   the caller's `adapter_id` is all that is left, and the figure
+        //   is filed under it, silently reattributing another provider's
+        //   money.
+        // - a balance for a resource this call did not ask about. The
+        //   request bounds what the reply may answer -- nothing in this
+        //   refresh listed that resource, so nothing established that it
+        //   still exists. Stored anyway it lands against the CURRENT read
+        //   and, with no status entry the host asked for behind it, on the
+        //   `Live` staleness and the synthesized outcome a missing entry
+        //   defaults to: a figure rendered `live` on a §6 outcome nobody
+        //   ever gave.
+        //
+        // Whole rather than line by line, for the reason §2 gives: a
+        // history page still faces a gate that can disqualify a sweep and
+        // keep what was honest, and a balances reply faces nothing. Safe,
+        // because freshness is derived -- a refused read writes no row, so
+        // what is on screen goes stale rather than staying `live`.
         if let Some(foreign) = raw
             .observations
             .iter()
@@ -456,6 +461,21 @@ impl AdapterHandle {
                     "malformed {OP_BALANCES_READ} reply: a balance for resource {:?} names \
                      adapter_id {:?} on the connection that announced {:?}",
                     foreign.resource_id, foreign.provenance.adapter_id, self.hello.adapter_id
+                ),
+            )));
+        }
+        let asked: HashSet<&str> = params.resource_ids.iter().map(String::as_str).collect();
+        if let Some(unasked) = raw
+            .observations
+            .iter()
+            .find(|b| !asked.contains(b.resource_id.as_str()))
+        {
+            return Err(HostError::Wire(ErrorBody::new(
+                WireErrorCode::InvalidRequest,
+                format!(
+                    "malformed {OP_BALANCES_READ} reply: a balance for resource {:?}, which \
+                     this call did not request",
+                    unasked.resource_id
                 ),
             )));
         }
@@ -659,47 +679,27 @@ fn staleness_by_resource(statuses: &[ResourceStatus]) -> HashMap<String, Stalene
         .collect()
 }
 
-/// An observation whose resource named no status at all is `Live` -- it was
-/// still just read off the wire. (The reply is malformed in that case:
-/// every requested `resource_id` appears in `statuses` exactly once. That
-/// is the conformance suite's assertion to make, not a reason to
-/// mis-stamp.)
+/// The staleness this observation's resource reported. The fallback is
+/// reachable only for an observation naming a resource this call did not
+/// request -- refused outright on a `balances.read` (spec/observation.md
+/// §2), and not part of any swept resource's page on a `history.read`. It
+/// is `Unavailable` rather than `Live` because a default is a claim, and
+/// `Live` is the one claim nothing here has the evidence to make.
 fn staleness_for(by_resource: &HashMap<String, Staleness>, resource_id: &str) -> Staleness {
     by_resource
         .get(resource_id)
         .copied()
-        .unwrap_or(Staleness::Live)
+        .unwrap_or(Staleness::Unavailable)
 }
 
 /// **Every requested `resource_id` appears in `statuses` exactly once**
-/// (spec/observation.md §6) -- never more than once, and never zero times.
-/// A reply that breaks either half is malformed, and it is refused here
-/// rather than defended against downstream.
-///
-/// This is not tidiness. Every consumer of a `statuses` array reaches for
-/// one entry per resource and takes the first match -- staleness stamping
-/// above, the retraction gate in `sumer-store`, the balance outcome label.
-///
-/// **Twice** is contradictory evidence. An adapter answering for one
-/// resource first cleanly and then with `stale` and an anonymous `degraded`
-/// gets judged on the clean entry: the sweep reads a complete, undegraded
-/// page, concludes the records it did not carry are gone, and retracts
-/// them.
-///
-/// **Not at all** is worse, because every one of those readers spells the
-/// absence as a permissive default. `history_start` is the sharp one: it is
-/// an `Option`, so a resource that supplied no status entry at all is
-/// indistinguishable from one that reported no lower bound on its history
-/// -- which is the WIDEST possible answer. The whole of history becomes
-/// reachable and every absence becomes evidence, so a reply that never said
-/// where a resource's history begins silently licenses the retraction of
-/// records that predate it. The asymmetry decides the direction: a missing
-/// bound must never widen what an absence may be evidence of. Staleness
-/// defaults `Live` the same way, and the balance outcome label defaults to
-/// `unknown`.
-///
-/// The honest place to say all of that is here, once, where the reply is
-/// decoded -- not in every reader, each of which would have to remember.
+/// (spec/observation.md §6) -- never twice, never zero times. Refused here,
+/// where the reply is decoded, rather than defended against in each of the
+/// readers downstream: staleness stamping above, the retraction gate in
+/// `sumer-store`, the balance outcome label. Every one of them reaches for
+/// one entry per resource and takes the first match, and every one of them
+/// spells an absent entry as its own permissive default. §6 carries the
+/// reasoning, including which default is the dangerous one.
 fn check_status_coverage<'a>(
     op: &str,
     requested: impl IntoIterator<Item = &'a str>,

@@ -9,9 +9,7 @@
 //!    of T)`, or `unavailable` when there has never been one. Blanking the
 //!    line loses information the store still holds; leaving it `live`
 //!    asserts a freshness nobody measured. Which of the two a line is comes
-//!    from `BalanceRow::from_latest_read` -- a fact about whether the
-//!    newest read wrote this row, not a marker some failing path had to
-//!    remember to write.
+//!    from `BalanceRow::from_latest_read` (spec/observation.md §2).
 //! 3. **Every figure carries source and freshness on its own line.** A
 //!    number with no provenance beside it is a number nobody can check.
 //!

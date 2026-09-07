@@ -215,6 +215,50 @@ stale rather than staying `live` with another adapter's number on it. A marker
 scheme would have owed this refusal a path of its own, which is one more path
 to enumerate.
 
+### A balance nobody asked for is refused, and so is its reply
+
+> **A `balances.read` reply may carry a balance only for a `resource_id` the
+> call requested. A balance for any other resource is refused, and with it the
+> whole reply.**
+
+This is §6's coverage rule seen from the other end, and it is one rule, not
+two: a reply that answers for a resource nobody asked about carries no status
+the host asked for either, so the figure arrives with **no §6 outcome behind
+it** — and every reader of a missing status entry falls back to a permissive
+default. The line is stored against the read that is current, stamped `Live`
+because nothing said otherwise, with an outcome the host had to invent, and
+`sumer balances` prints it as `live`. **A `Staleness` default is a claim**, and
+a host that defaults to `Live` is asserting a freshness it was never told. No
+observation without a status; no freshness claim without an outcome.
+
+The shape is not hypothetical. An adapter that listed resources A and B, and
+whose next **successful** listing carries only A, is asked about A alone. A
+reply that volunteers B's balance anyway — honest provenance, plausible figure,
+no status — puts B back on screen as `live` on the strength of nothing, in the
+exact case the derived-freshness rule above had just made go stale.
+
+It is refused whole rather than line by line for the reason the previous rule
+gives — a balances reply meets no judge downstream of the decode — and it is
+safe for the same reason: a refused read writes no row, so the figures already
+on screen go stale rather than being replaced by figures nobody asked for.
+
+**What this does not refuse.** A resource that is still listed and does carry
+its own status entry is being *answered*, not volunteered: its balance is
+stored exactly as before, however many resources the call named. Dropping a
+figure an adapter legitimately reported would be this rule's own bug.
+
+**A host therefore never holds a balance for a resource it has no `resource`
+row for.** A `balances.read` names the resources of the listing that opened
+the refresh, so an accepted line always has one. There is no orphan-balance
+case to define, because nothing can reach it.
+
+A `history.read` reply is bounded by its request in the same way, and the
+bound is enforced downstream rather than at the decode: an observation
+addressed to a resource the sweep did not ask about is not part of that
+resource's page, and §8.1's gate drops it unstored instead of folding it in.
+Its provenance is judged first even so — condition (8) is about every
+observation on the page, whatever resource it names.
+
 ## 3. History observations
 
 **Adapters emit observations, not revisions.** A history observation is:
@@ -473,6 +517,21 @@ produced any observations. A status entry is:
     fetched { page_empty: bool }, not_fetched, stale { as_of },
     rate_limited { retry_after_ms }, unavailable, reauth_required, revoked,
     gone, sca_required
+
+**Neither half is tidiness.** Every reader of a `statuses` array reaches for
+one entry per resource and takes the first match, so a **duplicate** entry is
+contradictory evidence judged on whichever half the reader matched first: an
+adapter that answers cleanly and then with `stale` and an anonymous `degraded`
+is read as complete and undegraded, and the sweep retracts on it. A **missing**
+entry is worse, because every one of those readers spells the absence as its
+own permissive default. `history_start` is the sharp one: it is optional, so a
+resource with no entry at all is indistinguishable from one that reported no
+lower bound on its history — the widest possible answer, under which the whole
+of history is in reach and every absence is evidence (§8.2). A missing bound
+must never widen what an absence may be evidence of. Staleness defaults the
+same way, to `Live` (§1), which is why §2 refuses a balance for a resource the
+call never asked about rather than storing a figure whose freshness no outcome
+supports.
 
 **`outcome` carries the freshness fact and nothing else.** It is what §1's
 staleness table reads, so anything that overwrites it changes how every

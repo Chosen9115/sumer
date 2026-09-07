@@ -387,6 +387,25 @@ The wire-level `err.code` vocabulary is closed and small: `unsupported_protocol`
 resource. If you find yourself wanting to put a `resource_id` in an `err`
 payload, that is the signal you want a `status` outcome instead.
 
+**A reply answers the request and nothing else.** A read names the resources
+it is asking about, and the reply may carry observations only for those. A
+`balances.read` that volunteers a balance for a resource the call did not
+request is refused whole by the host (`spec/observation.md` §2) — an adapter
+cannot put a figure on the user's screen by offering it unasked. This binds
+the reply from the opposite side to the `statuses` rule above: exactly one
+status for each resource requested, and no observation for any resource that
+was not. Extra `statuses` are inert rather than fatal, since no observation
+may reference one.
+
+`history.read` is deliberately **not** bound this way, and the asymmetry is
+worth understanding before you copy one rule onto the other. A history reply
+is judged downstream by the retraction gate, which needs to *see* an
+off-contract observation in order to disqualify the sweep for the right
+reason; refusing it at decode would replace a precise gate verdict with a
+generic transport failure. A balances reply meets no such judge — whatever
+survives the decode becomes a stored figure nobody re-examines — so the decode
+is the only place the check can live.
+
 **A reply with zero observations and every status `unavailable` is a SUCCESS
 envelope.** It is `{"id": N, "ok": {"observations": [], "statuses": [...]}}` —
 not an `err`. The request was processed correctly; the adapter is honestly
