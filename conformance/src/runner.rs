@@ -209,15 +209,27 @@ async fn case_interrupted_pagination(
 ) {
     let expect = fixture.get("expect").cloned().unwrap_or(Value::Null);
     let deadline = deadline_of(fixture);
-    for family_name in ["exact", "batch_restart"] {
-        let Some(family) = expect.pointer(&format!("/families/{family_name}")).cloned() else {
-            failures.push(Failure::new(
-                "setup",
-                format!("interrupted_pagination: expect.families.{family_name} missing"),
-            ));
-            continue;
-        };
-        run_pagination_family(argv, path, family_name, &family, deadline, failures).await;
+    // The families the FIXTURE declares, not a hardcoded pair: `exact` and
+    // `batch_restart` are the two families this suite's own fixture
+    // exercises, but an adapter may legitimately serve only one of them
+    // (the Bitcoin adapter's cursors are `exact` and nothing else), and a
+    // fixture for it would otherwise be failed for a family its adapter
+    // cannot have. Declaring none is still a setup failure: a fixture that
+    // exercises no family is a case that tests nothing.
+    let families = expect
+        .pointer("/families")
+        .and_then(Value::as_object)
+        .cloned()
+        .unwrap_or_default();
+    if families.is_empty() {
+        failures.push(Failure::new(
+            "setup",
+            "interrupted_pagination: expect.families declares no cursor family",
+        ));
+        return;
+    }
+    for (family_name, family) in families {
+        run_pagination_family(argv, path, &family_name, &family, deadline, failures).await;
     }
 }
 

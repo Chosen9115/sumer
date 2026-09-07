@@ -67,6 +67,24 @@ jobs:
             cargo clippy --all-targets --all-features -- -D warnings
           run_step "cargo test --locked --all-features" \
             cargo test --locked --all-features
+          # The live Bitcoin invariant check. It is #[ignore]d and refuses
+          # to run without SUMER_LIVE=1, so no pull request can ever be red
+          # because a free public API was slow -- this workflow is the only
+          # thing that runs it.
+          #
+          # ACCEPTABLE USE: one watch-only wallet, one published address
+          # (the 2010 pizza recipient -- a documented artefact, nobody's
+          # live wallet), a handful of requests once every 24 hours, with an
+          # honest User-Agent that says who is calling
+          # (`sumer-bitcoin/0.1`) rather than a browser forgery. An HTTP 429
+          # SKIPS the check instead of failing it: a free service asking us
+          # to slow down is not a defect in this adapter, and a nightly that
+          # cries wolf is a nightly nobody reads. If this ever stops being
+          # welcome, `--source` moves it to our own esplora instance in one
+          # line (adapters/bitcoin/README.md).
+          run_step "cargo test --test live_bitcoin (SUMER_LIVE=1)" \
+            env SUMER_LIVE=1 cargo test --locked -p sumer-conformance \
+              --test live_bitcoin -- --ignored --nocapture
           run_step "install cargo-fuzz" cargo install cargo-fuzz
           # `core/wire/fuzz` is its own workspace (see its Cargo.toml), so
           # cargo-fuzz -- which looks for a `fuzz/` directory under the

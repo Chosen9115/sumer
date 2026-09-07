@@ -1,0 +1,12 @@
+{
+ "wallets": [
+  {
+   "resource_id": "vault",
+   "label": "Pizza + BIP173 example",
+   "addresses": [
+    "17SkEw2md5avVNyYgj6RiXuQKNwkXaxFyQ",
+    "bc1qrp33g0q5c5txsp9arysrx4k6zdkfs4nce4xj0gdcccefvpysxf3qccfmv3"
+   ]
+  }
+ ]
+}
