@@ -39,9 +39,16 @@
 //!   ([`sub_nanosecond_fractions_are_unorderable`]) plus the ordering
 //!   property below, which is stated on the *exact decimal* and so still
 //!   holds where the return type gives out.
-//! * leap seconds: `:60` is accepted by the wire validator and is not a
-//!   real extra second in this arithmetic. Out of scope here; the value it
-//!   maps to is asserted in `time.rs`'s own tests, not oracled.
+//! * leap seconds: `:60` is accepted by the wire validator but names no
+//!   distinct instant under plain seconds-since-epoch arithmetic --
+//!   assigning it any value collides it with a real, different instant (the
+//!   one that follows: `23:59:60Z` and the next day's `00:00:00Z` reduce to
+//!   the same day-rollover total). As with the sub-nanosecond fraction,
+//!   there is no correct value to hold an oracle to, so this is covered by
+//!   a policy assertion instead
+//!   ([`a_leap_second_is_unorderable_not_collided_onto_the_next_second`]),
+//!   with [`corpus_is_not_hollow`] guarding that the corpus still contains
+//!   a leap second.
 //! * this says nothing about the wire validator's own accept/reject set,
 //!   only about ordering what it has already accepted.
 //!
@@ -266,6 +273,25 @@ fn parse(text: &str) -> Option<Rfc3339> {
     Rfc3339::new(text).ok()
 }
 
+/// Every RFC 3339 second field the wire validator accepts but that pins
+/// down no distinct instant under this crate's `(i64, u32)` clock: the leap
+/// second `:60`. Real UTC leap seconds are historical events -- 1998 and
+/// 2016 both had one -- so this is reachable stored data, not a
+/// hypothetical.
+fn leap_second_corpus() -> Vec<String> {
+    let mut out = Vec::new();
+    for (date, offset) in [
+        ("2016-12-31", "Z"),
+        ("1998-12-31", "Z"),
+        ("2016-06-30", "+02:00"),
+        ("1972-06-30", "-05:00"),
+    ] {
+        out.push(format!("{date}T23:59:60{offset}"));
+        out.push(format!("{date}T23:59:60.5{offset}"));
+    }
+    out
+}
+
 // ---------------------------------------------------------------------
 // The oracle is pinned to something outside this repository
 // ---------------------------------------------------------------------
@@ -337,6 +363,19 @@ fn corpus_is_not_hollow() {
     let later = "2026-01-01T00:00:00.0000000002Z";
     assert_eq!(oracle_cmp(earlier, later), Some(Ordering::Less));
     assert!(parse(earlier).is_some() && parse(later).is_some());
+
+    // A leap second must still be admissible input, or this guard's own
+    // corpus is checking nothing.
+    let leap_seconds = leap_second_corpus();
+    assert!(
+        leap_seconds.len() >= 4,
+        "the corpus must contain leap seconds, found {}",
+        leap_seconds.len()
+    );
+    assert!(
+        leap_seconds.iter().all(|text| parse(text).is_some()),
+        "the wire validator must still admit `:60` for this guard to mean anything"
+    );
 }
 
 // ---------------------------------------------------------------------
@@ -430,6 +469,39 @@ fn sub_nanosecond_fractions_are_unorderable() {
         let ts = parse(&text).unwrap();
         assert_eq!(instant(&ts).map(|i| i.1), Some(nanos), "{text}");
     }
+}
+
+/// A leap second must never be silently collided onto the instant that
+/// follows it. `23:59:60Z` and the next day's `00:00:00Z` both reduce to
+/// the same day-rollover total under plain seconds-since-epoch arithmetic
+/// -- not a rounding error, but a real, different instant reported as
+/// equal. That flips the retraction gate's `at >= start` from false to
+/// true for a record that never entered the provider's window, and needs
+/// no *current* leap-second event to reach: any historical `:60` in stored
+/// data is enough. There is no correct `(i64, u32)` to assign a leap
+/// second -- any choice collides with a real instant -- so, like the
+/// sub-nanosecond fraction, this is a policy assertion rather than a
+/// differential.
+#[test]
+fn a_leap_second_is_unorderable_not_collided_onto_the_next_second() {
+    for text in leap_second_corpus() {
+        let ts = parse(&text).expect("the wire validator admits a leap second");
+        assert_eq!(
+            instant(&ts),
+            None,
+            "{text} has no (secs, nanos) that does not collide with a real, different instant"
+        );
+    }
+
+    // The exact collision this guards against, spelled out: before the fix,
+    // both sides were `Some` and equal.
+    let leap = parse("2016-12-31T23:59:60Z").unwrap();
+    let next_second = parse("2017-01-01T00:00:00Z").unwrap();
+    assert_ne!(
+        instant(&leap),
+        instant(&next_second),
+        "a leap second must not compare equal to the instant that follows it"
+    );
 }
 
 /// The property the retraction gate actually rests on, stated against the

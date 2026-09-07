@@ -59,14 +59,16 @@ pub fn now_rfc3339() -> Rfc3339 {
 /// `None` when the text is not a timestamp this can order. Callers deciding
 /// whether to retract a record MUST treat that as "cannot order, so do not
 /// retract": a wrong exemption costs a stale row, a wrong retraction hides
-/// a financial record. Two of those cases are values `sumer_wire`'s
+/// a financial record. Three of those cases are values `sumer_wire`'s
 /// validator accepts and this cannot place on a line: a date the calendar
 /// does not have (`2026-02-30`, admitted because the validator checks
-/// `day <= 31` without the month), and a fraction finer than a nanosecond
+/// `day <= 31` without the month), a fraction finer than a nanosecond
 /// (`.0000000001`, admitted because the validator does not bound the
-/// fraction's length). Both would otherwise be answered with a *plausible
-/// wrong instant* -- a rolled-forward date, or a truncation that makes two
-/// different instants equal -- and a plausible wrong instant is what
+/// fraction's length), and a leap second (`:60`, admitted because the
+/// validator tolerates one). All three would otherwise be answered with a
+/// *plausible wrong instant* -- a rolled-forward date, a truncation that
+/// makes two different instants equal, or (for the leap second) the
+/// following second's own instant -- and a plausible wrong instant is what
 /// retracts a record that was never inside the window.
 #[must_use]
 pub fn instant(ts: &Rfc3339) -> Option<(i64, u32)> {
@@ -80,6 +82,18 @@ pub fn instant(ts: &Rfc3339) -> Option<(i64, u32)> {
     let hour: i64 = number(b.get(11..13)?)?;
     let minute: i64 = number(b.get(14..16)?)?;
     let second: i64 = number(b.get(17..19)?)?;
+    // `sumer_wire` admits `:60` to tolerate a leap second, but this clock is
+    // plain seconds-since-epoch with no leap-second table, so there is no
+    // slot for the extra second: `23:59:60` reduces to the same day-rollover
+    // total as the following `00:00:00`. That is not a rounding error, it is
+    // a genuinely different instant reported as equal, which turns the
+    // retraction gate's `at >= start` from false to true for a record that
+    // never entered the window. No current leap-second event is needed --
+    // any historical `:60` in stored data reaches this. Unorderable, like
+    // the impossible date and the sub-nanosecond fraction below.
+    if second == 60 {
+        return None;
+    }
 
     let mut i = 19;
     let mut nanos: u32 = 0;

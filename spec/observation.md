@@ -117,64 +117,103 @@ A balances list is the only shape that survives contact with all three without
 either inventing categories a provider never reported or silently dropping
 ones it did.
 
-### A host-authored marker is not a balance the host read
+### Freshness is derived from the read, not written onto the row
 
 A host that keeps a balance history — this one appends every line it reads and
 overwrites nothing — has a problem the wire itself does not. A figure it did
 **not** read this time stays on top of its category's history, still carrying
 the staleness of the last read that *did* succeed, and goes on rendering as
-`Live` long after the reads stopped working. So the host records a **marker**
-for every category it could not refresh: when a `balances.read` fails
-outright, and when a reply comes back without naming a category that resource
-has reported before. The
-marker withholds the figure and downgrades the freshness; the last known
-amount is untouched, one row further down.
+`Live` long after the reads stopped working.
 
-A marker is a host-authored row in an adapter-authored stream, which is the
-situation §8.4 confronts for retractions. There the answer is a separate
-table, so there is **no provider field to fabricate**. A balance stream has no
-second table to move to, so the same principle is stated on the row instead:
+The rule that answers it is one comparison:
 
-> **A host-authored balance marker carries no field it did not copy from the
-> adapter row it marks.** `category`, `canonical_hint`, `provider_id`,
-> `surface`, `observed_at` and `effective_at` are copied forward verbatim from
-> the most recent stored line for that `(resource_id, category)` — never
-> re-derived, never defaulted, never blanked. The host authors only the four
-> that were already its own: `amount` is **null**, because nothing was read
-> (and null is UNKNOWN, never zero); `received_at` is the host's own receipt
-> stamp (§1); `staleness` is `Unavailable`; and `completeness` is `Unknown`,
-> the explicit no-claim variant — carrying a `Complete` forward onto a read
-> that never happened would be precisely the fabrication this rule exists to
-> stop.
+> **A stored balance line is fresh iff the read that wrote it is that
+> adapter's most recent read.** A host opens a read for an adapter **before
+> anything that can fail**, and stamps every line that refresh stores with
+> it. A line from any earlier read is not fresh, and nothing else is.
 
-**A marker must also be distinguishable, and that is not a nicety.** A host
-stores the §6 `outcome` of the read each balance line came from. A marker's
-`outcome` is the outcome that occasioned it — the resource's own outcome, or
-`no_observation` when the reply named the resource and left this category out,
-or the failure when the call itself did not return — carried under an
-**`unread:` prefix**, and no adapter-derived row's outcome ever begins that
-way. Without the prefix the marker is byte-identical to an adapter row
-reporting `unavailable` with no amount, and those are two different claims:
-"the provider could not tell me" is evidence about the provider, while "I did
-not read this" is a statement about the host. A consumer that cannot tell them
-apart cannot report either one honestly.
+What the rule constrains is the *ordering*, not the count: opening a read more
+than once in a refresh is harmless, because only the current value is ever
+compared and every extra bump merely re-establishes the same invariant. What
+is not harmless is opening one late. A read opened after the first step that
+can fail leaves every earlier failure stamping its rows with the *previous*
+read, which is exactly the figure-looks-current bug this rule exists to
+remove. A host with more than one entry point into a refresh should open the
+read at each of them rather than reason about which one ran first.
 
-**A refresh that did not read a resource must not leave its last figure
-reading `live`.** This binds every path that ends a refresh early, not only a
-`balances.read` that returned and disappointed: a process that would not
-spawn, a `resources.list` that failed, a `status.read` that failed, and a
-connection refused under §8.1's `hello` rule all end without reading a
-balance, and each must mark the figures they did not refresh. The resources to
-mark come from what the host has stored, not from this run's listing — the
-failure may be that no listing happened. The converse also holds and is easy
-to get backwards: a failure *after* a successful balances read must not
-downgrade a figure that genuinely was read live this run. `live` is a claim
-about this refresh, and a host that cannot say when it last looked should say
-so rather than let an old number keep asserting freshness it no longer has.
+**Why a derivation and not a marker on the row.** The opposite shape is the
+obvious one: on every path where a balance was not read, write a row saying
+so. That shape is correct only if the paths are enumerated exhaustively, and
+they cannot be enumerated by inspection — `adr/0006-host-side-retraction.md`
+records what that cost. Deriving freshness inverts the obligation. Every one
+of these stores no line carrying the read it opened, so every figure it did
+not refresh stops being fresh **by construction**, with nothing to remember:
+
+- a `balances.read` that failed;
+- a reply that named the resource and omitted a category that resource has
+  reported before;
+- a resource the adapter has stopped listing — including one dropped from a
+  listing that otherwise **succeeded**, which no failure path ever visits;
+- a `resources.list` or a `status.read` that never returned;
+- a process that would not spawn;
+- a connection refused under §8.1's `hello` rule.
+
+Only the last of those is a rule of this document; the rest are ways a refresh
+can end. That is the point: the list does not have to be complete. A path
+nobody anticipated writes no rows either, and its figures go stale on the same
+comparison as everything else.
+
+**The converse holds, and is easy to get backwards.** A failure *after* a
+successful balances read must not downgrade a figure that genuinely was read
+this run. The read is opened once and stamps what it stored; a sweep that
+fails afterwards does not un-stamp it. Freshness is a claim about which read
+produced the line, never about whether the refresh that opened that read went
+on to succeed at everything else.
+
+**A host writes no balance row of its own.** §8.4's answer for retractions — a
+separate table, with **no provider field to fabricate** — needs no restatement
+here, because there is no host-authored balance row on which to fabricate one.
+The **`unread:` outcome prefix** an earlier version of this document required
+is **withdrawn**: a stored `outcome` is now always the §6 outcome the adapter
+reported for that resource, in the reply the line came from, and nothing else.
+
+A consumer still has two claims to tell apart, and still can:
+
+- **"the provider could not tell me"** is a line from the latest read whose
+  `amount` is null — the adapter looked and does not know, and null is
+  UNKNOWN, **never zero**;
+- **"I did not read this"** is any line the latest read did not write.
+
+The first is evidence about a provider; the second is a statement about the
+host. They are now different by construction rather than by a prefix: one is
+in the current read, the other is not.
 
 A category with no stored line is left alone. There is no figure there to
-protect from looking falsely current, and writing a marker for it would be the
+protect from looking falsely current, and writing anything for it would be the
 host asserting the category exists on the strength of nothing.
+
+### A balance from another adapter is refused, and so is its reply
+
+> **A balance whose `provenance.adapter_id` is not the connection's own is
+> refused, and with it the whole `balances.read` reply.**
+
+§8.1 condition (8) refuses a foreign *observation* one at a time, and can
+afford to: downstream of the decode a history page still faces the retraction
+gate, a judge that disqualifies the sweep and keeps what was honest. A
+balances reply has no such judge. A host files each balance under the
+connection it came from, so a contradiction that survives the decode is
+silently resolved in favour of the wrong adapter — the figure lands under the
+connection's `adapter_id`, and the claim that some other adapter observed it
+is simply lost.
+
+It is refused whole rather than line by line because nothing downstream of the
+decode could tell a refused line from an absent one: the rest of the reply
+would be stored as if the connection had never contradicted itself, and no
+consumer could see that it had. Refusing whole is only *safe* because
+freshness is derived — a refused read writes no row, so what is on screen goes
+stale rather than staying `live` with another adapter's number on it. A marker
+scheme would have owed this refusal a path of its own, which is one more path
+to enumerate.
 
 ## 3. History observations
 
@@ -506,7 +545,9 @@ JSON whitespace and key order.
 refuses such an observation outright, whatever its size, and that refusal
 outranks this section — it is never measured, never dropped for being
 oversized, and never turned into a `degraded` entry. §8.1 carries the
-reason.
+reason. A *balance* whose `provenance.adapter_id` is foreign is not measured
+either, and for a stronger reason: §2 refuses its whole reply, so nothing in
+it reaches this section at all.
 
 **Why `degraded` is a field and not an outcome.** An earlier version of this
 document spelled the degrade as an outcome, `oversized_observation`, which

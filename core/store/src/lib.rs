@@ -11,8 +11,8 @@
 //! **The retraction table** ([`schema`]): absence is host-authored and has
 //! its own table. A host cannot author an `Observation`: it has no amount,
 //! no surface, no posting and no provider provenance, and fabricating them
-//! would be fabricating provider evidence. A record is live iff its chain
-//! head's revision exceeds every retraction revision for its key, which is
+//! would be fabricating provider evidence. A record is live iff its chain's
+//! highest revision exceeds every retraction revision for its key, which is
 //! why revival needs no special case anywhere.
 //!
 //! **The single writer** ([`profile`]): every writing command holds an

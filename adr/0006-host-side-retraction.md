@@ -10,10 +10,10 @@ chain's **highest** revision, not the head's — those are two different orders,
 and mixing them buries records permanently (decision 3, and
 `spec/observation.md` §8.4, which carries the reasoning). Head *selection* is
 untouched. The two additions are the `resource_id` amendment to the content
-hash and the adapter obligation that pairs with it (decision 7), and the shape
-of a host-authored balance marker (decision 8) — the same "no provider field
-to fabricate" principle as decision 3, applied to a stream that has no second
-table to move to.
+hash and the adapter obligation that pairs with it (decision 7), and the rule
+that decides whether a stored balance is fresh (decision 8) — where the
+first design, a host-authored marker row, was rejected outright and the
+reasoning for rejecting it is the part worth keeping.
 
 ## Context
 
@@ -229,33 +229,52 @@ under whichever resource swept last: well-defined, useless, and the adapter's
 bug. The host cannot do better, because "moved" and "reported twice" are the
 same bytes.
 
-### 8. A host-authored balance marker copies, and says so
+### 8. Balance freshness is derived from the read, not marked on the row
 
 **Added in revision 1.**
 
-Balance lines are appended and never overwritten, so a failed `balances.read`
-— or a reply that stops naming a category it used to report — leaves the last
-successful figure on top, still stamped with that read's staleness, rendering
-as `Live` indefinitely. `refresh` now writes a marker row for every such
-category: amount withheld, freshness downgraded, last known figure untouched
-one row below.
+Balance lines are appended and never overwritten, so a figure the host did not
+read this time stays on top of its category, still stamped with the staleness
+of the last read that succeeded, and renders as `Live` indefinitely. The rule
+is now one comparison, stated normatively in `spec/observation.md` §2: **a
+stored balance line is fresh iff the read that wrote it is that adapter's most
+recent read.** A refresh opens a read for the adapter before anything that can
+fail and stamps every line it stores; a read that reaches no adapter stamps
+nothing, and every figure it did not refresh stops reading `live` with no
+failure path having had to say so.
 
-That is a host-authored row in an adapter-authored stream, which decision 3
-answers for retractions by giving them their own table with no provider field
-to fabricate. A balance stream has no second table to move to, so the rule is
-stated on the row: **the marker carries no field it did not copy from the row
-it marks.** `category`, `canonical_hint`, `provider_id`, `surface`,
-`observed_at` and `effective_at` are copied forward; the host authors only
-`amount` (null — nothing was read, and never a zero), `received_at`,
-`staleness` (`Unavailable`) and `completeness` (`Unknown`, the explicit
-no-claim variant). It is written as a `SELECT` from the row it marks, so the
-copying is structural rather than a promise the next edit can break.
+**What this replaced, and why the rejection is the lesson.** The first design
+was the obvious one: on every path where a balance was not read, write a
+host-authored **marker** row — amount withheld, freshness downgraded, last
+figure untouched one row below — carrying an `unread:` prefix on its stored
+`outcome` so it could not be confused with an adapter reporting `unavailable`.
+Four adversarial review rounds found five bugs in it, and they were all one
+bug. A failed `balances.read` wrote no marker. A resource that still reported
+one category left a dropped category reading `live`. Spawn, `resources.list`
+and `status.read` failures all returned before the marker code. A resource
+dropped from a **successful** listing was visited by neither marker loop and
+read `live` for ever. And the marker that did get written named the wrong
+reason.
 
-Before this, such a row was **byte-identical** to an adapter row reporting
-`unavailable` with no amount, and no consumer could tell "the provider could
-not tell me" from "I did not read this." So a marker's stored `outcome`
-carries an `unread:` prefix, which no adapter-derived row's ever does.
-`spec/observation.md` §2 states both halves normatively.
+Each round found one path nobody had. That is the transferable finding, and it
+is not about balances: **an enumeration of failure paths cannot be completed by
+inspection.** A design whose correctness is the completeness of such a list is
+wrong however many rounds it survives — the next round finds the next path.
+Inverting it costs an integer and a column and cannot have that defect, because
+the paths never have to be named. The marker machinery was deleted (−60 lines
+of production code, `refresh.rs` alone −156), and with it the `unread:` prefix:
+the host now writes no balance row of its own, so decision 3's "no provider
+field to fabricate" has nothing left to apply to on this stream. A stored
+`outcome` is always the outcome the adapter reported.
+
+The derivation also made one refusal safe that was not. A `balances.read`
+reply carrying a balance whose `provenance.adapter_id` is not the connection's
+own is refused **whole**, not line by line — there is no judge downstream of
+the decode, as there is for a history page, to tell a refused line from an
+absent one. Refusing whole is only safe because a refused read writes no row:
+what is on screen goes stale rather than staying `live` with another adapter's
+number on it. Under the marker scheme that refusal would have owed a marker
+path of its own — a sixth path to enumerate.
 
 ## Why the host-side version needs no delivery gate
 
