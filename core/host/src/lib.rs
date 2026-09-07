@@ -20,6 +20,7 @@ pub mod fold;
 mod mux;
 pub mod paging;
 mod process;
+pub mod time;
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -399,11 +400,14 @@ impl AdapterHandle {
         &self,
         resource_ids: Vec<String>,
     ) -> Result<sumer_wire::StatusReadReply, HostError> {
-        self.call_typed(
-            OP_STATUS_READ,
-            sumer_wire::StatusReadParams { resource_ids },
-        )
-        .await
+        let reply: sumer_wire::StatusReadReply = self
+            .call_typed(
+                OP_STATUS_READ,
+                sumer_wire::StatusReadParams { resource_ids },
+            )
+            .await?;
+        reject_duplicate_statuses(OP_STATUS_READ, &reply.statuses)?;
+        Ok(reply)
     }
 
     /// `balances.read`: batched, not paginated (Contract Amendment 1 Ruling
@@ -419,11 +423,15 @@ impl AdapterHandle {
                 sumer_wire::BalancesReadParams { resource_ids },
             )
             .await?;
+        reject_duplicate_statuses(OP_BALANCES_READ, &raw.statuses)?;
         let staleness = staleness_by_resource(&raw.statuses);
         let mut statuses = raw.statuses;
-        let observations = drop_oversized(raw.observations, &mut statuses, |b| {
-            (b.resource_id.clone(), None)
-        })
+        let observations = drop_oversized(
+            raw.observations,
+            &mut statuses,
+            |_| true,
+            |b| (b.resource_id.clone(), None),
+        )
         .into_iter()
         .map(|wire| {
             let stale = staleness_for(&staleness, &wire.resource_id);
@@ -447,11 +455,26 @@ impl AdapterHandle {
         let (raw, received_at): (sumer_wire::HistoryReadReply, Rfc3339) = self
             .call_typed_with_receipt(OP_HISTORY_READ, sumer_wire::HistoryReadParams { resources })
             .await?;
+        reject_duplicate_statuses(OP_HISTORY_READ, &raw.statuses)?;
         let staleness = staleness_by_resource(&raw.statuses);
         let mut statuses = raw.statuses;
-        let observations = drop_oversized(raw.observations, &mut statuses, |o| {
-            (o.resource_id.clone(), Some(o.local_id.clone()))
-        })
+        // An observation naming ANOTHER adapter is not measured and not
+        // dropped here: `spec/observation.md` §8.1 condition (8) refuses it
+        // outright and disqualifies the sweep, and that ruling is stronger
+        // than §6's degrade. Dropping it here instead would file it as a
+        // NAMED degrade -- which merely EXEMPTS its `local_id` from
+        // retraction -- so a foreign record would suppress a retraction
+        // rather than block one, exactly the inversion §8.1 forbids ("a
+        // refused observation ... can never suppress a retraction"). It is
+        // passed through to the one place that can tell the difference,
+        // which refuses it and stores nothing.
+        let own = self.hello.adapter_id.clone();
+        let observations = drop_oversized(
+            raw.observations,
+            &mut statuses,
+            |o: &sumer_wire::ObservationWire| o.provenance.adapter_id == own,
+            |o| (o.resource_id.clone(), Some(o.local_id.clone())),
+        )
         .into_iter()
         .map(|wire| {
             let stale = staleness_for(&staleness, &wire.resource_id);
@@ -608,6 +631,36 @@ fn staleness_for(by_resource: &HashMap<String, Staleness>, resource_id: &str) ->
         .unwrap_or(Staleness::Live)
 }
 
+/// **Every requested `resource_id` appears in `statuses` exactly once**
+/// (spec/observation.md §6). A reply that names one twice is malformed, and
+/// it is refused here rather than defended against downstream.
+///
+/// This is not tidiness. Every consumer of a `statuses` array reaches for
+/// one entry per resource and takes the first match -- staleness stamping
+/// above, the retraction gate in `sumer-store`, the balance outcome label.
+/// An adapter answering twice for one resource, first cleanly and then with
+/// `stale` and an anonymous `degraded`, gets judged on the clean entry: the
+/// sweep reads a complete, undegraded page, concludes the records it did
+/// not carry are gone, and retracts them. Contradictory evidence must never
+/// be judged complete, and the honest place to say so is here, once, where
+/// the reply is decoded -- not in every reader, each of which would have to
+/// remember.
+fn reject_duplicate_statuses(op: &str, statuses: &[ResourceStatus]) -> Result<(), HostError> {
+    let mut seen: HashMap<&str, ()> = HashMap::new();
+    for status in statuses {
+        if seen.insert(status.resource_id.as_str(), ()).is_some() {
+            return Err(HostError::Wire(ErrorBody::new(
+                WireErrorCode::InvalidRequest,
+                format!(
+                    "malformed {op} reply: resource {:?} appears in `statuses` more than once;                      every requested resource_id appears exactly once",
+                    status.resource_id
+                ),
+            )));
+        }
+    }
+    Ok(())
+}
+
 // ---------------------------------------------------------------------
 // MAX_OBSERVATION_BYTES enforcement (spec/observation.md §6)
 // ---------------------------------------------------------------------
@@ -630,11 +683,15 @@ fn staleness_for(by_resource: &HashMap<String, Staleness>, resource_id: &str) ->
 fn drop_oversized<T: serde::Serialize>(
     observations: Vec<T>,
     statuses: &mut Vec<ResourceStatus>,
+    measure: impl Fn(&T) -> bool,
     key: impl Fn(&T) -> (String, Option<String>),
 ) -> Vec<T> {
     observations
         .into_iter()
         .filter(|observation| {
+            if !measure(observation) {
+                return true;
+            }
             let bytes = serde_json::to_vec(observation).map_or(usize::MAX, |v| v.len());
             if bytes <= MAX_OBSERVATION_BYTES {
                 return true;
@@ -646,13 +703,23 @@ fn drop_oversized<T: serde::Serialize>(
         .collect()
 }
 
-/// Records the dropped record on one resource's status. It sets that
-/// entry's `degraded` field rather than adding a second entry -- **every
-/// requested `resource_id` appears in `statuses` exactly once**
+/// Records the dropped record on one resource's status. It **appends to**
+/// that entry's `degraded` list rather than adding a second status entry --
+/// **every requested `resource_id` appears in `statuses` exactly once**
 /// (spec/observation.md §6) -- and rather than replacing its `outcome`,
 /// which carries a different fact: how fresh what this resource *did*
 /// deliver is. Overwriting `stale { as_of }` here would mis-stamp a
 /// perfectly good cached sibling as `Live`.
+///
+/// **Appends, and never overwrites.** This runs once per dropped record, so
+/// a single slot lost every drop but the last: two oversized records on one
+/// page left the first unexplained, and an unexplained absence is retracted.
+/// Worse, an *anonymous* degrade the adapter itself reported -- which
+/// disqualifies the sweep (§8.1 condition 5) -- was overwritten by this
+/// host-authored NAMED one, which merely exempts one id. That silently
+/// converted a disqualifying signal into an exempting one and retracted a
+/// live record. Nothing the host writes here can weaken what the adapter
+/// said.
 fn report_oversized(
     statuses: &mut Vec<ResourceStatus>,
     resource_id: String,
@@ -667,7 +734,7 @@ fn report_oversized(
         .iter_mut()
         .find(|status| status.resource_id == resource_id)
     {
-        Some(existing) => existing.degraded = Some(degraded),
+        Some(existing) => existing.degraded.push(degraded),
         // A resource that produced an observation but no status entry is
         // already a malformed reply (the conformance suite's assertion to
         // make). The host still records what it dropped rather than
@@ -676,88 +743,12 @@ fn report_oversized(
         None => statuses.push(ResourceStatus {
             resource_id,
             outcome: ReadOutcome::Fetched { page_empty: false },
-            degraded: Some(degraded),
+            degraded: vec![degraded],
             provider_detail: None,
             page: None,
             credential_expires_at: None,
             strong_auth_expires_at: None,
             history_start: None,
         }),
-    }
-}
-
-// ---------------------------------------------------------------------
-// Host clock: RFC 3339 "now", stdlib-only.
-// ---------------------------------------------------------------------
-
-/// The host's own receipt-time stamp, formatted to second precision as
-/// `YYYY-MM-DDTHH:MM:SSZ` -- exactly the shape [`Rfc3339::new`] validates.
-/// No date/time dependency: a calendar-correct proleptic Gregorian
-/// conversion from a Unix timestamp is a well-known, self-contained
-/// algorithm (Hinnant's `civil_from_days`), and nothing here needs time
-/// zones, locales, or calendar arithmetic beyond that.
-pub(crate) fn now_rfc3339() -> Rfc3339 {
-    let since_epoch = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default();
-    let total_secs = i64::try_from(since_epoch.as_secs()).unwrap_or(i64::MAX);
-    let days = total_secs.div_euclid(86_400);
-    let secs_of_day = total_secs.rem_euclid(86_400);
-    let hour = secs_of_day / 3600;
-    let minute = (secs_of_day % 3600) / 60;
-    let second = secs_of_day % 60;
-    let (year, month, day) = civil_from_days(days);
-    let text = format!("{year:04}-{month:02}-{day:02}T{hour:02}:{minute:02}:{second:02}Z");
-    Rfc3339::new(text).unwrap_or_else(|e| {
-        // Unreachable except if `Rfc3339`'s own validation rules change
-        // shape: `year`/`month`/`day`/`hour`/`minute`/`second` above are
-        // all in-range by construction (the civil-calendar algorithm and
-        // the `div_euclid`/`rem_euclid` splits guarantee it), formatted
-        // into exactly the 20-byte shape the validator requires.
-        unreachable!("now_rfc3339 built a timestamp its own crate rejects: {e}")
-    })
-}
-
-/// Civil (proleptic Gregorian) date from a day count since the Unix epoch.
-/// Howard Hinnant's `civil_from_days`
-/// (<http://howardhinnant.github.io/date_algorithms.html>), valid for any
-/// `days >= 0` (all we need: [`now_rfc3339`] never sees a pre-1970 value).
-fn civil_from_days(days: i64) -> (i64, i64, i64) {
-    let z = days + 719_468;
-    let era = z.div_euclid(146_097);
-    let doe = z - era * 146_097; // [0, 146096]
-    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365; // [0, 399]
-    let y = yoe + era * 400;
-    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100); // [0, 365]
-    let mp = (5 * doy + 2) / 153; // [0, 11]
-    let d = doy - (153 * mp + 2) / 5 + 1; // [1, 31]
-    let m = if mp < 10 { mp + 3 } else { mp - 9 }; // [1, 12]
-    let y = if m <= 2 { y + 1 } else { y };
-    (y, m, d)
-}
-
-#[cfg(test)]
-#[allow(clippy::unwrap_used, clippy::expect_used)]
-mod lib_tests {
-    use super::*;
-
-    #[test]
-    fn now_rfc3339_is_well_formed_and_recent() {
-        let ts = now_rfc3339();
-        assert!(
-            ts.as_str().starts_with("20"),
-            "expected a 21st-century date, got {ts:?}"
-        );
-        assert!(ts.as_str().ends_with('Z'));
-    }
-
-    #[test]
-    fn civil_from_days_matches_known_dates() {
-        // 1970-01-01 is day 0 by definition.
-        assert_eq!(civil_from_days(0), (1970, 1, 1));
-        // 2000-03-01 is a well-known anchor for this algorithm.
-        assert_eq!(civil_from_days(11_017), (2000, 3, 1));
-        // 2026-09-06, comfortably inside this milestone's timeframe.
-        assert_eq!(civil_from_days(20_702), (2026, 9, 6));
     }
 }

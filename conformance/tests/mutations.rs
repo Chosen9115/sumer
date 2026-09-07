@@ -263,7 +263,7 @@ const COVERAGE: &[(&str, &[&str])] = &[
     ("interrupted_pagination", &["A1", "A5", "A10"]),
     ("large_amounts", &["A1", "A2"]),
     ("null_category", &["A3"]),
-    ("oversized_observation", &["A10"]),
+    ("oversized_observation", &["A10", "A7"]),
     (
         "pending_to_posted",
         &[

@@ -162,3 +162,20 @@ decision here (say, adding a cancel frame, or moving to length-prefixed
 framing under a new version) is bounded to that version bump and the
 conformance suite's coverage of it; it does not require re-deciding the
 process-versus-library adapter boundary ADR 0001 already settled.
+
+## Revision 1 — 2026-09-07, superseded by PR 4's store
+
+The reasoning above rests in one place on cursor and revision stores being
+"host-side and in-memory by design" (see the paragraph near the frame-cap
+discussion). That was true when this was decided and is no longer: PR 4's
+`core/store` persists both, and `refresh` is the first caller `fold` and
+`paging` have ever had.
+
+The decision is unaffected — nothing in the envelope depended on the stores
+being transient — but a reader reaching that sentence today would be misled,
+which is why this is recorded rather than edited. What replaces the
+in-memory assumption is stated normatively in `spec/observation.md` §8 and
+argued in ADR 0006: a persisted cursor is written only inside the
+transaction that commits the page which minted it, and it is dropped when
+the resource fingerprint or the adapter's `local_id_derivation` changes.
+

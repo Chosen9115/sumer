@@ -26,8 +26,11 @@ tombstone probe: it asked the provider about transactions this adapter had
 seen before and no longer saw, which restated your wallet's own history back
 at the server one txid at a time. **This adapter no longer reports
 disappearances and no longer makes that request** — see "What this adapter
-does NOT do" in `README.md`. When the capability returns in PR 4 the probe returns with it,
-and this file will say so before it ships.
+does NOT do" in `README.md`. **The capability has returned, and the probe has
+not**: the host derives absence from a complete sweep of the reads listed above
+(`spec/observation.md` §8), so nothing asks the provider about a transaction it
+did not just report. The disclosure in this file is the disclosure, and it did
+not grow to buy retraction back.
 
 The operator of the Esplora instance therefore learns, for every sync:
 

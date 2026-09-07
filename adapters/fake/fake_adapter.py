@@ -182,9 +182,10 @@ def degrade_oversized(body):
 
     Step 2: if it is STILL too large (an oversized `description`, say), the
     observation is omitted entirely, the resource's status entry gains
-    `degraded {local_id, bytes}` carrying its REAL measured size, and every
-    other observation on the page is emitted regardless -- one bad event
-    must never brick a resource.
+    a `degraded {local_id, bytes}` entry carrying its REAL measured size --
+    one entry per omitted record, APPENDED, never overwriting an earlier
+    one -- and every other observation on the page is emitted regardless:
+    one bad event must never brick a resource.
 
     `degraded` sits BESIDE `outcome` and never replaces it (spec/observation
     .md section 6). A resource can be serving cached data and have dropped
@@ -205,10 +206,9 @@ def degrade_oversized(body):
         if size > MAX_OBSERVATION_BYTES:
             for status in body.get("statuses", []):
                 if status.get("resource_id") == obs.get("resource_id"):
-                    status["degraded"] = {
-                        "local_id": obs.get("local_id"),
-                        "bytes": size,
-                    }
+                    status.setdefault("degraded", []).append(
+                        {"local_id": obs.get("local_id"), "bytes": size}
+                    )
             continue
         kept.append(obs)
     body["observations"] = kept

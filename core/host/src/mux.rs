@@ -709,7 +709,7 @@ pub async fn read_loop(
         let mut frames = Vec::new();
         let push_result = decoder.push(&buf[..n], &mut frames);
         for frame in frames {
-            let received_at = crate::now_rfc3339();
+            let received_at = crate::time::now_rfc3339();
             if let Err(kind) = mux.on_frame(&mut hello_done, frame, received_at) {
                 let _ = kill_tx.try_send(Some(kind));
                 return;

@@ -1,6 +1,6 @@
 # ADR 0004 — The watch-only Bitcoin adapter: Esplora, wallet-shaped resources, byte-cut pages, and no retraction
 
-- **Status:** accepted (revision 4)
+- **Status:** accepted (revision 5)
 - **Date:** 2026-09-07
 - **Decision by:** Linus, Milestone 1
 
@@ -26,6 +26,15 @@ the corner is deleted rather than designed a fifth time. Decisions 1, 2 and
 3 are unchanged. The three superseded decisions are kept below, marked
 **Superseded in revision 4**, because what they claimed and why it stopped
 being claimed is the whole argument.
+
+**Revision 5 changes no decision in this document. It records that PR 4
+discharged both obligations revision 4 left on it**: retraction has returned,
+host-side, and the address-set binding below is met. Decisions 1, 2, 3 and 7
+stand exactly as written — this adapter still emits no tombstone, still keeps
+no memory of what it reported, and still makes no unrecoverable write. What
+changed is on the other side of the wire. See
+`adr/0006-host-side-retraction.md` and `spec/observation.md` §8, and the two
+paragraphs marked **Discharged in revision 5** below.
 
 Corrections are marked **Revised** in place, with the claim they replace
 stated rather than deleted.
@@ -293,10 +302,10 @@ subtracts every tombstone that `spec/observation.md` §6 step 2 omitted for
 size, accumulated across all of that crawl's pages, from the set it records
 as gone. Without that subtraction the failure is silent and permanent: an
 oversized tombstone is omitted, the crawl still drains, the baseline still
-forgets the txid, nothing ever probes it again, and the host is told only
-`degraded {}`. Omission is deterministic per observation — it depends on
-`MAX_OBSERVATION_BYTES` and the observation, not on the page budget — so
-the accumulator needs no delivery gate of its own.
+forgets the txid, nothing ever probes it again, and the host is told only an
+anonymous `degraded` entry. Omission is deterministic per observation — it
+depends on `MAX_OBSERVATION_BYTES` and the observation, not on the page
+budget — so the accumulator needs no delivery gate of its own.
 
 **`--source` is bounded at 256 bytes, rejected and not truncated.** It
 becomes `provenance.provider_id` on every observation this adapter emits,
@@ -423,6 +432,20 @@ something other than "a byte reached a pipe". That is what PR 4's
 persistence is. Retraction lands there or not at all; it does not come back
 as a fifth patch to a file-based baseline.
 
+**Discharged in revision 5.** It landed there, and not as a fifth patch to
+anything here. The host derives absence itself from a **complete sweep** —
+one `history.read` that began at `page: None`, drained, and passed eight
+gates — and writes it to an append-only retraction table under the same
+SQLite transaction as the sweep's final page. The three requirements this
+paragraph set are met and one of them turned out to be unnecessary: the
+state is durable and survives a process, the write is the host's own
+transaction, and "delivered" needs no expression at all, because the party
+that commits is the party that consumed the reply. The normative rule is
+`spec/observation.md` §8; the argument is `adr/0006-host-side-retraction.md`.
+**Nothing in this adapter changed to make that work**, which is the strongest
+available evidence that decision 7 removed a capability from the wrong
+layer rather than removing it from the product.
+
 **The wire's tombstone shape is unaffected and stays proven.**
 `spec/observation.md` §4's tombstone semantics, the host fold, and the
 append-only chain are all exercised by `conformance/cases/reorg_vanish.json`
@@ -460,6 +483,16 @@ address-set SHA-256 recorded in `seen.json` differs from the wallet's
 current one.** Without that, "adding an address is a revision" is false for
 history: the new address's past is silently never delivered. This paragraph
 is the requirement; a PR 4 that persists cursors without it does not pass.
+
+**Discharged in revision 5.** PR 4 meets it twice over. The host records a
+`fingerprint` per resource and **drops the stored cursor** whenever that
+fingerprint or the adapter's `local_id_derivation` changes; and separately,
+`refresh` always sweeps from `page: None`, so the ordinary path never carries
+a stored cursor at all (the cursor exists to resume a sweep a crash cut
+short, and a resumed sweep is partial by the gates in
+`spec/observation.md` §8.1, so it never retracts either). The requirement is
+met by the first rule; the second makes it unreachable in the common case
+rather than merely handled.
 
 ## Reconciliation with ADR 0001 (Revision 2)
 
@@ -569,13 +602,19 @@ process boundary as any other.
   name" has no answer to be faithful to; `confirmed` and `unconfirmed` are
   named by us, computed from `chain_stats`/`mempool_stats` funded minus
   spent, never summed, and `unconfirmed` may legitimately be negative.
-- **No disappearance is ever reported.** See decision 7. A transaction
-  dropped from the mempool or reorged out stays in the host's live set until
-  PR 4.
+- **No disappearance is ever reported *by this adapter*.** See decision 7.
+  Since revision 5 the host retracts such a record itself from a complete
+  sweep, so it no longer stays in the live set — but the reason is coarser
+  than a tombstone's was: a host deriving absence cannot tell `reorged_out`
+  from `dropped_from_mempool` and does not guess, so both arrive as
+  `absent_from_complete_sweep` (`adr/0006-host-side-retraction.md`).
 - **A cursor-resumed read never carries a mined revision.** A transaction
   reported `pending` and later confirmed at or below the cursor is
   suppressed, not revised — in one process as much as across two. See
-  decision 3 as revised. Repaired only by a `history.read` with no `page`.
+  decision 3 as revised. Repaired only by a `history.read` with no `page` —
+  which, since revision 5, is what every ordinary `refresh` issues, so this
+  costs a Sumer host nothing in practice. It remains a real limit for any
+  host that resumes from a stored cursor by default.
 - **`history.read` never answers `stale`.** Nothing about a history is
   cached, so a failed history read has no prior answer to be stale about:
   it is `unavailable`. Balances are unaffected — that is what the cache is

@@ -60,10 +60,11 @@ conforming-looking implementations can disagree about whether
 
 A frame at or under `MAX_FRAME_BYTES` that still contains an oversized
 observation is not a wire-level violation; it is handled inside the reply
-body per `spec/observation.md` §6 — the record is omitted and reported in
-its resource's status `degraded { local_id?, bytes }` field, which sits
-beside that status's `outcome` and never replaces it. A frame that itself exceeds `MAX_FRAME_BYTES` is a
-wire-level violation regardless of what is inside it.
+body per `spec/observation.md` §6 — the record is omitted and reported as a
+`{ local_id?, bytes }` entry appended to its resource's status `degraded`
+list, which sits beside that status's `outcome` and never replaces it. A
+frame that itself exceeds `MAX_FRAME_BYTES` is a wire-level violation
+regardless of what is inside it.
 
 ## 2. Fatal frames: no resync
 

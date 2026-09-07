@@ -12,15 +12,14 @@
 //! expectations are checked against **one** implementation instead of two
 //! that could silently diverge.
 //!
-//! **Known limit: nothing in this crate calls it.** [`crate::AdapterHandle`]
-//! never assigns a revision -- `history_read` hands observations back and
-//! says the fold is the caller's step -- so the conformance suite is this
-//! module's only consumer today. "The host assigns `revision` by arrival
-//! order" is therefore proven against `Fold` itself, and against a `Fold`
-//! the suite drives over real adapter reads, but never end to end through
-//! a host doing it on its own behalf: an integration built on
-//! `AdapterHandle` alone would get no revisions at all and nothing would
-//! notice. Closes when the CLI arrives and becomes that caller.
+//! `sumer refresh` is this module's caller inside the host: it replays one
+//! ADAPTER's stored observations into one `Fold` in stored order (the key
+//! is `(adapter_id, local_id)`, so a per-resource replay would split a
+//! chain the moment a `local_id` moved resource), ingests the sweep's, and
+//! takes [`Fold::live_set`] as the base it derives retraction from
+//! (`spec/observation.md` §8). Revision assignment
+//! therefore has exactly one implementation, exercised both end to end by
+//! the CLI and directly by the conformance suite.
 //!
 //! **Revision order vs. chain order are two different things, on purpose.**
 //! `revision` is assigned strictly in the order [`Fold::ingest`] is called

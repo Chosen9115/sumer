@@ -349,8 +349,8 @@ fn internal(e: impl Display) -> ErrorBody {
 /// `strong_auth_expires_at` do not exist for a watch-only wallet -- there
 /// is no credential and no authentication session.
 ///
-/// `degraded` starts absent and is filled in by [`map::cut_page`] when a
-/// page had to drop a record for size. It used to be documented here as
+/// `degraded` starts empty and is filled in by [`map::cut_page`] with one
+/// entry per record a page had to drop for size. It used to be documented here as
 /// unreachable, on the grounds that this adapter's `provider_extra` is a
 /// fixed handful of scalars -- which was wrong: `block_hash` is one of
 /// them, it comes from the provider, and a provider scalar has no length
@@ -359,7 +359,7 @@ fn status(resource_id: &str, outcome: ReadOutcome) -> ResourceStatus {
     ResourceStatus {
         resource_id: resource_id.to_owned(),
         outcome,
-        degraded: None,
+        degraded: Vec::new(),
         provider_detail: None,
         page: None,
         credential_expires_at: None,

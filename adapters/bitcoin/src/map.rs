@@ -636,10 +636,11 @@ pub struct Page {
     pub next: Option<Cursor>,
     /// Set only when the page cut early, per `spec/observation.md` 5.
     pub page_size_reduced_to: Option<u32>,
-    /// An observation this page dropped for size, per
-    /// `spec/observation.md` 6 step 2. Only the FIRST one, because
-    /// `degraded` is one field on one status entry.
-    pub degraded: Option<Degraded>,
+    /// Every observation this page dropped for size, per
+    /// `spec/observation.md` 6 step 2 -- one entry each, on one status
+    /// entry. A single slot kept only the first, and a host cannot exempt
+    /// from retraction a record it was never told about.
+    pub degraded: Vec<Degraded>,
     /// Serialized bytes of `observations`: what this page spent of the
     /// reply's budget, so the next resource in the same reply knows what
     /// is left.
@@ -669,7 +670,7 @@ pub fn cut_page(plan: Plan, from: Option<&Cursor>, budget: usize) -> Result<Page
     // The resume cursor names the LAST EMITTED item, never the first
     // withheld one: `exact` promises nothing at or below it is re-sent.
     let mut last_key: Option<Key> = None;
-    let mut degraded: Option<Degraded> = None;
+    let mut degraded: Vec<Degraded> = Vec::new();
     let mut used = 0usize;
     let mut cut = false;
 
@@ -695,11 +696,13 @@ pub fn cut_page(plan: Plan, from: Option<&Cursor>, budget: usize) -> Result<Page
             // record must never brick a resource. The cursor is not
             // advanced onto it -- it does not need to be, because the page
             // continues and a later emitted item names a resume point above
-            // it. Only the FIRST omission is reported: `degraded` is one
-            // field on one status entry, and inventing a second entry to
-            // carry a second omission would break "every requested
-            // resource_id appears exactly once".
-            degraded.get_or_insert(Degraded {
+            // it. EVERY omission is reported, as its own entry on the one
+            // status entry this resource gets -- "every requested
+            // resource_id appears exactly once" is about status entries,
+            // not about how many records one of them may name. Reporting
+            // only the first left the rest as unexplained absences, and an
+            // unexplained absence is retracted.
+            degraded.push(Degraded {
                 local_id: Some(obs.local_id.clone()),
                 bytes: u64::try_from(size).unwrap_or(u64::MAX),
             });
@@ -1286,14 +1289,16 @@ mod tests {
             vec![local_id("w", &txid(1)), local_id("w", &txid(3))],
             "every other observation on the page is emitted regardless"
         );
-        let degraded = page
-            .degraded
-            .expect("the omitted record is reported, never silently dropped");
         assert_eq!(
-            degraded.local_id.as_deref(),
+            page.degraded.len(),
+            1,
+            "the omitted record is reported, never silently dropped"
+        );
+        assert_eq!(
+            page.degraded[0].local_id.as_deref(),
             Some(local_id("w", &txid(2)).as_str())
         );
-        assert!(degraded.bytes > 200_000, "the REAL measured size");
+        assert!(page.degraded[0].bytes > 200_000, "the REAL measured size");
         assert!(
             page.next.is_none(),
             "the plan drained; the resource is readable, not stuck on the record \

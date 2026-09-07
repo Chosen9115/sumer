@@ -523,8 +523,8 @@ async fn an_observation_over_the_cap_is_dropped_and_reported() {
         }
         other => panic!("the degrade must not overwrite the freshness outcome, got {other:?}"),
     }
-    match &status.degraded {
-        Some(degraded) => {
+    match status.degraded.as_slice() {
+        [degraded] => {
             assert_eq!(degraded.local_id.as_deref(), Some("huge"));
             assert!(
                 degraded.bytes > 65_536,
@@ -532,7 +532,7 @@ async fn an_observation_over_the_cap_is_dropped_and_reported() {
                 degraded.bytes
             );
         }
-        None => panic!("the dropped record must be reported, got {status:?}"),
+        other => panic!("exactly one dropped record must be reported, got {other:?}"),
     }
     assert_eq!(
         reply.observations[0].provenance.staleness,
@@ -570,7 +570,7 @@ async fn an_adapter_side_degrade_does_not_destroy_the_staleness_it_reported() {
         \x20                                    'completeness': 'complete'}}}}],\n\
         \x20   'statuses': [{{'resource_id': 'acct1',\n\
         \x20                 'outcome': {{'stale': {{'as_of': '2026-09-06T11:00:00Z'}}}},\n\
-        \x20                 'degraded': {{'local_id': 'huge', 'bytes': 260000}}}}]}}}})\n"
+        \x20                 'degraded': [{{'local_id': 'huge', 'bytes': 260000}}]}}]}}}})\n"
     );
     let handle = spawn(&script, Duration::from_secs(5))
         .await
@@ -593,9 +593,9 @@ async fn an_adapter_side_degrade_does_not_destroy_the_staleness_it_reported() {
         status.outcome,
         sumer_wire::ReadOutcome::Stale { .. }
     ));
-    let degraded = status.degraded.as_ref().expect("the degrade is reported");
-    assert_eq!(degraded.local_id.as_deref(), Some("huge"));
-    assert_eq!(degraded.bytes, 260_000);
+    assert_eq!(status.degraded.len(), 1, "the degrade is reported");
+    assert_eq!(status.degraded[0].local_id.as_deref(), Some("huge"));
+    assert_eq!(status.degraded[0].bytes, 260_000);
 }
 
 #[tokio::test]
@@ -897,5 +897,44 @@ async fn an_exited_adapter_is_never_blamed_for_ignoring_stdin_eof() {
     match handle.close().await {
         Some(Terminal::Violation(ProtocolViolationKind::StdoutHeldOpen)) => {}
         other => panic!("expected StdoutHeldOpen, got {other:?}"),
+    }
+}
+
+/// **Every requested `resource_id` appears in `statuses` exactly once**
+/// (spec/observation.md §6), on every read that carries statuses -- not
+/// only on the one whose downstream reader happened to be audited.
+///
+/// A reply naming a resource twice is refused where it is decoded. Every
+/// reader of a `statuses` array takes the first entry that matches, so an
+/// adapter answering cleanly and then contradicting itself in the same
+/// array gets judged on the clean half: `sumer-store`'s sweep reads a
+/// complete page and retracts, and a balance line is labelled with an
+/// outcome the resource also denied. One guard at the decode boundary is
+/// what keeps every one of those readers from having to remember.
+#[tokio::test]
+async fn a_reply_naming_one_resource_twice_is_refused_on_every_read() {
+    let statuses = "[{'resource_id': 'acct1', 'outcome': {'fetched': {'page_empty': True}}},\
+                     {'resource_id': 'acct1', 'outcome': 'unavailable'}]";
+    let script = format!(
+        "{PRELUDE}\nhello_ok(read(), capabilities=['balances.read', 'status.read'])\n\
+         for _ in range(2):\n\
+        \x20   req = read()\n\
+        \x20   send({{'id': req['id'], 'ok': {{'observations': [], 'statuses': {statuses}}}\n\
+        \x20         if req['op'] == 'balances.read' else {{'statuses': {statuses}}}}})\n"
+    );
+    let handle = spawn(&script, Duration::from_secs(5))
+        .await
+        .expect("handshake");
+
+    match handle.balances_read(vec!["acct1".to_owned()]).await {
+        Err(HostError::Wire(err)) => assert!(
+            err.message.contains("more than once"),
+            "the refusal names the malformation, got {err:?}"
+        ),
+        other => panic!("a duplicate resource must be refused, got {other:?}"),
+    }
+    match handle.status_read(vec!["acct1".to_owned()]).await {
+        Err(HostError::Wire(err)) => assert!(err.message.contains("more than once")),
+        other => panic!("a duplicate resource must be refused, got {other:?}"),
     }
 }

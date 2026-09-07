@@ -740,11 +740,21 @@ impl<'de> Deserialize<'de> for ReadOutcome {
 pub struct ResourceStatus {
     pub resource_id: String,
     pub outcome: ReadOutcome,
-    /// An observation this resource dropped for exceeding
-    /// [`crate::MAX_OBSERVATION_BYTES`]. Independent of `outcome`: the
-    /// degrade is not a freshness fact and must never overwrite one.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub degraded: Option<Degraded>,
+    /// The observations this resource dropped for exceeding
+    /// [`crate::MAX_OBSERVATION_BYTES`], **one entry each**. Independent of
+    /// `outcome`: the degrade is not a freshness fact and must never
+    /// overwrite one. Empty means nothing was dropped.
+    ///
+    /// A **list**, because a single slot loses evidence the retraction gate
+    /// runs on. Two records dropped from one page collapse into whichever
+    /// was written last, so the first becomes an unexplained absence and is
+    /// retracted; and an *anonymous* degrade -- which disqualifies a sweep
+    /// (`spec/observation.md` §8.1 condition 5) -- gets silently rewritten
+    /// into a *named* one, which merely exempts. Both end in a live
+    /// financial record retracted on incomplete evidence. Every side that
+    /// omits a record appends its own entry; nothing overwrites anything.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub degraded: Vec<Degraded>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub provider_detail: Option<ProviderDetail>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1077,7 +1087,7 @@ mod tests {
         let status = ResourceStatus {
             resource_id: "acct1".to_owned(),
             outcome: ReadOutcome::Fetched { page_empty: false },
-            degraded: None,
+            degraded: Vec::new(),
             provider_detail: None,
             page: None,
             credential_expires_at: None,
@@ -1091,7 +1101,7 @@ mod tests {
             back.outcome,
             ReadOutcome::Fetched { page_empty: false }
         ));
-        assert!(back.degraded.is_none());
+        assert!(back.degraded.is_empty());
         assert!(
             !json.contains("degraded"),
             "an absent degrade is not written at all: {json}"
@@ -1103,12 +1113,29 @@ mod tests {
         // Both facts on one entry: the data is stale, AND one record was
         // dropped for size. Neither overwrites the other.
         let text = r#"{"resource_id":"acct1","outcome":{"stale":{"as_of":"2026-09-06T11:00:00Z"}},
-                       "degraded":{"local_id":"huge","bytes":260000}}"#;
+                       "degraded":[{"local_id":"huge","bytes":260000}]}"#;
         let status: ResourceStatus = serde_json::from_str(text).unwrap();
         assert!(matches!(status.outcome, ReadOutcome::Stale { .. }));
-        let degraded = status.degraded.unwrap();
-        assert_eq!(degraded.local_id.as_deref(), Some("huge"));
-        assert_eq!(degraded.bytes, 260_000);
+        assert_eq!(status.degraded.len(), 1);
+        assert_eq!(status.degraded[0].local_id.as_deref(), Some("huge"));
+        assert_eq!(status.degraded[0].bytes, 260_000);
+    }
+
+    /// Two records dropped from one page are TWO entries. A single slot
+    /// kept only the last, which made the first an unexplained absence --
+    /// and a retraction (`spec/observation.md` §8.1).
+    #[test]
+    fn several_dropped_records_are_all_reported() {
+        let text = r#"{"resource_id":"acct1","outcome":{"fetched":{"page_empty":false}},
+                       "degraded":[{"bytes":99},{"local_id":"huge","bytes":260000}]}"#;
+        let status: ResourceStatus = serde_json::from_str(text).unwrap();
+        assert_eq!(status.degraded.len(), 2);
+        assert!(
+            status.degraded[0].local_id.is_none(),
+            "the ANONYMOUS degrade survives beside the named one -- it is the \
+             one that disqualifies a sweep, and losing it retracts a live record"
+        );
+        assert_eq!(status.degraded[1].local_id.as_deref(), Some("huge"));
     }
 
     #[test]

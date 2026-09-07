@@ -165,6 +165,27 @@
                       },
                       {
                         "resource_id": "wallet-oversized",
+                        "local_id": "wallet-oversized:big-untruncatable-2",
+                        "provider_id": "big-untruncatable-2",
+                        "state": "active",
+                        "surface": "onchain",
+                        "posting": "posted",
+                        "amount": {
+                          "asset": "sat",
+                          "amount": "654321"
+                        },
+                        "raw_sign": "provider_positive",
+                        "description": "REPLACED BY pad",
+                        "provider_extra": {
+                          "memo": "small, but the description is not, again"
+                        },
+                        "provenance": {
+                          "provider_id": "big-untruncatable-2",
+                          "observed_at": "2026-09-01T10:12:00Z"
+                        }
+                      },
+                      {
+                        "resource_id": "wallet-oversized",
                         "local_id": "wallet-oversized:sibling-after",
                         "provider_id": "sibling-after",
                         "state": "active",
@@ -214,6 +235,14 @@
                       "path": [
                         "observations",
                         2,
+                        "description"
+                      ],
+                      "bytes": 200000
+                    },
+                    {
+                      "path": [
+                        "observations",
+                        3,
                         "description"
                       ],
                       "bytes": 200000
@@ -300,6 +329,10 @@
             "omitted": true
           },
           {
+            "local_id": "wallet-oversized:big-untruncatable-2",
+            "omitted": true
+          },
+          {
             "local_id": "wallet-oversized:sibling-after",
             "provider_id": "sibling-after",
             "state": "active",
@@ -335,15 +368,21 @@
             "as_of": "2026-09-01T09:00:00Z"
           }
         },
-        "degraded": {
-          "local_id": "wallet-oversized:big-untruncatable",
-          "bytes": 200480
-        },
+        "degraded": [
+          {
+            "local_id": "wallet-oversized:big-untruncatable",
+            "bytes": 200480
+          },
+          {
+            "local_id": "wallet-oversized:big-untruncatable-2",
+            "bytes": 200486
+          }
+        ],
         "page": {
           "cursor_resumable": "exact"
         }
       }
     },
-    "notes": "NOTHING HERE IS DECLARED; every size is real. The script pads two fields just before the reply is written -- provider_extra.bulk_provider_payload to 120,000 bytes on big-truncatable, and description to 200,000 bytes on big-untruncatable -- and the adapter then runs spec/observation.md section 6's two-step degrade over the actual serialized bytes. The numbers in this expect block are the values that degrade PRODUCES, not values the fixture asserts into existence: _original_bytes 120028 is the serialized size of the provider_extra that was thrown away ({\"bulk_provider_payload\":\"<120000 bytes>\"}), and degraded.bytes 200480 is the measured size of big-untruncatable AFTER step 1 truncated its provider_extra and step 1 still could not save it. Five things must hold at once or A10 is vacuous: (1) big-truncatable is PRESENT with provider_extra collapsed to EXACTLY {_truncated:true,_original_bytes:120028} -- compared exactly, not as a subset, because an adapter that leaves a leaked 70 KB field sitting beside the truncation marker satisfies a subset check while shipping an observation still far over MAX_OBSERVATION_BYTES; (2) its provenance.completeness is partial; (3) sibling-small BEFORE it and sibling-after AFTER it are ordinary untruncated observations in the SAME page -- an adapter that gives up on a page once it meets one oversized entry fails here even though the truncated entry itself looks right; (4) big-untruncatable never appears in observations at all, yet the resource's single statuses entry reports it in `degraded` with its REAL byte count, and the resource stays readable (its `page` survives); (5) THE RESOURCE IS DELIBERATELY STALE. Its outcome is stale{as_of}, and the degrade must leave that alone -- `degraded` sits beside `outcome`, never on top of it. Every surviving observation is therefore stamped staleness:cached, AND ALL THREE SAY SO IN expect.ledger. staleness is host-derived, not adapter-sent, but the host derives it per resource from that resource's OWN outcome (section 1's freshness table), so it is a genuine per-observation claim and a reproducible one -- only received_at, an unpredictable clock reading, is stripped before comparing. expect.statuses carries the other half: outcome stale{as_of} AND degraded{local_id,bytes} on the SAME status entry, so an implementation that reports the degrade AS the outcome loses the stale{as_of} there and ALSO mis-stamps three perfectly good cached observations `live` in the ledger. That pair is exactly what the oversized_observation__stale_outcome_erased mutant provokes, and it is the failure mode a degrade that overwrites freshness has. A resource that is both stale and degraded is the exact case that bug hides in, and it is still the case this fixture drives. (6) The ORDER is asserted too: sibling-small, then the truncated record, then -- with the omitted one gone from the sequence but its local_id asserted absent from every sequence -- sibling-after. A membership check could not tell that from a page that emitted the survivors in any other order. Every observation is measured AT THE WIRE, off the recording of the same connection the typed crawl ran on and for BOTH executions, before the host's own cap enforcement can omit anything, so an adapter that skips the degrade entirely is caught emitting the oversized record rather than being silently remediated into looking conformant."
+    "notes": "NOTHING HERE IS DECLARED; every size is real. The script pads three fields just before the reply is written -- provider_extra.bulk_provider_payload to 120,000 bytes on big-truncatable, and description to 200,000 bytes on EACH of big-untruncatable and big-untruncatable-2 -- and the adapter then runs spec/observation.md section 6's two-step degrade over the actual serialized bytes. The numbers in this expect block are the values that degrade PRODUCES, not values the fixture asserts into existence: _original_bytes 120028 is the serialized size of the provider_extra that was thrown away ({\"bulk_provider_payload\":\"<120000 bytes>\"}), and degraded.bytes 200480/200486 are the measured sizes of big-untruncatable and big-untruncatable-2 AFTER step 1 truncated their provider_extra and step 1 still could not save either. Seven things must hold at once or A10 is vacuous: (1) big-truncatable is PRESENT with provider_extra collapsed to EXACTLY {_truncated:true,_original_bytes:120028} -- compared exactly, not as a subset, because an adapter that leaves a leaked 70 KB field sitting beside the truncation marker satisfies a subset check while shipping an observation still far over MAX_OBSERVATION_BYTES; (2) its provenance.completeness is partial; (3) sibling-small BEFORE it and sibling-after AFTER it are ordinary untruncated observations in the SAME page -- an adapter that gives up on a page once it meets one oversized entry fails here even though the truncated entry itself looks right; (4) big-untruncatable never appears in observations at all, yet the resource's single statuses entry reports it in `degraded` with its REAL byte count, and the resource stays readable (its `page` survives); (5) THE RESOURCE IS DELIBERATELY STALE. Its outcome is stale{as_of}, and the degrade must leave that alone -- `degraded` sits beside `outcome`, never on top of it. Every surviving observation is therefore stamped staleness:cached, AND ALL THREE SAY SO IN expect.ledger. staleness is host-derived, not adapter-sent, but the host derives it per resource from that resource's OWN outcome (section 1's freshness table), so it is a genuine per-observation claim and a reproducible one -- only received_at, an unpredictable clock reading, is stripped before comparing. expect.statuses carries the other half: outcome stale{as_of} AND degraded:[{local_id,bytes}] on the SAME status entry, so an implementation that reports the degrade AS the outcome loses the stale{as_of} there and ALSO mis-stamps three perfectly good cached observations `live` in the ledger. That pair is exactly what the oversized_observation__stale_outcome_erased mutant provokes, and it is the failure mode a degrade that overwrites freshness has. A resource that is both stale and degraded is the exact case that bug hides in, and it is still the case this fixture drives. (6) The ORDER is asserted too: sibling-small, then the truncated record, then -- with BOTH omitted records gone from the sequence but their local_ids asserted absent from every sequence -- sibling-after. A membership check could not tell that from a page that emitted the survivors in any other order. (7) A SECOND untruncatable record, big-untruncatable-2, is dropped from the SAME page as the first, and `degraded` MUST name BOTH of them, each with its own real byte count, in the order the page produced them. This is not a second copy of point (4) for luck: it is the specific case a single-valued `degraded` field cannot represent at all, and the case a `get_or_insert`-shaped bug (keep the first oversized record's entry, silently drop every later one on the same page -- or the read-side twin, overwrite the earlier entry with the later one) gets identically wrong either way. Either failure mode leaves one dropped record named and the other an unexplained absence: a record that is neither in `observations` nor in `degraded`, which is precisely a false retraction waiting to happen downstream (core/store/tests/false_retraction.rs holds the store side of that bug; this fixture holds the wire side). `degraded` having exactly two elements, both present, is the only way this fixture can pass. Every observation is measured AT THE WIRE, off the recording of the same connection the typed crawl ran on and for BOTH executions, before the host's own cap enforcement can omit anything, so an adapter that skips the degrade entirely is caught emitting the oversized record rather than being silently remediated into looking conformant."
   }
 }

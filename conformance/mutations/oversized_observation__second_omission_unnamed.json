@@ -1,0 +1,9 @@
+{
+  "fixture": "oversized_observation",
+  "assertions": [
+    "A7"
+  ],
+  "why": "The page drops TWO oversized records, big-untruncatable and big-untruncatable-2, and this wrapper reintroduces the exact bug that made `degraded` a list in the first place: both records still vanish from `observations` (the real degrade still runs), but only the first is named in `degraded` -- the second becomes an unexplained absence, identical in shape to a `get_or_insert`-style bug that keeps the first entry and silently drops the rest, or its last-write-wins twin. expect.statuses declares `degraded` with exactly two elements; a one-element list fails the array-length comparison, which `assert_expected_statuses` files under A7 regardless of which field in the status entry disagreed. Nothing else can catch this: the ledger's sequence check only asserts that an omitted local_id never appears in `observations`, which is still true here, so a `degraded` list is the only place this bug is visible on the wire.",
+  "adapter": "only_first_omission_named.py",
+  "patch": []
+}
