@@ -18,10 +18,13 @@ What that means for you, concretely: **a transaction dropped from the
 mempool, or reorged out of the chain, stays in the host's live set.** The
 host was told the transaction was there, nothing ever tells it otherwise,
 and no later sync of this adapter corrects it. Everything else is
-self-correcting — a re-mined transaction, a changed height, a new
-transaction all arrive on the next crawl — but a *disappearance* does not,
-because absence is not expressible on this wire without a tombstone and a
-tombstone is exactly what this adapter no longer sends.
+self-correcting, on a `history.read` with no `page`: a re-mined
+transaction, a changed height and a new transaction all arrive on that
+crawl. (A *cursor-resumed* crawl corrects only what lands strictly above
+the cursor — a height that moved to at or below it is suppressed, and that
+is a known limit of its own, below.) A *disappearance* is corrected by
+neither, because absence is not expressible on this wire without a
+tombstone and a tombstone is exactly what this adapter no longer sends.
 
 **Why it was removed rather than fixed.** Retracting needs the adapter to
 remember what it reported, and a lost retraction is lost permanently:
@@ -191,49 +194,56 @@ still resumes confirmed reads. One sync emits two sections, in this order:
 2. **By txid** — everything the provider currently reports as unconfirmed,
    ascending by txid.
 
-**Section 2 is re-emitted in full every page request, regardless of
-height.** That is what turns "a pending transaction got mined into a block
-at or below the cursor" into a revision of the same `local_id` rather than
-a record that stays pending — for as long as the crawl that saw it pending
-is the crawl that sees it confirmed. Section 1 would suppress it as at or
-below the cursor; section 2 is the only place the revision can arrive from.
+**Section 2 is the crawl's CURRENT mempool, and nothing else** — every
+transaction the provider reports as unconfirmed *for this crawl*, minus the
+ones a `:m:` cursor has already delivered. It is not filtered by height,
+because an unconfirmed transaction has no height to filter by, and that is
+the only sense in which it ignores the confirmed mark. It is not re-sent in
+full on every page: a page request resuming mid-mempool picks up after its
+`:m:` txid.
 
-**It reads nothing about previous syncs.** Section 2 used to also carry the
-tracked mempool set and every height revision remembered from the last
-completed crawl, which made the revision survive a cursor the host had
-persisted across processes. That memory lived in the same file the
-retraction did, and went with it. A `history.read` with no `page` re-emits
-everything at its current state and repairs any record left behind — see
-"Known limits".
+**It therefore delivers no revision of a transaction mined at or below the
+cursor, and cannot.** Every page of one crawl is served from one frozen
+snapshot, so a transaction cannot be pending on one page and confirmed on a
+later one; and a cursor-resumed read that starts a *new* crawl re-fetches,
+by which time the transaction carries a height at or below the mark and
+section 1 drops it. What used to deliver that revision was a remembered
+mempool set and a remembered height per txid, which lived in the same file
+the retraction did and went with it. The only thing that delivers it now is
+a `history.read` with **no `page`**, which re-emits everything at its
+current state and repairs any record left behind — see "Known limits".
 
 > **The live-check invariant "resuming at C returns no confirmed
-> transaction at or below C" exempts section 2, and section 2 only.**
-> Re-emitting it is required behaviour; without the exemption the invariant
-> would fail this conforming adapter. The checker must use exactly this
-> definition, or it fails a conforming adapter — which is worse than not
-> checking:
+> transaction at or below C" exempts section 2 — and, separately, a
+> transaction a reorg re-mined between the two reads.**
+> Emitting it regardless of the confirmed mark is required behaviour;
+> without the exemption the invariant would fail this conforming adapter.
+> The checker must use exactly this definition, or it fails a conforming
+> adapter — which is worse than not checking:
 >
 > The checker keeps all four clauses below, because they are the contract
 > for *any* conforming adapter and narrowing them would fail one. This
-> adapter now only ever produces clause 1: it emits no tombstones
-> (clause 2) and remembers nothing across crawls (clauses 3 and 4).
+> adapter produces clause 1 on every read, and clause 4 whenever a reorg
+> re-mines a transaction between two reads — a resume takes a *fresh*
+> crawl, so a re-mined height reaches the host. It never produces clause 2
+> (it emits no tombstone) and never clause 3 (a transaction it reported
+> pending and that has since confirmed at or below the cursor is not
+> emitted at all — it is suppressed, which is the known limit above, not a
+> revision).
 >
-> **An observation is EXEMPT if, and only if, its cursor is a section-2
-> cursor** — that is, if the cursor that resumes after it carries a `:m:`
-> suffix. Equivalently, and observably from replies alone, an observation
-> is exempt if any of these hold:
+> **An observation is EXEMPT if any of these hold** — all four readable
+> from the replies alone, which is all a checker has:
 >
 > 1. its `posting` is `pending` (currently unconfirmed), or
 > 2. its `state` is `tombstoned`, or
 > 3. a previous reply in the same connection reported the same `local_id`
->    with `posting: "pending"` (it was in the tracked mempool set, and has
->    since confirmed — this is the case the exemption exists for), or with
->    a different `block_height` (a reorg re-mined it, possibly *downwards*,
+>    with `posting: "pending"` (it has since confirmed), or with a
+>    different `block_height` (a reorg re-mined it, possibly *downwards*,
 >    which the confirmed section would otherwise suppress forever).
 >
 > **Everything else is section 1 and is NOT exempt**: a `posting: "posted"`
-> observation whose `local_id` was never seen pending must be strictly
-> above C, with no exception.
+> observation whose `local_id` was seen neither pending nor at another
+> `block_height` must be strictly above C, with no exception.
 
 **Pages are cut by SERIALIZED BYTES, never by block.** A page spends at
 most 512 KiB, and never more than the reply has left. Blocks split freely,
@@ -341,8 +351,17 @@ There is no such write any more. A `history.read` records nothing at all,
 and the one thing a `balances.read` records is a cached figure, written as
 it is read and not gated on anything: if the reply is refused for size, the
 cache holds a figure that was genuinely observed and the next successful
-read overwrites it. Losing it, or writing it for a reply nobody received,
-costs at most one `unavailable` where a `stale` was possible.
+read overwrites it.
+
+The two failure directions cost different things, and neither is
+unrecoverable. **Losing the cache** (deleted, unwritable, a schema bump, a
+changed address set) costs *every* failed `balances.read` from then until
+one succeeds: each answers `unavailable` where a `stale { as_of }` would
+have been possible. That is bounded by the next successful read, not by
+one reply. **Writing it for a reply nobody received** costs nothing at all:
+the figures were genuinely observed at the moment recorded, so a later
+`stale` derived from them is true regardless of who saw the reply that
+observed them.
 
 **A repeated `resource_id` is refused** with an envelope `invalid_request`,
 in all three batch ops. Every requested `resource_id` appears in `statuses`
@@ -397,8 +416,9 @@ State lives in `<state-dir>/<resource_id>.json`, one file per resource:
 That is the whole file. It exists so a failed `balances.read` can answer
 `stale { as_of }` carrying the figures the last successful one observed,
 rather than `unavailable`. Nothing in it is unrecoverable: lose it, fail to
-write it, or write it for a reply that never went out, and the cost is one
-`unavailable` until the next successful balance read.
+write it, or write it for a reply that never went out: no read is ever
+wrong because of it, and a lost cache costs `unavailable` instead of
+`stale` on every failed balance read until the next successful one.
 
 - A missing, unreadable, unparseable, version-mismatched or hash-mismatched
   file is a **FIRST RUN**: `unavailable` on a failed read. Never a partial
@@ -519,11 +539,14 @@ run 1 reports it as `stale { as_of }` and emits no history at all.
   at the top of this file. A transaction dropped from the mempool or reorged
   out stays in the host's live set until PR 4 lands the capability against
   the host's own persistence.
-- **A revision can be missed by a host that persists a cursor across
-  processes.** A transaction this adapter reported `pending` and a *later
-  crawl* sees confirmed at a height at or below that cursor is not
-  re-emitted: section 2 carries only what the provider says is unconfirmed
-  now, and section 1 suppresses anything at or below the cursor. A
+- **A cursor-resumed read never carries a revision that lands at or below
+  the cursor.** A transaction this adapter reported `pending` and that is
+  confirmed at a height at or below that cursor by the time of the next
+  read — or one a reorg re-mined *downwards* past it — is not re-emitted:
+  section 2 carries only what the provider says is unconfirmed now, and
+  section 1 suppresses anything at or below the cursor. This holds in one
+  process as much as across two — pages of one crawl are one frozen
+  snapshot, and a resume that outlives its crawl re-fetches. Only a
   `history.read` with no `page` re-emits it at its current state and repairs
   the record. This is the same family as the limit below, and closes the
   same way.

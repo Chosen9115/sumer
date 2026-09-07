@@ -100,8 +100,8 @@ impl From<serde_json::Error> for MapError {
 // Esplora payloads
 // ---------------------------------------------------------------------
 
-/// One transaction as Esplora returns it, from either an address listing
-/// or `GET /tx/:txid`. Unknown fields are ignored on purpose: this is a
+/// One transaction as Esplora returns it, from an address listing -- the
+/// only place this adapter reads one from. Unknown fields are ignored on purpose: this is a
 /// third-party payload that grows fields between deployments, and
 /// rejecting one would take a whole wallet offline over a field we do not
 /// read.
@@ -572,12 +572,14 @@ pub struct Plan {
 /// 2. **By txid** -- everything the provider currently reports as
 ///    unconfirmed, ascending by txid.
 ///
-/// Section 2 is re-emitted in full every sync regardless of height, which
-/// is what turns "this pending transaction was mined" into a revision of
-/// the same `local_id` rather than a record that stays pending forever --
-/// for as long as the crawl that saw it pending is the crawl that sees it
-/// confirmed. It is also why the "resuming at C returns no confirmed
-/// transaction at or below C" invariant exempts this section.
+/// Section 2 is not placed against the confirmed mark -- an unconfirmed
+/// transaction has no height to place -- so it is skipped only by the
+/// cursor's own `:m:` txid. That is why the "resuming at C returns no
+/// confirmed transaction at or below C" invariant exempts this section.
+/// It delivers no REVISION: a transaction this crawl reports unconfirmed
+/// and a later crawl sees mined at or below the mark is dropped by section
+/// 1 and gone from section 2, and only a `history.read` with no `page`
+/// brings it back (`adapters/bitcoin/README.md`, "Known limits").
 ///
 /// **Nothing here reads what a previous sync saw.** A transaction the
 /// provider no longer lists is simply not in the plan; this adapter does
@@ -1155,12 +1157,10 @@ mod tests {
         );
     }
 
-    /// Section 2 -- everything the provider currently reports as
-    /// unconfirmed -- is re-emitted regardless of the cursor, and that is
-    /// what exempts it from the no-confirmed-tx-at-or-below-C invariant.
-    /// A pending transaction whose crawl later sees it confirmed is a
-    /// revision of the same `local_id`; without section 2 it would stay
-    /// pending for the rest of that crawl.
+    /// Section 2 -- everything this crawl's provider reports as
+    /// unconfirmed -- is emitted regardless of the confirmed mark, which is
+    /// what exempts it from the no-confirmed-tx-at-or-below-C invariant: a
+    /// pending transaction has no height to compare against that mark.
     #[test]
     fn the_mempool_section_is_emitted_regardless_of_the_cursor() {
         let pending = txid(2);

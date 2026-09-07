@@ -38,10 +38,11 @@ Every `.status` file has the same two-line body: `503` and
   has gone dark; the other still answers, byte-identically to `run0`.
 
 That is the point of the corpus: seventeen of `cold`'s transactions are now
-absent from everything the adapter can read, and there is no `tx_*.status`
-file anywhere in it. A tombstone needs a direct `GET /tx/:txid` answering
-404; absence behind a failed fetch is not evidence, and this corpus offers
-the adapter every opportunity to decide otherwise.
+absent from everything the adapter can read, and this corpus offers the
+adapter every opportunity to say something about that. It says nothing —
+it emits no tombstone under any circumstance (ADR 0004 decision 7) and no
+partial history either. There is no `tx_*.status` file anywhere in it
+because `GET /tx/:txid` is not an endpoint this adapter requests.
 
 `run1/now` is `run0/now` + 86400 (2026-09-08T14:43:28Z).
 

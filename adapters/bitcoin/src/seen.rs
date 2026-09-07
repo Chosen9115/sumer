@@ -4,10 +4,12 @@
 //! last successful `balances.read` observed and when, so that a later
 //! failed read can answer `stale { as_of }` instead of `unavailable`.
 //!
-//! **Nothing here is unrecoverable.** Losing this file, failing to write
-//! it, or writing it for a reply the host never received all cost the same
-//! thing: one `unavailable` where a `stale` was possible, until the next
-//! successful balance read re-establishes it. That is the whole reason
+//! **Nothing here is unrecoverable.** Losing this file, or failing to
+//! write it, costs `unavailable` where a `stale` was possible on EVERY
+//! failed balance read until the next successful one re-establishes it --
+//! bounded by that read, not by one reply. Writing it for a reply the host
+//! never received costs nothing: the figures were genuinely observed, so a
+//! `stale` derived from them later is true. That is the whole reason
 //! there is no delivery gate around the write and no lock around the
 //! read-modify-write -- see ADR 0004 decision 7. The file used to also
 //! carry a transaction baseline, which existed so the adapter could
@@ -34,8 +36,8 @@ use sumer_wire::Rfc3339;
 ///
 /// 3: the `history` section is gone. A schema-2 file carries a transaction
 /// baseline this adapter no longer reads, and its `balances` section could
-/// be salvaged -- but rule 1 is "no partial parse", and a first run here
-/// costs one `unavailable`.
+/// be salvaged -- but rule 1 is "no partial parse", and a first run costs
+/// only `unavailable` in place of `stale` until the next successful read.
 const SCHEMA: u32 = 3;
 
 /// What the previous successful balance read left behind.
@@ -312,7 +314,8 @@ mod tests {
     }
 
     /// A cache write that cannot happen is survived, and leaves no
-    /// half-written file behind. It costs one `unavailable`.
+    /// half-written file behind. It costs `unavailable` in place of
+    /// `stale` until a later write succeeds.
     #[test]
     fn a_write_that_cannot_happen_leaves_no_file() {
         let dir = tmpdir("writefail");

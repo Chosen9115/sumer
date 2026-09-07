@@ -15,8 +15,9 @@ Every read this adapter performs is an HTTP request naming one of your
 addresses in the URL path:
 
 ```
-GET /address/bc1q…            balances
-GET /address/bc1q…/txs/chain  history
+GET /address/bc1q…                    balances
+GET /address/bc1q…/txs/chain          history
+GET /address/bc1q…/txs/chain/{txid}   history, page 2 and on
 GET /address/bc1q…/txs/mempool
 ```
 
@@ -24,8 +25,8 @@ Four endpoints, and that is all of them. A fifth, `GET /tx/<txid>`, was the
 tombstone probe: it asked the provider about transactions this adapter had
 seen before and no longer saw, which restated your wallet's own history back
 at the server one txid at a time. **This adapter no longer reports
-disappearances and no longer makes that request** — see "Tombstones" in
-`README.md`. When the capability returns in PR 4 the probe returns with it,
+disappearances and no longer makes that request** — see "What this adapter
+does NOT do" in `README.md`. When the capability returns in PR 4 the probe returns with it,
 and this file will say so before it ships.
 
 The operator of the Esplora instance therefore learns, for every sync:

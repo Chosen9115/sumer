@@ -56,8 +56,10 @@ def crawl(adapter_argv, env):
     request_id = 3
     for resource_id in resources:
         page = None
-        # The baseline is written only when a crawl is delivered IN FULL,
-        # so priming has to drain every page, not just read the first.
+        # Draining every page, not just reading the first: run0 exists to
+        # prove a whole crawl over this corpus succeeds before run1 breaks
+        # it. (The only state a run leaves behind is the balance cache,
+        # written by the `balances.read` above.)
         while True:
             query = {"resource_id": resource_id}
             if page is not None:

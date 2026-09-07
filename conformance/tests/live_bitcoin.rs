@@ -408,7 +408,13 @@ async fn check_the_invariants() -> bool {
          category, and neither category twice. A host that adds up whatever lines \
          arrive double-counts the wallet the moment one is emitted twice"
     );
-    let mut reported = Amount::parse(sat.clone(), "0").expect("zero parses");
+    // KEPT PER CATEGORY, never accumulated into one figure. The two lines
+    // are computed from different provider counters and mean different
+    // things, and a total is blind to which line each figure landed on:
+    // swap them and every quantity a sum can see is preserved. Section 8
+    // is where that is caught, because the split can only be checked
+    // against the history.
+    let mut reported: BTreeMap<String, Amount> = BTreeMap::new();
     for line in &balances.observations {
         let amount = line
             .amount
@@ -416,7 +422,7 @@ async fn check_the_invariants() -> bool {
             .unwrap_or_else(|| panic!("{}: a successful read reports a figure", line.category));
         assert_eq!(amount.asset(), &sat);
         assert_eq!(amount.scale(), 0, "satoshis are integers");
-        reported = reported.add(&amount).expect("same asset");
+        reported.insert(line.category.clone(), amount);
     }
 
     // 4. History, paginated to exhaustion, on the same connection.
@@ -498,19 +504,62 @@ async fn check_the_invariants() -> bool {
     // 8. Cross-endpoint reconciliation, and only now that the floor has
     // passed: the balance came from `GET /address/:addr`'s counters, the
     // history from the transaction listings. Two endpoints, one wallet, and
-    // the sum of every net delta must be what the counters say -- confirmed
-    // plus unconfirmed, because a mempool transaction moves the second one.
-    let mut summed = Amount::parse(sat.clone(), "0").expect("zero parses");
+    // the sum of every net delta must be what the counters say.
+    //
+    // PER CATEGORY, and that is the whole point of it. `confirmed` is
+    // `chain_stats` funded minus spent and `unconfirmed` is `mempool_stats`
+    // funded minus spent (`adapters/bitcoin/README.md`), so each line is
+    // the sum of exactly one half of the history: the posted observations
+    // and the pending ones. Reconciling only the TOTAL passes an adapter
+    // that reports both figures under each other's category -- the count is
+    // right, the names are right, both are integers, the sum is right, and
+    // the wallet's actual confirmed balance is a number it never reported.
+    // The recorded fixtures pin the amount to the category by construction;
+    // this check did not, and that was the hole.
+    //
+    // The two reads are seconds apart and the wallet can move between them.
+    // That exposure is not new: a payment arriving between them already
+    // breaks the total this section has always compared. A confirmation
+    // between them moves a figure from one line to the other, which is the
+    // same bet on the same seconds, stated rather than engineered around.
+    let mut summed: BTreeMap<String, Amount> = BTreeMap::new();
     for o in &observations {
-        if o.state == ObservationState::Active {
-            summed = summed.add(&o.amount).expect("same asset");
+        if o.state != ObservationState::Active {
+            continue;
         }
+        let category = match o.posting {
+            Posting::Posted => "confirmed",
+            Posting::Pending => "unconfirmed",
+            Posting::Unknown => panic!(
+                "§8: {} came back with posting `unknown`, which belongs to neither balance line \
+                 -- this adapter has only two, and every transaction it reads is either in a \
+                 block or in the mempool",
+                o.local_id
+            ),
+        };
+        let running = summed
+            .entry(category.to_owned())
+            .or_insert_with(|| Amount::parse(sat.clone(), "0").expect("zero parses"));
+        *running = running.add(&o.amount).expect("same asset");
     }
-    assert_eq!(
-        summed.cmp_same_asset(&reported).expect("same asset"),
-        std::cmp::Ordering::Equal,
-        "the transaction listings sum to {summed:?} but the address counters say {reported:?}"
-    );
+    // A wallet with no mempool activity legitimately has no pending
+    // observation at all, and `0` is the honest sum of nothing.
+    let zero = Amount::parse(sat.clone(), "0").expect("zero parses");
+    for category in ["confirmed", "unconfirmed"] {
+        let from_history = summed.get(category).unwrap_or(&zero);
+        let from_counters = reported
+            .get(category)
+            .unwrap_or_else(|| panic!("§8: no {category} balance line survived §3"));
+        assert_eq!(
+            from_history
+                .cmp_same_asset(from_counters)
+                .expect("same asset"),
+            std::cmp::Ordering::Equal,
+            "§8: the {category} transaction listings sum to {from_history} but the {category} \
+             address counter says {from_counters}. Two endpoints, one wallet, one category -- \
+             and a total that reconciles proves nothing about which line a figure landed on"
+        );
+    }
 
     // 9. The resume bracket: read again from a cursor in the middle of the
     // confirmed section. TWO things are owed, and only together do they
@@ -540,17 +589,22 @@ async fn check_the_invariants() -> bool {
     //   1. its `posting` is `pending` (currently unconfirmed), or
     //   2. its `state` is `tombstoned`, or
     //   3. a previous reply in the same connection reported the same
-    //      `local_id` with `posting: "pending"` (it was in the tracked
-    //      mempool set, and has since confirmed -- this is the case the
-    //      exemption exists for), or with a different `block_height` (a
-    //      reorg re-mined it, possibly *downwards*, which the confirmed
-    //      section would otherwise suppress forever).
+    //      `local_id` with `posting: "pending"` (it has since confirmed),
+    //      or with a different `block_height` (a reorg re-mined it,
+    //      possibly *downwards*, which the confirmed section would
+    //      otherwise suppress forever).
     //
-    // Everything else is section 1 and is not exempt. Re-emitting section 2
-    // is REQUIRED behaviour -- it is what turns "this pending transaction
-    // was mined into a block below your cursor" into a revision instead of
-    // a record that stays pending forever -- so a check without every
-    // clause of this would fail a conforming adapter. The second half of
+    // Everything else is section 1 and is not exempt. Emitting section 2
+    // regardless of the confirmed mark is REQUIRED behaviour -- an
+    // unconfirmed transaction has no height to place against the cursor --
+    // so a check without clause 1 would fail a conforming adapter.
+    // Clause 2 this adapter never produces (it emits no tombstone) and
+    // neither is clause 3's first half reachable: a transaction it reported
+    // pending and that has since confirmed at or below the cursor is
+    // SUPPRESSED rather than revised (`adapters/bitcoin/README.md`, "Known
+    // limits"). Clause 3's second half it produces for real -- a resume
+    // takes a fresh crawl, so a reorg between the two reads below lands
+    // here. The second half of
     // clause 3 was missing here until it was noticed: a reorg that re-mined
     // a transaction DOWNWARDS, in the seconds between the two reads below,
     // made an adapter doing exactly what the README requires fail 9a.

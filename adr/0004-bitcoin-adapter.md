@@ -109,23 +109,26 @@ and `cursor_resumable` is `exact`. The confirmed high-water mark is always
 present, so a cursor persisted mid-mempool still resumes confirmed reads
 correctly. One sync emits two sections: confirmed transactions strictly
 above the mark, ascending by `(height, txid)`; then a by-txid section —
-everything the provider currently reports as unconfirmed — re-emitted **in
-full on every page request**, which is what turns "this pending transaction
-was mined into a block below your cursor" into a revision of the same
-`local_id` instead of a record that stays pending. The confirmed section
-suppresses it as at or below the cursor; section 2 is the only section
-exempt from that rule, so it is the only place the revision can arrive from.
+everything the provider reports as unconfirmed **for this crawl**, ascending
+by txid, minus whatever a `:m:` cursor has already delivered. Section 2 is
+not placed against the confirmed mark at all, because an unconfirmed
+transaction has no height to place, and that is what the live check's
+exemption is for.
 
-**Revised in revision 4: section 2 carries only the CURRENT mempool.** It
-also carried the tracked mempool set and every height revision remembered
-from the last completed crawl, which made those revisions survive a cursor
-the host had persisted across processes. That memory was the transaction
-baseline decision 7 deletes. The cost is stated as a known limit rather than
-engineered around: a transaction reported `pending` by one crawl and seen
-confirmed at or below the host's cursor by a *later* crawl is not
-re-emitted until a `history.read` with no `page`, which re-emits everything
-at its current state. It is the same family as the address-set/cursor
-defect below, and closes the same way — in PR 4, with persistence.
+**Revised in revision 4: section 2 carries only the CURRENT mempool, and
+delivers no revision.** It also carried the tracked mempool set and every
+height remembered from the last completed crawl, which is what turned "this
+pending transaction was mined into a block below your cursor" into a
+revision of the same `local_id`. That memory was the transaction baseline
+decision 7 deletes, and the revision went with it: pages of one crawl come
+from one frozen snapshot, so nothing can be pending on one page and
+confirmed on a later one, and a cursor-resumed read that starts a fresh
+crawl finds the transaction carrying a height at or below the mark, where
+section 1 drops it. The cost is stated as a known limit rather than
+engineered around: the record is repaired only by a `history.read` with no
+`page`, which re-emits everything at its current state. It is the same
+family as the address-set/cursor defect below, and closes the same way — in
+PR 4, with persistence.
 
 **Pages are cut at 512 KiB of serialized observations — and never past what
 the REPLY has left — never at a block boundary.** The rejected alternative
@@ -569,9 +572,10 @@ process boundary as any other.
 - **No disappearance is ever reported.** See decision 7. A transaction
   dropped from the mempool or reorged out stays in the host's live set until
   PR 4.
-- **A revision can be missed by a host that persists a cursor across
-  processes.** See decision 3 as revised. Repaired by any `history.read`
-  with no `page`.
+- **A cursor-resumed read never carries a mined revision.** A transaction
+  reported `pending` and later confirmed at or below the cursor is
+  suppressed, not revised — in one process as much as across two. See
+  decision 3 as revised. Repaired only by a `history.read` with no `page`.
 - **`history.read` never answers `stale`.** Nothing about a history is
   cached, so a failed history read has no prior answer to be stale about:
   it is `unavailable`. Balances are unaffected — that is what the cache is

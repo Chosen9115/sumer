@@ -829,8 +829,9 @@ mod tests {
     }
 
     // -----------------------------------------------------------------
-    // End to end over a corpus: the positive-evidence rule, exercised
-    // through the same code path a real sync takes.
+    // End to end over a corpus: a whole sync, through the same code path a
+    // real one takes -- including a failed fetch reporting NOTHING rather
+    // than a partial history.
     // -----------------------------------------------------------------
 
     pub(crate) const ADDR: &str = "bc1qexample0";
