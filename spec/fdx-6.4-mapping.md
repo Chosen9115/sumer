@@ -106,7 +106,7 @@ FDX schema objects: `Transaction` (base), `DepositTransaction`.
 
 | FDX 6.4 field | Sumer path | Lossy |
 |---|---|---|
-| `transactionId` (`Identifier`) | `provider_id` on the history observation, verbatim; also one input to the adapter's documented `local_id` derivation (`spec/observation.md` §3) | |
+| `transactionId` (`Identifier`) | `provider_id` on the history observation, verbatim; also one input to the adapter's documented `local_id` derivation, **alongside the `resource_id`** — a transfer between two of the user's own accounts at one institution shows up in both accounts' transaction lists, and an adapter may not report one `local_id` under two resources (`spec/observation.md` §3) | |
 | `referenceTransactionId` (`Identifier`, reverse-posting / correction link) | `supersedes_provider_id` | |
 | `accountCategory` (fixed `DEPOSIT_ACCOUNT` on this variant) | Not carried per-observation — already expressed by the resource's `(adapter_id, resource_id)` key; also copied to `provider_extra["accountCategory"]` for traceability | |
 | `status` (enum: `AUTHORIZATION`, `MEMO`, `PENDING`, `POSTED`) | `posting`: `PENDING` and `MEMO` and `AUTHORIZATION` -> `pending`; `POSTED` -> `posted`. (FDX's own text says Plaid treats `MEMO` and `AUTHORIZATION` as `PENDING`; Sumer's three-value `posting` enum has no `unknown` case exercised here because FDX's `status` is required and closed.) The original enum value is additionally kept at `provider_extra["status"]`, verbatim, so which of the three pending-shaped values it was is never actually lost | |

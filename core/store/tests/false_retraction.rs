@@ -659,3 +659,258 @@ fn the_resume_lookup_is_indexed() {
         "expected an index scan, got {plan:?}"
     );
 }
+
+// ---------------------------------------------------------------------
+// (7) A disqualified sweep must not adopt the vantage it never reconciled
+// ---------------------------------------------------------------------
+
+/// **One partial sweep must not consume the vantage exemption.**
+///
+/// `spec/observation.md` §8.2: a vantage change retracts nothing, records a
+/// `vantage_changed` discrepancy, and stores the new `provider_id` -- one
+/// exemption plus a permanent audit row. `derive_retractions` is the only
+/// writer of that discrepancy and it never runs on a disqualified sweep,
+/// so while the new `provider_id` was stored OUTSIDE the gate a single
+/// non-`exact` page (or one `rate_limited`, or an adapter that did not
+/// drain) adopted the new vantage silently. The next sweep then compared
+/// the new vantage against itself, saw no change, and retracted the
+/// records the old vantage could see under
+/// `absent_from_complete_sweep` -- blaming the provider for a move the
+/// user was never told about.
+#[tokio::test]
+async fn a_disqualified_sweep_does_not_adopt_the_vantage_it_never_reconciled() {
+    if !support::python3_available() {
+        return;
+    }
+    let scratch = Scratch::new("vantage-adoption");
+    let not_exact = json!({
+        "resource_id": RESOURCE_ID,
+        "page": {"cursor_resumable": "batch_restart", "next": null}
+    });
+    let fixture = fixture(
+        &scratch,
+        vec![
+            // run 0: vantage p1, qualifying. `x` and `y` are live.
+            Run::new(vec![page(
+                None,
+                vec![obs("x", "10.00"), obs("y", "20.00")],
+                drained_status(None),
+            )]),
+            // run 1: the vantage MOVED to p2, which cannot see `x` -- and
+            // the sweep fails condition (6), so it testifies to nothing.
+            Run::new(vec![page(None, vec![obs("y", "20.00")], not_exact)]).provider_id("p2"),
+            // run 2: the same new vantage, this time a qualifying sweep.
+            // THIS is the sweep the exemption belongs to.
+            Run::new(vec![page(
+                None,
+                vec![obs("y", "20.00")],
+                drained_status(None),
+            )])
+            .provider_id("p2"),
+        ],
+    );
+    let mut store = store(&scratch);
+    assert!(
+        only(
+            refresh_run(&mut store, &fixture, 0, SweepOptions::default())
+                .await
+                .0
+        )
+        .complete
+    );
+
+    let partial = only(
+        refresh_run(&mut store, &fixture, 1, SweepOptions::default())
+            .await
+            .0,
+    );
+    assert_eq!(
+        partial.disqualified_reason.as_deref(),
+        Some("a page cursor was not exact-resumable"),
+        "run 1 is the partial sweep this case is about"
+    );
+    let stored_vantage = sumer_store::store::resource(store.conn(), ADAPTER_ID, RESOURCE_ID)
+        .unwrap()
+        .expect("the resource row")
+        .last_provider_id;
+    assert_eq!(
+        stored_vantage.as_deref(),
+        Some("p1"),
+        "a sweep that derived no retractions reconciled nothing, so it has not \
+         earned the right to say the host has seen this vantage"
+    );
+
+    let complete = only(
+        refresh_run(&mut store, &fixture, 2, SweepOptions::default())
+            .await
+            .0,
+    );
+    assert!(complete.complete, "{:?}", complete.disqualified_reason);
+    assert_eq!(
+        complete.retracted, 0,
+        "a vantage change retracts nothing -- `x` is absent because the view moved"
+    );
+    assert_eq!(
+        complete
+            .discrepancies
+            .iter()
+            .map(|d| d.kind.clone())
+            .collect::<Vec<_>>(),
+        vec!["vantage_changed".to_owned()],
+        "and the move is on the record, where the user can read it"
+    );
+    assert!(
+        live_ids(&store).contains(&"x".to_owned()),
+        "`x` was never retracted: {:?}",
+        retractions(&store)
+    );
+    assert_eq!(
+        sumer_store::store::resource(store.conn(), ADAPTER_ID, RESOURCE_ID)
+            .unwrap()
+            .expect("the resource row")
+            .last_provider_id
+            .as_deref(),
+        Some("p2"),
+        "the qualifying sweep DOES adopt it, so the next one retracts normally"
+    );
+}
+
+// ---------------------------------------------------------------------
+// (8) A record reported under a second resource is live under it
+// ---------------------------------------------------------------------
+
+/// **A `local_id` under a different `resource_id` is a changed fact.**
+///
+/// `content_hash` omitted `resource_id`, so an observation differing only
+/// by resource deduped against the head stored under the OLD resource:
+/// nothing was appended under the new one, `stamp_seen` wrote the new
+/// resource's fingerprint onto the old resource's head row, and
+/// [`live_records`] -- which filters on the head's `resource_id` -- kept
+/// showing the record under the resource that no longer reports it. The
+/// old resource's next sweep then retracted a record the adapter had
+/// reported in that very refresh, under `resource_definition_changed`,
+/// and the record was live NOWHERE.
+#[tokio::test]
+async fn a_record_reported_under_a_second_resource_is_live_under_it() {
+    if !support::python3_available() {
+        return;
+    }
+    let scratch = Scratch::new("cross-resource-dedup");
+
+    fn observation(local_id: &str, resource_id: &str) -> Value {
+        json!({
+            "resource_id": resource_id,
+            "local_id": local_id,
+            "state": "active",
+            "surface": "s",
+            "posting": "posted",
+            "amount": {"asset": "usd", "amount": "10.00"},
+            "raw_sign": "provider_positive",
+            "description": local_id
+        })
+    }
+    fn reply(resource_id: &str, observations: Vec<Value>) -> Run {
+        Run::new(vec![raw_page(
+            json!({}),
+            json!({
+                "observations": observations,
+                "statuses": [{
+                    "resource_id": resource_id,
+                    "page": {"cursor_resumable": "exact", "next": null}
+                }]
+            }),
+        )])
+    }
+
+    async fn sweep(
+        store: &mut sumer_store::Store,
+        fixture: &std::path::Path,
+        run: usize,
+        resource_id: &str,
+        fingerprint: &str,
+    ) -> sweep::SweepReport {
+        let handle = support::connect(fixture, run).await;
+        let input = sweep::SweepInput {
+            adapter_id: ADAPTER_ID,
+            resource_id,
+            hello_derivation: DERIVATION,
+            fingerprint,
+            provider_id: "p1",
+            history_start: None,
+            options: SweepOptions::default(),
+        };
+        let report = sweep::sweep_resource(store, &handle, &input)
+            .await
+            .expect("the sweep runs");
+        let _ = handle.close().await;
+        report
+    }
+
+    fn live(store: &sumer_store::Store, resource_id: &str) -> Vec<String> {
+        sweep::live_records(store, ADAPTER_ID, resource_id)
+            .unwrap()
+            .into_iter()
+            .map(|(local_id, _, _)| local_id)
+            .collect()
+    }
+
+    let fixture = fixture(
+        &scratch,
+        vec![
+            reply("r1", vec![observation("x", "r1"), observation("y", "r1")]),
+            // The provider reports the SAME record under r2, unchanged in
+            // every other field. `x` is still live under r1 -- nothing has
+            // retracted it, so nothing has disabled dedup.
+            reply("r2", vec![observation("x", "r2")]),
+            // And now r1 sweeps again without it, honestly.
+            reply("r1", vec![observation("y", "r1")]),
+        ],
+    );
+    let mut store = store(&scratch);
+    assert!(sweep(&mut store, &fixture, 0, "r1", "fp1").await.complete);
+
+    let moved = sweep(&mut store, &fixture, 1, "r2", "fp2").await;
+    assert!(moved.complete, "{:?}", moved.disqualified_reason);
+    assert_eq!(
+        moved.revised, 1,
+        "a record appearing under a different resource is a changed fact and \
+         appends a revision"
+    );
+    assert_eq!(
+        live(&store, "r2"),
+        vec!["x".to_owned()],
+        "the resource the provider just reported it under is where it lives"
+    );
+    // The other half: `stamp_seen` wrote r2's fingerprint onto r1's row,
+    // because dedup fired on a record that had moved. It cannot now --
+    // equal hashes imply an equal `resource_id` -- and the row r1 read
+    // under fp1 still says fp1.
+    let row = |revision: i64| -> (String, Option<String>) {
+        store
+            .conn()
+            .query_row(
+                "SELECT resource_id, fingerprint FROM observation
+                 WHERE local_id = 'x' AND revision = ?1",
+                [revision],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap()
+    };
+    assert_eq!(row(1), ("r1".to_owned(), Some("fp1".to_owned())));
+    assert_eq!(row(2), ("r2".to_owned(), Some("fp2".to_owned())));
+
+    let back = sweep(&mut store, &fixture, 2, "r1", "fp1").await;
+    assert!(back.complete, "{:?}", back.disqualified_reason);
+    assert_eq!(
+        back.retracted,
+        0,
+        "r1 no longer holds `x` -- there is nothing there to retract: {:?}",
+        retractions(&store)
+    );
+    assert_eq!(live(&store, "r1"), vec!["y".to_owned()]);
+    assert_eq!(
+        live(&store, "r2"),
+        vec!["x".to_owned()],
+        "a record the adapter reported in this very refresh is live SOMEWHERE"
+    );
+}

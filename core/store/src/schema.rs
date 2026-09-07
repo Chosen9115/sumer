@@ -31,7 +31,14 @@ use rusqlite::Connection;
 
 /// The schema version this build writes and expects. A database stamped
 /// with anything else is refused rather than guessed at.
-pub const USER_VERSION: i64 = 1;
+///
+/// **2**: `observation.content_hash` is the hash of a field list that now
+/// includes `resource_id` (see [`crate::hash`]). The table's shape did not
+/// change; the DERIVATION of a column stored in it did, and a table
+/// holding two derivations of one column under one name is the quiet
+/// inconsistency `user_version` exists to refuse. Nothing is released, so
+/// the cost is a `sumer` profile no one has yet.
+pub const USER_VERSION: i64 = 2;
 
 const DDL: &str = r"
 CREATE TABLE adapter (

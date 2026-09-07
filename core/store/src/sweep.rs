@@ -463,12 +463,27 @@ pub async fn sweep_resource(
             }
 
             store::set_adapter_derivation(&txn, input.adapter_id, input.hello_derivation)?;
+            // The VANTAGE is adopted only by a sweep that RECONCILED it.
+            // `derive_retractions` is the only writer of `vantage_changed`
+            // and it never runs on a disqualified sweep, so storing the
+            // new `provider_id` here unconditionally destroyed both halves
+            // of §8.2's exemption at once: the audit row was never written
+            // and the next sweep, comparing the new vantage against
+            // itself, retracted everything the old vantage could see under
+            // a reason that blames the provider. One non-`exact` page was
+            // enough.
+            //
+            // The derivation and the fingerprint are NOT gated with it:
+            // neither exempts anything (condition (7) reads the per-sweep
+            // hello value, §8.3 reads the per-record fingerprint that
+            // `ingest_page` has already stamped on this sweep's rows), so
+            // they are metadata that must stay in step with those rows.
             store::set_resource_definition(
                 &txn,
                 input.adapter_id,
                 input.resource_id,
                 input.fingerprint,
-                input.provider_id,
+                report.complete.then_some(input.provider_id),
             )?;
             store::finish_crawl(
                 &txn,
@@ -657,9 +672,9 @@ struct PageCounts {
 /// alone differs -- which is exactly why `received_at` is not in the hash.
 ///
 /// **A retracted record is the one exception, and it is not a special
-/// case in the liveness rule -- it is the rule.** Liveness is "the chain
-/// head's revision exceeds every retraction for that key", so a record the
-/// host retracted and the provider is now reporting again has to grow a
+/// case in the liveness rule -- it is the rule.** Liveness is "the chain's
+/// highest revision exceeds every retraction for that key", so a record
+/// the host retracted and the provider is now reporting again has to grow a
 /// revision to come back. A reorg that re-mines a transaction re-emits it
 /// BYTE-IDENTICALLY, so a dedup that fired here would leave it retracted
 /// for ever, no matter how many honest sweeps carried it. "Live again" is
@@ -679,8 +694,15 @@ fn ingest_page(
         let head = fold.chain(input.adapter_id, &observation.local_id);
         let head = head.last();
         let head_hash = head.map(|head| content_hash(&head.observation));
-        let currently_retracted =
-            head.is_some_and(|head| is_buried(buried, &observation.local_id, head.revision));
+        // Liveness is asked of the chain's HIGHEST revision, never the
+        // head's -- the two differ whenever the fold's total order and
+        // arrival order disagree, and `live_set` asks the same question
+        // the same way. Ask the head here and a backwards clock step makes
+        // this say "buried" while `live_set` says "live": dedup stays off
+        // for ever and the chain grows a row on every refresh.
+        let currently_retracted = fold
+            .highest_revision(input.adapter_id, &observation.local_id)
+            .is_some_and(|revision| is_buried(buried, &observation.local_id, revision));
         if !currently_retracted && head_hash.as_deref() == Some(hash.as_str()) {
             // The head's OWN revision names the row to stamp. "The last row
             // inserted" is a different row whenever the fold's total order
@@ -741,10 +763,10 @@ struct RetractionOutcome {
 
 /// The retraction derivation, run inside the final page's transaction.
 ///
-/// A record is LIVE iff its chain head is `active` **and** that head's
-/// revision exceeds every retraction revision for its key. Revival needs
-/// no special case anywhere: a later sweep appends revision N+1, which is
-/// greater than N, and the record is live again.
+/// A record is LIVE iff its chain head is `active` **and** the chain's
+/// highest revision exceeds every retraction revision for its key.
+/// Revival needs no special case anywhere: a later sweep appends revision
+/// N+1, which is greater than N, and the record is live again.
 #[allow(clippy::too_many_arguments)]
 fn derive_retractions(
     conn: &rusqlite::Connection,
@@ -936,13 +958,22 @@ fn derive_retractions(
     })
 }
 
-/// Whether a retraction currently buries this chain head.
+/// Whether a retraction currently buries this chain.
 ///
 /// **The liveness rule, and the only copy of it** (`spec/observation.md`
-/// §8.4): a record is live iff the fold's live set holds it AND its chain
-/// head's revision EXCEEDS every retraction revision for its key. Revival
-/// needs no special case -- a later sweep appends revision N+1, which
-/// exceeds N.
+/// §8.4): a record is live iff the fold's live set holds it AND its
+/// chain's HIGHEST revision EXCEEDS every retraction revision for its key.
+/// Revival needs no special case -- a later sweep appends revision N+1,
+/// which exceeds N.
+///
+/// "Highest", not "the head's": `revision` is arrival order and the head
+/// is fold order, so a wall clock that stepped backwards between refreshes
+/// (NTP, a restored snapshot -- `received_at` is `SystemTime::now()` at
+/// second precision) sorts the re-emitted observation BELOW the buried
+/// head, and the head's revision never grows past the retraction. The
+/// record is then buried permanently while its chain grows a row per
+/// refresh. The invariant this restores: the revision liveness is measured
+/// against is the maximum in the chain.
 fn is_buried(high_water: &HashMap<String, u64>, local_id: &str, revision: u64) -> bool {
     high_water
         .get(local_id)
@@ -969,12 +1000,18 @@ fn live_set(
     let mut live: Vec<(String, u64, Observation)> = fold
         .live_set()
         .into_iter()
-        .filter(|((owner, local_id), head)| {
-            *owner == adapter_id
-                && head.observation.resource_id == resource_id
-                && !is_buried(high_water, local_id, head.revision)
+        .filter(|((owner, _), head)| {
+            *owner == adapter_id && head.observation.resource_id == resource_id
         })
-        .map(|((_, local_id), head)| (local_id.to_owned(), head.revision, head.observation.clone()))
+        .filter_map(|((_, local_id), head)| {
+            // The chain's highest revision, not the head's -- see
+            // [`is_buried`]. It is also the revision a retraction derived
+            // from this set is recorded against, so the two can never
+            // disagree about what would bury this record.
+            let revision = fold.highest_revision(adapter_id, local_id)?;
+            (!is_buried(high_water, local_id, revision))
+                .then(|| (local_id.to_owned(), revision, head.observation.clone()))
+        })
         .collect();
     live.sort_by(|a, b| a.0.cmp(&b.0));
     live
@@ -1198,5 +1235,86 @@ mod tests {
         assert_eq!(recovered.retracted, 1);
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// One observation, built directly rather than scripted: the clock
+    /// behaviour this asserts on cannot be reached through the adapter.
+    fn observed(local_id: &str, received_at: &str) -> Observation {
+        use sumer_money::{Amount, AssetId};
+        use sumer_wire::{
+            Completeness, ObservationState, Posting, Provenance, ProvenanceWire, RawSign, Staleness,
+        };
+        Observation {
+            resource_id: "acct".to_owned(),
+            local_id: local_id.to_owned(),
+            provider_id: None,
+            supersedes_provider_id: None,
+            state: ObservationState::Active,
+            tombstone_reason: None,
+            surface: "s".to_owned(),
+            posting: Posting::Posted,
+            amount: Amount::parse(AssetId::new("usd").unwrap(), "10.00").unwrap(),
+            fees: None,
+            raw_sign: RawSign::ProviderPositive,
+            description: local_id.to_owned(),
+            provider_extra: serde_json::Map::new(),
+            provenance: Provenance::stamp(
+                ProvenanceWire {
+                    adapter_id: "fake-adapter".to_owned(),
+                    provider_id: "p1".to_owned(),
+                    surface: "s".to_owned(),
+                    observed_at: Rfc3339::new("2026-01-01T00:00:00Z").unwrap(),
+                    effective_at: None,
+                    completeness: Completeness::Complete,
+                },
+                Rfc3339::new(received_at).unwrap(),
+                Staleness::Live,
+            ),
+        }
+    }
+
+    /// **A record buried by a retraction revives on the next sweep, even
+    /// if the wall clock stepped backwards** (`spec/observation.md` §8.4).
+    ///
+    /// `received_at` is `SystemTime::now()` at second precision with no
+    /// monotonic guard, so an NTP correction or a restored VM snapshot
+    /// makes the re-emitted observation sort BELOW the buried head in the
+    /// fold's total order. Liveness then compared the retraction
+    /// high-water against the fold HEAD's revision -- a number in arrival
+    /// order -- so the head's revision never grew past the retraction, the
+    /// record stayed buried for ever, and because `currently_retracted`
+    /// correctly disables dedup the chain grew one row per refresh with no
+    /// way back.
+    ///
+    /// The two orders are both correct and they answer different
+    /// questions; the bug was comparing across them. Liveness is an
+    /// arrival-order question ("has the host learned anything since the
+    /// retraction?"), so it asks the chain's HIGHEST revision.
+    #[test]
+    fn a_backwards_clock_step_does_not_bury_a_record_for_ever() {
+        let mut fold = Fold::new();
+        assert_eq!(fold.ingest(observed("x", "2026-01-01T00:00:10Z")), 1);
+        // The retraction that buried revision 1, then the same record
+        // re-emitted while the clock reads five seconds EARLIER.
+        let high_water = HashMap::from([("x".to_owned(), 1u64)]);
+        assert_eq!(fold.ingest(observed("x", "2026-01-01T00:00:05Z")), 2);
+
+        let live = live_set(&fold, &high_water, "fake-adapter", "acct");
+        assert_eq!(
+            live.len(),
+            1,
+            "revision 2 exceeds the retraction at revision 1: the record is live \
+             again, whatever the clock did"
+        );
+        assert_eq!(
+            live[0].1, 2,
+            "and the revision liveness (and the next retraction) is measured \
+             against is the chain's highest, not the fold head's"
+        );
+        assert!(
+            !is_buried(&high_water, "x", live[0].1),
+            "the invariant: liveness is measured against the chain's maximum \
+             revision, so nothing can bury a record the host has learned since"
+        );
     }
 }

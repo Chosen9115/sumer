@@ -1,8 +1,19 @@
 # ADR 0006 — Retraction is host-side, derived from a complete sweep
 
-- **Status:** accepted
+- **Status:** accepted (revision 1)
 - **Date:** 2026-09-07
 - **Decision by:** Linus, Milestone 1
+
+**Revision 1** corrects decision 3 on one point and adds two rules the
+implementation of this ADR made necessary. The liveness comparison reads the
+chain's **highest** revision, not the head's — those are two different orders,
+and mixing them buries records permanently (decision 3, and
+`spec/observation.md` §8.4, which carries the reasoning). Head *selection* is
+untouched. The two additions are the `resource_id` amendment to the content
+hash and the adapter obligation that pairs with it (decision 7), and the shape
+of a host-authored balance marker (decision 8) — the same "no provider field
+to fabricate" principle as decision 3, applied to a stream that has no second
+table to move to.
 
 ## Context
 
@@ -30,7 +41,7 @@ evidence licenses it, and what it costs.
 **The host derives retraction. No adapter ever reports a disappearance.**
 
 The normative rule is `spec/observation.md` §8, which binds any host and not
-only this one. This ADR records why these mechanisms were chosen over their
+only this one (with the two rules revision 1 added stated in §2 and §3). This ADR records why these mechanisms were chosen over their
 alternatives, and what they cost.
 
 ### 1. The evidence is a complete sweep, and it has eight gates
@@ -102,13 +113,27 @@ and no provider provenance for a record it did not read, and filling those in
 on its own behalf is fabricating provider evidence. So a derived absence is not
 written into the observation chain. It is
 `retraction(adapter_id, local_id, revision, reason, crawl_id, retracted_at)`,
-append-only, with no provider field to fabricate, where `revision` is the head
-revision it retracts.
+append-only, with no provider field to fabricate, where `revision` is the
+chain's **highest** revision at the moment it retracts.
 
-**A record is live iff its chain head's revision exceeds every retraction
+**A record is live iff its chain's highest revision exceeds every retraction
 revision for that key.** Revival then needs no special case at all: a later
 sweep appends revision N+1 > N and the record is live again by the same rule
 that hid it. `show` unions the two tables by revision.
+
+**Highest, not the head's — revised in revision 1.** `revision` is arrival
+order; the head is the winner of the fold's total order
+(`received_at`, `surface`, `arrival_index`). Liveness asks "has anything been
+learned about this key since revision N," which is an arrival-order question,
+so it must be answered in arrival order. Asking the head instead compares
+across two orders and buries a record for ever the first time they disagree —
+and they disagree on ordinary input: two surfaces in one page sort by
+`surface` ahead of arrival, and a backwards wall-clock step (NTP correction, VM
+snapshot restore) makes every later re-emission sort *below* the buried head,
+so the head's revision never grows past the retraction while the chain gains a
+row per refresh. Which observation the user sees as current is still the head,
+chosen by the same total order as before; only the comparison moved.
+`spec/observation.md` §8.4 states it normatively.
 
 The reason is chosen by *why* the record is absent, in this order: the head's
 derivation differs from the sweep's → `derivation_changed`; the head's
@@ -169,6 +194,68 @@ minus the retraction rule is the diff base, and `paging::ResumeState` drives
 the page loop. Revision assignment stays in **one** implementation. Until this
 PR both modules had no caller inside the host and the conformance suite was
 their only consumer — a stated known limit in three files, now closed.
+
+### 7. `resource_id` is hashed, and an adapter may not report a `local_id` twice
+
+**Added in revision 1.**
+
+The content hash that decides "same record, seen again" covers the frozen
+contract's field list **plus `resource_id`**, a deliberate amendment recorded
+in `core/store/src/hash.rs`. Chains are keyed `(adapter_id, local_id)` and
+`resource_id`s are free to collide (`spec/observation.md` §3), so a
+spec-conforming adapter emitting a bare provider id under two resources is
+reachable — and with `resource_id` outside the hash, its second observation
+deduped against the head stored under the *first* resource. Nothing was stored
+under the new resource, the head kept the old resource's attribution, and the
+old resource's next sweep then retracted — as `resource_definition_changed` —
+a record the adapter had reported in that very refresh. The record ended up
+live under **no** resource, and which resource was swept first decided it.
+Nothing constrains that order.
+
+A hash that omits a field the system discriminates on is a trap for whoever
+reads it next, so the field goes in the hash. A record appearing under a
+different resource is a **changed fact** and appends a revision, on the same
+principle that makes a byte-identical re-emission of a buried record append.
+
+The pairing rule is on the adapter, and it is normative in
+`spec/observation.md` §3: **an adapter MUST NOT report one `local_id` under
+two `resource_id`s at the same time.** The natural counterexample — a transfer
+between two of the user's own wallets, genuinely visible from both — is
+answered by giving the two sides distinct `local_id`s, which is what
+`adapters/bitcoin/src/map.rs` already does by prefixing with the resource id.
+Revision 1 makes that convention normative rather than accidental. An adapter
+that ignores it appends a revision per sweep for ever and shows the record
+under whichever resource swept last: well-defined, useless, and the adapter's
+bug. The host cannot do better, because "moved" and "reported twice" are the
+same bytes.
+
+### 8. A host-authored balance marker copies, and says so
+
+**Added in revision 1.**
+
+Balance lines are appended and never overwritten, so a failed `balances.read`
+— or a reply that stops naming a category it used to report — leaves the last
+successful figure on top, still stamped with that read's staleness, rendering
+as `Live` indefinitely. `refresh` now writes a marker row for every such
+category: amount withheld, freshness downgraded, last known figure untouched
+one row below.
+
+That is a host-authored row in an adapter-authored stream, which decision 3
+answers for retractions by giving them their own table with no provider field
+to fabricate. A balance stream has no second table to move to, so the rule is
+stated on the row: **the marker carries no field it did not copy from the row
+it marks.** `category`, `canonical_hint`, `provider_id`, `surface`,
+`observed_at` and `effective_at` are copied forward; the host authors only
+`amount` (null — nothing was read, and never a zero), `received_at`,
+`staleness` (`Unavailable`) and `completeness` (`Unknown`, the explicit
+no-claim variant). It is written as a `SELECT` from the row it marks, so the
+copying is structural rather than a promise the next edit can break.
+
+Before this, such a row was **byte-identical** to an adapter row reporting
+`unavailable` with no amount, and no consumer could tell "the provider could
+not tell me" from "I did not read this." So a marker's stored `outcome`
+carries an `unread:` prefix, which no adapter-derived row's ever does.
+`spec/observation.md` §2 states both halves normatively.
 
 ## Why the host-side version needs no delivery gate
 
@@ -288,9 +375,10 @@ place does not exist here to be placed.
   strand the record retracted forever however many honest sweeps carried it —
   the reorg-remine case, which is the one this capability was built for. The
   resolution is not a special case in the liveness rule, it *is* the liveness
-  rule: while a key's head revision is at or below a retraction revision for
-  that key, every re-observation appends. "Live again" is a changed fact even
-  when the content is not, and a revision is the only thing this model has to
+  rule: while a key's highest chain revision is at or below a retraction
+  revision for that key, every re-observation appends. "Live again" is a
+  changed fact even when the content is not, and a revision is the only
+  thing this model has to
   say it with. Recorded in `spec/observation.md` §8.4.
 - **A dedup hit refreshes the stored derivation and fingerprint, not only the
   last-seen marker.** Otherwise a record that *survived* an address change

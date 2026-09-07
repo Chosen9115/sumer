@@ -3,7 +3,35 @@
 //! The field list is the frozen contract's, verbatim: `local_id`,
 //! `provider_id`, `supersedes_provider_id`, `state`, `tombstone_reason`,
 //! `surface`, `posting`, `amount`, `fees`, `raw_sign`, `description`,
-//! `provider_extra`, `observed_at`, `effective_at`, `completeness`.
+//! `provider_extra`, `observed_at`, `effective_at`, `completeness` --
+//! **plus `resource_id`, a deliberate amendment to that list.**
+//!
+//! # Why `resource_id` was added
+//!
+//! Records are keyed by `(adapter_id, local_id)` (`spec/observation.md`
+//! §3), which is exactly why a `local_id` CAN reach the store under a
+//! second `resource_id`: the key holds no resource, §3 lets resource ids
+//! collide, and [`sumer_host::fold`] keys chains adapter-wide precisely so
+//! a record that moves resource keeps one chain. An adapter that emits a
+//! bare txid across two wallets is therefore reachable, and while
+//! `resource_id` was outside the hash such a record deduped against the
+//! head stored under the OLD resource: nothing was stored under the new
+//! one, the head kept the old resource's attribution, and the old
+//! resource's next sweep retracted -- as `resource_definition_changed` --
+//! a record the adapter had reported in that very refresh. Which resource
+//! was swept first decided the outcome, and nothing constrains that order.
+//!
+//! A record appearing under a different resource is a **changed fact**:
+//! the same principle that makes a byte-identical re-emission of a buried
+//! record append a revision. The hash must discriminate on every field the
+//! system discriminates on; one that omits one is a trap for whoever reads
+//! it next. §3 now also forbids an adapter to report one `local_id`
+//! under two `resource_id`s at the same time -- which does not make this
+//! redundant: that is an obligation on adapters, and a retraction may not
+//! rest on an obligation a buggy adapter can break. With `resource_id`
+//! hashed, a violation is merely loud (a revision per sweep, the record
+//! under whichever resource swept last) instead of silent (the record
+//! live under no resource at all).
 //!
 //! **What is excluded, and why the exclusion is the whole point.**
 //! `received_at`, `staleness`, `revision`, `crawl_id` differ on every
@@ -35,6 +63,7 @@ pub fn content_hash(observation: &Observation) -> String {
     let mut put = |key: &str, value: serde_json::Value| {
         fields.insert(key.to_owned(), value);
     };
+    put("resource_id", observation.resource_id.as_str().into());
     put("local_id", observation.local_id.as_str().into());
     put("provider_id", opt_str(observation.provider_id.as_deref()));
     put(
@@ -197,6 +226,18 @@ mod tests {
         let before = observation("42.00", "2026-01-01T00:00:00Z", Staleness::Live);
         let after = observation("42.37", "2026-01-01T00:00:00Z", Staleness::Live);
         assert_ne!(content_hash(&before), content_hash(&after));
+    }
+
+    /// The same record under a second `resource_id` is a CHANGED FACT.
+    /// While this was outside the hash it deduped against the head stored
+    /// under the old resource, so it was stored nowhere, shown nowhere,
+    /// and retracted by the old resource's next sweep.
+    #[test]
+    fn the_resource_is_content() {
+        let here = observation("42.00", "2026-01-01T00:00:00Z", Staleness::Live);
+        let mut moved = here.clone();
+        moved.resource_id = "other".to_owned();
+        assert_ne!(content_hash(&here), content_hash(&moved));
     }
 
     /// Scale is content. `42.0` and `42.00` are the same *value* and two

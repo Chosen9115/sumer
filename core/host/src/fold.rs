@@ -131,6 +131,26 @@ impl Fold {
             .unwrap_or_default()
     }
 
+    /// The highest `revision` in one chain -- the newest thing the host
+    /// has LEARNED about that key, which is not always the chain's head.
+    ///
+    /// The head is the last entry in the fold's total order; `revision` is
+    /// arrival order. The two disagree whenever `received_at` does not
+    /// increase with arrival (two surfaces reconciled out of order in one
+    /// page, or a wall clock that stepped backwards between refreshes),
+    /// and a question asked in arrival order must be answered in arrival
+    /// order. Liveness is such a question -- "has anything been learned
+    /// since the retraction at revision N?" -- so it asks this, not
+    /// `chain().last()`. Asking the head instead lets a backwards clock
+    /// step bury a record whose revision can then never grow past the
+    /// retraction, permanently.
+    #[must_use]
+    pub fn highest_revision(&self, adapter_id: &str, local_id: &str) -> Option<u64> {
+        self.chains
+            .get(&(adapter_id.to_owned(), local_id.to_owned()))
+            .and_then(|entries| entries.iter().map(|e| e.revisioned.revision).max())
+    }
+
     /// Every `(adapter_id, local_id)` this fold has ever seen an
     /// observation for.
     pub fn keys(&self) -> impl Iterator<Item = (&str, &str)> {

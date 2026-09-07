@@ -304,15 +304,21 @@ fn resource_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ResourceRow> {
     })
 }
 
+/// `provider_id` is `None` for a sweep that must not adopt the vantage it
+/// read from -- a disqualified one, which derived no retractions and so
+/// reconciled nothing. Adopting it there consumes §8.2's vantage exemption
+/// without ever recording the `vantage_changed` the exemption exists to
+/// pair with, and the next sweep retracts on a move nobody was told about.
 pub fn set_resource_definition(
     conn: &Connection,
     adapter_id: &str,
     resource_id: &str,
     fingerprint: &str,
-    provider_id: &str,
+    provider_id: Option<&str>,
 ) -> Result<()> {
     conn.execute(
-        "UPDATE resource SET fingerprint = ?3, last_provider_id = ?4
+        "UPDATE resource SET fingerprint = ?3,
+                last_provider_id = COALESCE(?4, last_provider_id)
          WHERE adapter_id = ?1 AND resource_id = ?2",
         rusqlite::params![adapter_id, resource_id, fingerprint, provider_id],
     )?;
@@ -335,8 +341,18 @@ pub fn set_resource_definition(
 /// successful resume that drains from C leaves crawl 1 still `drained = 0`
 /// with `next_page = C`, and every later `--resume` selects that same stale
 /// C again, for ever. `next_page` is cleared rather than the row: the
-/// crawl, its disqualifier and its observations are the audit trail, and
-/// the point it stopped at is recorded as the successor's `start_page`.
+/// crawl, its disqualifier and its observations are the audit trail.
+///
+/// **What the clear costs, stated honestly.** On a `--resume` the point the
+/// old crawl stopped at survives as this crawl's `start_page`. On a plain
+/// refresh it does not: `start_page` is `None`, so a refresh that dies
+/// before its first page commits leaves `--resume` with nothing, and the
+/// next run starts from the beginning of history. That is an availability
+/// cost and never a correctness one -- a sweep from `page: None` satisfies
+/// gate condition (1), where a resumed one does not, so the fallback is
+/// strictly stronger evidence than the cursor it lost. The clear and the
+/// insert commit together for the same reason: a crash between them would
+/// leave the resource with no cursor and no crawl to explain why.
 #[allow(clippy::too_many_arguments)]
 pub fn open_crawl(
     conn: &Connection,
@@ -347,12 +363,13 @@ pub fn open_crawl(
     derivation: &str,
     fingerprint: Option<&str>,
 ) -> Result<i64> {
-    conn.execute(
+    let txn = conn.unchecked_transaction()?;
+    txn.execute(
         "UPDATE crawl SET next_page = NULL
          WHERE adapter_id = ?1 AND resource_id = ?2 AND next_page IS NOT NULL",
         rusqlite::params![adapter_id, resource_id],
     )?;
-    conn.execute(
+    txn.execute(
         "INSERT INTO crawl
            (adapter_id, resource_id, started_at, start_page, next_page,
             local_id_derivation, fingerprint)
@@ -366,7 +383,9 @@ pub fn open_crawl(
             fingerprint
         ],
     )?;
-    Ok(conn.last_insert_rowid())
+    let crawl_id = txn.last_insert_rowid();
+    txn.commit()?;
+    Ok(crawl_id)
 }
 
 pub fn set_crawl_cursor(conn: &Connection, crawl_id: i64, next_page: Option<&str>) -> Result<()> {

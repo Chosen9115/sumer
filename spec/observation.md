@@ -117,6 +117,52 @@ A balances list is the only shape that survives contact with all three without
 either inventing categories a provider never reported or silently dropping
 ones it did.
 
+### A host-authored marker is not a balance the host read
+
+A host that keeps a balance history — this one appends every line it reads and
+overwrites nothing — has a problem the wire itself does not. A figure it did
+**not** read this time stays on top of its category's history, still carrying
+the staleness of the last read that *did* succeed, and goes on rendering as
+`Live` long after the reads stopped working. So the host records a **marker**
+for every category it could not refresh: when a `balances.read` fails
+outright, and when a reply comes back without naming a category that resource
+has reported before. The
+marker withholds the figure and downgrades the freshness; the last known
+amount is untouched, one row further down.
+
+A marker is a host-authored row in an adapter-authored stream, which is the
+situation §8.4 confronts for retractions. There the answer is a separate
+table, so there is **no provider field to fabricate**. A balance stream has no
+second table to move to, so the same principle is stated on the row instead:
+
+> **A host-authored balance marker carries no field it did not copy from the
+> adapter row it marks.** `category`, `canonical_hint`, `provider_id`,
+> `surface`, `observed_at` and `effective_at` are copied forward verbatim from
+> the most recent stored line for that `(resource_id, category)` — never
+> re-derived, never defaulted, never blanked. The host authors only the four
+> that were already its own: `amount` is **null**, because nothing was read
+> (and null is UNKNOWN, never zero); `received_at` is the host's own receipt
+> stamp (§1); `staleness` is `Unavailable`; and `completeness` is `Unknown`,
+> the explicit no-claim variant — carrying a `Complete` forward onto a read
+> that never happened would be precisely the fabrication this rule exists to
+> stop.
+
+**A marker must also be distinguishable, and that is not a nicety.** A host
+stores the §6 `outcome` of the read each balance line came from. A marker's
+`outcome` is the outcome that occasioned it — the resource's own outcome, or
+`no_observation` when the reply named the resource and left this category out,
+or the failure when the call itself did not return — carried under an
+**`unread:` prefix**, and no adapter-derived row's outcome ever begins that
+way. Without the prefix the marker is byte-identical to an adapter row
+reporting `unavailable` with no amount, and those are two different claims:
+"the provider could not tell me" is evidence about the provider, while "I did
+not read this" is a statement about the host. A consumer that cannot tell them
+apart cannot report either one honestly.
+
+A category with no stored line is left alone. There is no figure there to
+protect from looking falsely current, and writing a marker for it would be the
+host asserting the category exists on the strength of nothing.
+
 ## 3. History observations
 
 **Adapters emit observations, not revisions.** A history observation is:
@@ -240,6 +286,48 @@ the deduplication key, and is not present on every observation to begin with
 (it is optional; a pending-only surface may have nothing the provider itself
 calls an id yet). The live set is always the fold over observations keyed by
 `local_id`, never a naive unique-by-`provider_id` pass.
+
+### One `local_id`, one `resource_id` at a time
+
+**An adapter MUST NOT report the same `local_id` under two `resource_id`s at
+the same time.** This is the rule above seen from the adapter's end. Because a
+record is keyed `(adapter_id, local_id)` and `resource_id`s are free to
+collide, the key carries no resource in it — so a `local_id` that turns up
+under a second `resource_id` can only mean the record **moved**, and the host
+will treat it as exactly that: the move is a changed fact, so it appends a
+revision, the record is live under the new resource, and the old resource's
+listing no longer contains it. Nothing is retracted there — the fold's head for
+that key now names the other resource, so the old resource's next sweep does
+not find it in the live set it diffs against (§8) and has nothing to retract.
+
+The host can tell a move from a re-report only because the two differ, so
+`resource_id` is one of the fields the host's content hash discriminates on.
+Leave it out and the second resource's observation is deduplicated against the
+first's head: nothing is stored under the new resource, the head keeps the old
+resource's attribution, and the old resource's next sweep retracts a record the
+adapter reported in that very refresh — with the outcome decided by which
+resource happened to be swept first.
+
+**The counterexample is real, and the escape hatch is the `local_id` itself.**
+A transfer between two of the user's own wallets is genuinely visible from
+both, and the provider will hand the adapter the same id for it twice. Two
+resources reporting one real-world event are two records in this model, not
+one, so the adapter must derive **distinct `local_id`s** for them — by taking
+the resource id as an input to the derivation alongside the provider data. The
+reference Bitcoin adapter already does this: `local_id = "<resource_id>:<txid>"`
+(`adapters/bitcoin/src/map.rs`, `adr/0004-bitcoin-adapter.md` decision 2). This
+rule makes that convention normative for every adapter rather than a local
+habit of one. It costs the derivation nothing: a resource id is ordinary
+adapter-scoped input, and the function stays the deterministic pure function
+this section requires.
+
+**An adapter that ignores this produces a well-defined, useless history.** One
+`local_id` reported under two resources on every refresh appends one revision
+per sweep for ever — a chain that grows without a single fact changing — and
+the record renders under whichever resource swept last. The host cannot do
+better: "moved" and "reported twice" are the same bytes, and choosing between
+them would mean inventing evidence. This is the adapter's bug, and it is the
+adapter's to fix.
 
 ## 4. One model, two domains: pending→posted and reorg
 
@@ -669,14 +757,43 @@ never enters the observation chain. It is a separate, append-only record:
 
     retraction { adapter_id, local_id, revision, reason, crawl_id, retracted_at }
 
-with **no provider field to fabricate**, where `revision` is the chain head
-revision it retracts and `crawl_id` names the sweep that derived it.
+with **no provider field to fabricate**, where `revision` is the **highest
+revision in the chain** it retracts and `crawl_id` names the sweep that derived
+it.
 
 Liveness is then one rule over both tables:
 
-> A record is live iff the fold's live set (§3) contains it **and** its chain
-> head's `revision` exceeds every retraction `revision` recorded for that
-> `(adapter_id, local_id)`.
+> A record is live iff the fold's live set (§3) contains it **and** its
+> chain's **highest** `revision` exceeds every retraction `revision` recorded
+> for that `(adapter_id, local_id)`.
+
+**The chain's highest revision, not the head's — those are two different
+questions.** `revision` is **arrival order**: the host stamps it as
+observations come off the wire (§3). The chain *head* is not the newest
+arrival; it is the winner of §3's fold total order,
+`(received_at, surface, arrival_index)`. Both orders are correct for what they
+answer. The head answers "what is true about this record now," which is a
+question about the provider's account of it. Liveness answers "has this host
+learned anything about this key since the retraction at revision N," which is a
+question about arrival — so it has to be asked in arrival order.
+
+Compare a retraction's revision against the *head's* and the two orders are
+mixed, which can bury a record for ever. Both ways they disagree are ordinary,
+not exotic. Two surfaces reporting the same event in one page already sort by
+`surface` ahead of arrival index, so the later arrival need not be the head. And
+a wall clock that steps **backwards** between refreshes — an NTP correction, a
+VM snapshot restore, a machine resuming with a bad RTC — stamps every
+re-emission with a `received_at` below the buried head's, so every honest sweep
+sorts *under* that head and the head's revision never grows past the
+retraction. The record stays retracted for ever while its chain grows one row
+per refresh, because dedup is off for a record the host believes buried (below).
+Reading the chain's highest revision has neither failure: a revision, once
+assigned, is never outranked by an older arrival.
+
+**Head *selection* is unchanged.** §3's total order still decides which
+observation the fold presents as the record's current state and which one the
+user sees, and it is still that head whose derivation and fingerprint §8.3's
+re-stamp refreshes. Only the liveness comparison moved.
 
 **This is why revival needs no special case.** A later sweep that re-emits the
 record appends revision N+1, which exceeds the retraction's N, and the record
@@ -689,12 +806,14 @@ contradiction.
 buried.** Recognising a re-emitted record as byte-identical to its chain head
 and appending nothing is right in the ordinary case and wrong in exactly this
 one: a reorg that re-mines a transaction re-emits it **byte-identically**, so a
-dedup firing there would append no revision, leave the head at N, and keep the
-record retracted forever — no matter how many honest sweeps carried it.
-**"Live again" is a changed fact even when the content is not**, and a revision
-is the only way this model has to express a changed fact. So while a key's
-chain head revision is at or below a retraction revision for that key, every
-re-observation of it appends.
+dedup firing there would append no revision, leave the chain's highest
+revision at N, and keep the record retracted forever — no matter how many
+honest sweeps carried it. **"Live again" is a changed fact even when the
+content is not**, and a revision is the only way this model has to express a
+changed fact. So while a key's **highest** chain revision is at or below a
+retraction revision for that key, every re-observation of it appends — the same
+revision the liveness rule compares, asked the same way, so dedup and liveness
+can never disagree about whether a record is buried.
 
 **Nothing is deleted.** A retraction hides a record from the live set and from
 everything derived from it; it removes nothing. The chain, the retraction rows,
