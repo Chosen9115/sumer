@@ -21,7 +21,7 @@ mod wallet;
 use map::{Ctx, Cursor, PAGE_BUDGET_BYTES};
 use source::{FetchError, Source};
 use std::cell::RefCell;
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::fmt::Display;
 use std::io::{self, BufRead, Write};
 use std::path::{Path, PathBuf};
@@ -41,6 +41,21 @@ const PROTOCOL: &str = "1";
 /// `--source` at mempool.space's `/api`, or at your own esplora/electrs,
 /// and no code changes. Never at a service that wants an xpub.
 const DEFAULT_SOURCE: &str = "https://blockstream.info/api";
+
+/// The longest `--source` this adapter accepts. Over it is a usage error
+/// and exit 2, exactly like `wallet.rs`'s `resource_id` bound.
+///
+/// **Rejected, never truncated.** `--source` becomes
+/// `provenance.provider_id` on every observation this adapter emits and
+/// every resource descriptor it lists; a truncated provider identity is a
+/// falsified provenance, which is a worse answer than refusing to start.
+///
+/// With this bound every field of a tombstone is bounded by construction,
+/// so `spec/observation.md` 6 step 2 cannot omit one -- which matters
+/// because an omitted tombstone that still cleared its txid from the
+/// baseline is a retraction suppressed permanently. `map::Page::omitted`
+/// is what makes that safe rather than merely unreachable.
+const MAX_SOURCE_BYTES: usize = 256;
 
 const USAGE: &str = "\
 usage: sumer-bitcoin-adapter --wallets <file.json> [options]
@@ -70,12 +85,22 @@ fn main() -> std::process::ExitCode {
             return std::process::ExitCode::from(2);
         }
     };
+    // A --state-dir the operator DECLARED and this process cannot use is a
+    // failed configuration, not a degraded one: it would run for weeks
+    // reporting `unavailable`, emitting no tombstone, and saying so only in
+    // a stderr line per write. Omitting the flag stays an announced warning
+    // -- that is a different configuration, and it works.
+    if let Some(dir) = &options.state_dir {
+        if let Err(e) = probe_state_dir(dir) {
+            eprintln!("sumer-bitcoin-adapter: --state-dir {}: {e}", dir.display());
+            return std::process::ExitCode::from(2);
+        }
+    }
     let adapter = Adapter {
         wallets,
         source: options.source,
         store: seen::Store::new(options.state_dir),
         crawls: RefCell::new(HashMap::new()),
-        pending: RefCell::new(Vec::new()),
     };
 
     let stdin = io::stdin();
@@ -97,11 +122,27 @@ fn main() -> std::process::ExitCode {
         if frame.is_empty() {
             continue;
         }
-        if let Some(reply) = adapter.handle(frame) {
+        if let Some((reply, commits)) = adapter.handle(frame) {
             match write_reply(&mut out, &reply) {
-                // The state writes this reply earned are applied HERE,
-                // and only here: after the frame carrying it has gone out.
-                Ok(delivered) => adapter.settle(delivered),
+                // The state writes THIS reply earned are applied HERE, and
+                // only here: after the frame carrying them has gone out.
+                Ok(true) => {
+                    for commit in commits {
+                        commit.apply(&adapter.store);
+                    }
+                }
+                // What went out was not that reply, so it carried none of
+                // those observations and nothing in them may be recorded
+                // as reported. The next sync re-derives the diff.
+                Ok(false) => {
+                    for commit in &commits {
+                        eprintln!(
+                            "sumer-bitcoin-adapter: {} was not delivered, so its baseline is \
+                             left where it was; the next sync re-derives the diff",
+                            commit.resource_id()
+                        );
+                    }
+                }
                 Err(e) => {
                     eprintln!("sumer-bitcoin-adapter: stdout: {e}");
                     break;
@@ -110,6 +151,45 @@ fn main() -> std::process::ExitCode {
         }
     }
     std::process::ExitCode::SUCCESS
+}
+
+/// The startup probe: `create_dir_all`, then a temp write and a rename --
+/// the two steps `seen.rs`'s atomic write is built out of -- and then a
+/// `try_lock` on `<dir>/.probe.lock`.
+///
+/// **`try_lock`, never `lock`, and `WouldBlock` counts as success.**
+/// Another adapter already holding it is proof the filesystem supports the
+/// lock at all, which is the only question being asked; blocking here
+/// would let a contended directory hang startup before the hello reply.
+///
+/// **This NARROWS the hole, it does not close it.** ENOSPC, a quota
+/// reached at write time and a directory deleted mid-run all survive it
+/// verbatim -- see ADR 0004 on the residual window.
+///
+/// ponytail: no watchdog. A wedged network mount can still block inside
+/// `open` itself; a timeout around this probe is the upgrade path if that
+/// is ever observed in the field.
+fn probe_state_dir(dir: &Path) -> io::Result<()> {
+    let at = |step: &'static str| {
+        move |e: io::Error| io::Error::new(e.kind(), format!("cannot {step} it ({e})"))
+    };
+    std::fs::create_dir_all(dir).map_err(at("create"))?;
+    let tmp = dir.join(format!(".probe.tmp.{}", std::process::id()));
+    let moved = dir.join(format!(".probe.{}", std::process::id()));
+    std::fs::write(&tmp, b"").map_err(at("write to"))?;
+    std::fs::rename(&tmp, &moved).map_err(at("rename within"))?;
+    let _ = std::fs::remove_file(&moved);
+    let lock = dir.join(".probe.lock");
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(&lock)
+        .map_err(at("open a lock file in"))?;
+    match file.try_lock() {
+        Ok(()) | Err(std::fs::TryLockError::WouldBlock) => Ok(()),
+        Err(std::fs::TryLockError::Error(e)) => Err(at("lock a file in")(e)),
+    }
 }
 
 /// The only place this process writes to stdout, and the only place the
@@ -274,6 +354,12 @@ impl Options {
             }
         }
         let wallets = wallets.ok_or("--wallets is required")?;
+        if target.len() > MAX_SOURCE_BYTES {
+            return Err(format!(
+                "--source is {} bytes and the limit is {MAX_SOURCE_BYTES}",
+                target.len()
+            ));
+        }
         let source = match target.strip_prefix("file:") {
             Some(dir) => {
                 if record.is_some() {
@@ -322,10 +408,31 @@ struct Adapter {
     /// pages of one crawl is work already done inside one connection,
     /// not state carried across them.
     crawls: RefCell<HashMap<String, Crawl>>,
-    /// State writes the reply under construction has earned. Applied by
-    /// [`Adapter::settle`] once that reply has actually been written, and
-    /// dropped unapplied if it was not.
-    pending: RefCell<Vec<Commit>>,
+}
+
+/// One op's answer: the reply body, and the state writes THAT BODY earned.
+///
+/// **One value, not two.** The commits are a field of the body that
+/// carried the observations they record, so there is no way to apply a
+/// commit against a frame that carried something else. An op that fails
+/// returns `Err(ErrorBody)` and `?` drops the `Ok` half holding the
+/// commits, which is what makes the defect below unrepresentable rather
+/// than guarded: an envelope error is small, it FITS a frame, so
+/// "was the reply written?" answered yes -- and a *different* resource's
+/// queued commit was applied for a reply that never went out.
+struct Outcome {
+    body: serde_json::Value,
+    commits: Vec<Commit>,
+}
+
+/// The three ops that observe nothing and therefore commit nothing.
+impl From<serde_json::Value> for Outcome {
+    fn from(body: serde_json::Value) -> Outcome {
+        Outcome {
+            body,
+            commits: Vec::new(),
+        }
+    }
 }
 
 /// A state write a reply has EARNED but not yet paid for.
@@ -338,14 +445,67 @@ struct Adapter {
 /// state that says "already reported" is what stops it. That loss is
 /// permanent, which is the one thing the positive-evidence rule cannot
 /// absorb.
-struct Commit {
-    resource_id: String,
-    write: StateWrite,
+enum Commit {
+    Balances {
+        resource_id: String,
+        address_hash: String,
+        as_of: Rfc3339,
+        confirmed: Option<i128>,
+        unconfirmed: Option<i128>,
+    },
+    History {
+        resource_id: String,
+        address_hash: String,
+        as_of: Rfc3339,
+        /// The whole baseline is delivery-gated, because `map::plan` reads
+        /// recorded heights: updating a height, or recording `Some` for a
+        /// txid that was tracked as mempool, removes it from the by-txid
+        /// re-emit set exactly as a removal does.
+        txs: map::SeenTxs,
+        /// **The unrecoverable half.** A lost `txs` update is re-derived
+        /// from the provider on the next crawl; a lost `retracted` entry
+        /// never is, because nothing probes a txid no baseline holds.
+        ///
+        /// It is what this crawl EMITTED a tombstone for, not what it
+        /// found gone -- see [`map::Page::omitted`].
+        retracted: BTreeSet<String>,
+    },
 }
 
-/// The state write itself, deferred: everything it needs is captured, so
-/// what is left is one call against the store.
-type StateWrite = Box<dyn Fn(&seen::Store) -> io::Result<()>>;
+impl Commit {
+    fn resource_id(&self) -> &str {
+        let (Commit::Balances { resource_id, .. } | Commit::History { resource_id, .. }) = self;
+        resource_id
+    }
+
+    /// A state write that fails is logged and survived: the next sync
+    /// simply sees an older baseline, which under positive evidence costs
+    /// a delayed tombstone and never an invented one.
+    fn apply(self, store: &seen::Store) {
+        let written = match &self {
+            Commit::Balances {
+                resource_id,
+                address_hash,
+                as_of,
+                confirmed,
+                unconfirmed,
+            } => store.save_balances(resource_id, address_hash, as_of, *confirmed, *unconfirmed),
+            Commit::History {
+                resource_id,
+                address_hash,
+                as_of,
+                txs,
+                retracted,
+            } => store.save_history(resource_id, address_hash, as_of, txs, retracted),
+        };
+        if let Err(e) = written {
+            eprintln!(
+                "sumer-bitcoin-adapter: could not record state for {}: {e}",
+                self.resource_id()
+            );
+        }
+    }
+}
 
 /// One crawl's snapshot: everything a page of it is planned from.
 struct Crawl {
@@ -358,6 +518,14 @@ struct Crawl {
     /// rest of it: the by-txid section's membership must not shift between
     /// pages either.
     seen_txs: map::SeenTxs,
+    /// Every tombstone of this crawl that a page dropped for size, across
+    /// all of its pages. `chain.gone` MINUS this is what the crawl
+    /// actually retracted, and therefore what its baseline may forget.
+    ///
+    /// It needs no delivery gate of its own: whether an observation is
+    /// omitted depends on `MAX_OBSERVATION_BYTES` and the observation, not
+    /// on the page budget, so re-cutting the same page omits the same set.
+    omitted: BTreeSet<String>,
 }
 
 fn invalid(e: impl Display) -> ErrorBody {
@@ -413,8 +581,34 @@ fn unknown_resource(resource_id: &str) -> ResourceStatus {
     )
 }
 
+/// Rejects a request that names the same `resource_id` twice.
+///
+/// Every requested `resource_id` appears in `statuses` EXACTLY ONCE
+/// (`spec/observation.md` 6). A repeat has no conforming answer -- one
+/// entry drops a request the host made, two break the rule -- so the
+/// request cannot be processed as a whole, which is what an envelope error
+/// is for.
+///
+/// The offending id stays OUT of `err.detail`: `spec/wire.md` 8 says an
+/// `err` payload naming a resource is the signal a status outcome was the
+/// right channel, and here it is not -- the fault is in the shape of the
+/// request, not a fact about any resource.
+fn no_repeats<'a>(resource_ids: impl Iterator<Item = &'a str>) -> Result<(), ErrorBody> {
+    let mut seen = BTreeSet::new();
+    for resource_id in resource_ids {
+        if !seen.insert(resource_id) {
+            return Err(ErrorBody::new(
+                WireErrorCode::InvalidRequest,
+                "a resource_id is named more than once in this request; every requested \
+                 resource_id appears in statuses exactly once, so a repeat has no answer",
+            ));
+        }
+    }
+    Ok(())
+}
+
 impl Adapter {
-    fn handle(&self, frame: &str) -> Option<Reply<serde_json::Value>> {
+    fn handle(&self, frame: &str) -> Option<(Reply<serde_json::Value>, Vec<Commit>)> {
         let value: serde_json::Value = match serde_json::from_str(frame) {
             Ok(v) => v,
             Err(e) => {
@@ -429,7 +623,7 @@ impl Adapter {
             Ok(r) => r,
             Err(e) => {
                 let id = RequestId(id?);
-                return Some(Reply::err(id, invalid(e)));
+                return Some((Reply::err(id, invalid(e)), Vec::new()));
             }
         };
         let id = request.id;
@@ -451,8 +645,10 @@ impl Adapter {
             .with_detail(serde_json::json!({"op": other}))),
         };
         Some(match result {
-            Ok(ok) => Reply::ok(id, ok),
-            Err(err) => Reply::err(id, err),
+            Ok(Outcome { body, commits }) => (Reply::ok(id, body), commits),
+            // The commits an op earned before it failed went with the
+            // `Outcome` that `?` dropped. There is nothing here to settle.
+            Err(err) => (Reply::err(id, err), Vec::new()),
         })
     }
 
@@ -473,7 +669,7 @@ impl Adapter {
         map::rfc3339_utc(self.source.now()).map_err(|e| internal(format!("clock: byte {}", e.at)))
     }
 
-    fn resources_list(&self, params: &serde_json::Value) -> Result<serde_json::Value, ErrorBody> {
+    fn resources_list(&self, params: &serde_json::Value) -> Result<Outcome, ErrorBody> {
         let _: ResourcesListParams = serde_json::from_value(params.clone()).map_err(invalid)?;
         let resources = self
             .wallets
@@ -497,14 +693,18 @@ impl Adapter {
                 }
             })
             .collect();
-        serde_json::to_value(ResourcesListReply { resources }).map_err(internal)
+        serde_json::to_value(ResourcesListReply { resources })
+            .map(Outcome::from)
+            .map_err(internal)
     }
 
-    fn balances_read(&self, params: &serde_json::Value) -> Result<serde_json::Value, ErrorBody> {
+    fn balances_read(&self, params: &serde_json::Value) -> Result<Outcome, ErrorBody> {
         let params: BalancesReadParams = serde_json::from_value(params.clone()).map_err(invalid)?;
+        no_repeats(params.resource_ids.iter().map(String::as_str))?;
         let observed_at = self.observed_at()?;
         let mut observations = Vec::new();
         let mut statuses = Vec::new();
+        let mut commits = Vec::new();
         let mut abandoned = false;
 
         for resource_id in &params.resource_ids {
@@ -524,7 +724,13 @@ impl Adapter {
                     Ok((c, u)) => {
                         confirmed = Some(c);
                         unconfirmed = Some(u);
-                        self.record_balances(w, &observed_at, confirmed, unconfirmed);
+                        commits.push(Commit::Balances {
+                            resource_id: w.resource_id.clone(),
+                            address_hash: w.address_hash.clone(),
+                            as_of: observed_at.clone(),
+                            confirmed,
+                            unconfirmed,
+                        });
                         status(resource_id, ReadOutcome::Fetched { page_empty: false })
                     }
                     Err(FetchError::RateLimited {
@@ -569,13 +775,16 @@ impl Adapter {
             observations,
             statuses,
         })
+        .map(|body| Outcome { body, commits })
         .map_err(internal)
     }
 
-    fn history_read(&self, params: &serde_json::Value) -> Result<serde_json::Value, ErrorBody> {
+    fn history_read(&self, params: &serde_json::Value) -> Result<Outcome, ErrorBody> {
         let params: HistoryReadParams = serde_json::from_value(params.clone()).map_err(invalid)?;
+        no_repeats(params.resources.iter().map(|q| q.resource_id.as_str()))?;
         let mut observations = Vec::new();
         let mut statuses = Vec::new();
+        let mut commits = Vec::new();
         let mut abandoned = false;
         // ONE budget for the whole reply, not one per resource -- and
         // every resource's mandatory status entry is reserved out of it
@@ -630,6 +839,7 @@ impl Adapter {
                                 observed_at,
                                 chain,
                                 seen_txs: recorded.txs,
+                                omitted: BTreeSet::new(),
                             },
                         );
                     }
@@ -675,27 +885,47 @@ impl Adapter {
             // a transaction arriving mid-pagination shift every later
             // page, duplicating, skipping or reordering observations while
             // the cursor advanced over a dataset that moved underneath it.
-            let (page, snapshot_at, delivered_in_full) = {
-                let crawls = self.crawls.borrow();
-                let Some(crawl) = crawls.get(resource_id) else {
+            let (page, snapshot_at, drained) = {
+                let mut crawls = self.crawls.borrow_mut();
+                let Some(crawl) = crawls.get_mut(resource_id) else {
                     return Err(internal("the crawl snapshot vanished before it was read"));
                 };
-                let chain = map::Chain {
-                    txs: &crawl.chain.txs,
-                    mempool: &crawl.chain.mempool,
-                    gone: &crawl.chain.gone,
+                let (page, next_txs) = {
+                    let chain = map::Chain {
+                        txs: &crawl.chain.txs,
+                        mempool: &crawl.chain.mempool,
+                        gone: &crawl.chain.gone,
+                    };
+                    let ctx = self.ctx(w, &crawl.observed_at);
+                    let plan = map::plan(&ctx, &chain, &w.owned, &crawl.seen_txs, from.as_ref())
+                        .map_err(internal)?;
+                    let page =
+                        map::cut_page(plan, from.as_ref(), budget.page()).map_err(internal)?;
+                    let next_txs = page
+                        .next
+                        .is_none()
+                        .then(|| map::next_seen(&chain, &w.owned, &crawl.seen_txs));
+                    (page, next_txs)
                 };
-                let ctx = self.ctx(w, &crawl.observed_at);
-                let plan = map::plan(&ctx, &chain, &w.owned, &crawl.seen_txs, from.as_ref())
-                    .map_err(internal)?;
-                let page = map::cut_page(plan, from.as_ref(), budget.page()).map_err(internal)?;
-                let delivered = page.next.is_none().then(|| {
-                    (
-                        map::next_seen(&chain, &w.owned, &crawl.seen_txs),
-                        crawl.chain.gone.clone(),
-                    )
+                // What the crawl RETRACTED is what its pages emitted a
+                // tombstone for -- `gone` minus everything the degrade
+                // dropped for size, accumulated across every page. A
+                // tombstone that was omitted was never reported, and
+                // forgetting its txid would leave it in no baseline at
+                // all: nothing would ever probe it again and the
+                // retraction would be suppressed forever, with the host
+                // told only `degraded {}`.
+                crawl.omitted.extend(page.omitted.iter().cloned());
+                let drained = next_txs.map(|txs| {
+                    let retracted = crawl
+                        .chain
+                        .gone
+                        .difference(&crawl.omitted)
+                        .cloned()
+                        .collect();
+                    (txs, retracted)
                 });
-                (page, crawl.observed_at.clone(), delivered)
+                (page, crawl.observed_at.clone(), drained)
             };
             budget.spend(page.bytes);
 
@@ -704,8 +934,14 @@ impl Adapter {
             // abandons mid-page leaves the old baseline in place, so the
             // next sync re-derives it rather than trusting a
             // half-delivered diff.
-            if let Some((txs, tombstoned)) = delivered_in_full {
-                self.record_history(w, &snapshot_at, &txs, &tombstoned);
+            if let Some((txs, retracted)) = drained {
+                commits.push(Commit::History {
+                    resource_id: w.resource_id.clone(),
+                    address_hash: w.address_hash.clone(),
+                    as_of: snapshot_at,
+                    txs,
+                    retracted,
+                });
                 self.crawls.borrow_mut().remove(resource_id);
             }
 
@@ -728,14 +964,16 @@ impl Adapter {
             observations,
             statuses,
         })
+        .map(|body| Outcome { body, commits })
         .map_err(internal)
     }
 
     /// Reachability, one address per wallet. No `stale` here: a cached
     /// answer says nothing about whether the provider is reachable NOW,
     /// which is the only question this op asks.
-    fn status_read(&self, params: &serde_json::Value) -> Result<serde_json::Value, ErrorBody> {
+    fn status_read(&self, params: &serde_json::Value) -> Result<Outcome, ErrorBody> {
         let params: StatusReadParams = serde_json::from_value(params.clone()).map_err(invalid)?;
+        no_repeats(params.resource_ids.iter().map(String::as_str))?;
         let mut statuses = Vec::new();
         let mut abandoned = false;
         for resource_id in &params.resource_ids {
@@ -770,78 +1008,13 @@ impl Adapter {
                 }
             });
         }
-        serde_json::to_value(StatusReadReply { statuses }).map_err(internal)
-    }
-
-    /// QUEUES the balances a balance read observed. See [`Commit`]: it is
-    /// written once the reply carrying them has been.
-    fn record_balances(
-        &self,
-        w: &Wallet,
-        as_of: &Rfc3339,
-        confirmed: Option<i128>,
-        unconfirmed: Option<i128>,
-    ) {
-        let (id, hash, as_of) = (w.resource_id.clone(), w.address_hash.clone(), as_of.clone());
-        self.queue(w, move |store| {
-            store.save_balances(&id, &hash, &as_of, confirmed, unconfirmed)
-        });
-    }
-
-    /// QUEUES the transaction baseline a completed crawl established.
-    /// `tombstoned` is what this crawl PROVED gone; everything else already
-    /// on disk survives the write. See `seen.rs` rule 3.
-    fn record_history(
-        &self,
-        w: &Wallet,
-        as_of: &Rfc3339,
-        txs: &map::SeenTxs,
-        tombstoned: &std::collections::BTreeSet<String>,
-    ) {
-        let (id, hash, as_of) = (w.resource_id.clone(), w.address_hash.clone(), as_of.clone());
-        let (txs, tombstoned) = (txs.clone(), tombstoned.clone());
-        self.queue(w, move |store| {
-            store.save_history(&id, &hash, &as_of, &txs, &tombstoned)
-        });
-    }
-
-    fn queue(&self, w: &Wallet, write: impl Fn(&seen::Store) -> io::Result<()> + 'static) {
-        self.pending.borrow_mut().push(Commit {
-            resource_id: w.resource_id.clone(),
-            write: Box::new(write),
-        });
-    }
-
-    /// Applies the state writes the reply just written earned -- or drops
-    /// them, if what went out was not that reply.
-    ///
-    /// A state write that fails is logged and survived: the next sync
-    /// simply sees an older baseline, which under positive evidence costs
-    /// a delayed tombstone and never an invented one. A reply the host
-    /// never received costs the same thing, and for the same reason it
-    /// must: `delivered` false means those observations went nowhere, so
-    /// nothing in them may be recorded as reported.
-    fn settle(&self, delivered: bool) {
-        for commit in self.pending.borrow_mut().drain(..) {
-            if !delivered {
-                eprintln!(
-                    "sumer-bitcoin-adapter: {} was not delivered, so its baseline is \
-                     left where it was; the next sync re-derives the diff",
-                    commit.resource_id
-                );
-                continue;
-            }
-            if let Err(e) = (commit.write)(&self.store) {
-                eprintln!(
-                    "sumer-bitcoin-adapter: could not record state for {}: {e}",
-                    commit.resource_id
-                );
-            }
-        }
+        serde_json::to_value(StatusReadReply { statuses })
+            .map(Outcome::from)
+            .map_err(internal)
     }
 }
 
-fn hello(params: &serde_json::Value) -> Result<serde_json::Value, ErrorBody> {
+fn hello(params: &serde_json::Value) -> Result<Outcome, ErrorBody> {
     let params: HelloParams = serde_json::from_value(params.clone()).map_err(invalid)?;
     if !params.protocol.iter().any(|v| v == PROTOCOL) {
         return Err(ErrorBody::new(
@@ -864,8 +1037,17 @@ fn hello(params: &serde_json::Value) -> Result<serde_json::Value, ErrorBody> {
         // Serial by design: one blocking HTTP sync at a time.
         max_in_flight: 1,
     })
+    .map(Outcome::from)
     .map_err(internal)
 }
+
+/// The commit boundary's own harness. It lives under `tests/` because that
+/// is what it is, and is compiled INTO this binary because its injections
+/// need the adapter in this process -- see this crate's `Cargo.toml`.
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+#[path = "../tests/commit_boundary.rs"]
+mod commit_boundary;
 
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
@@ -874,7 +1056,7 @@ mod tests {
 
     #[test]
     fn hello_declares_the_four_read_capabilities_and_the_derivation() {
-        let ok = hello(&serde_json::json!({"protocol": ["1"]})).unwrap();
+        let ok = hello(&serde_json::json!({"protocol": ["1"]})).unwrap().body;
         assert_eq!(ok["protocol"], "1");
         assert_eq!(ok["adapter_id"], ADAPTER_ID);
         assert_eq!(ok["local_id_derivation"], "btc-txid@1");
@@ -884,7 +1066,9 @@ mod tests {
 
     #[test]
     fn hello_refuses_a_version_it_was_not_offered() {
-        let err = hello(&serde_json::json!({"protocol": ["2", "999"]})).unwrap_err();
+        let Err(err) = hello(&serde_json::json!({"protocol": ["2", "999"]})) else {
+            panic!("this adapter speaks protocol 1 only");
+        };
         assert_eq!(err.code, WireErrorCode::UnsupportedProtocol);
     }
 
@@ -893,7 +1077,7 @@ mod tests {
     // through the same code path a real sync takes.
     // -----------------------------------------------------------------
 
-    const ADDR: &str = "bc1qexample0";
+    pub(crate) const ADDR: &str = "bc1qexample0";
 
     fn ok_of(reply: Reply<serde_json::Value>) -> serde_json::Value {
         match reply {
@@ -908,7 +1092,7 @@ mod tests {
 
     impl Adapter {
         /// The WHOLE path a reply takes in `main`: build it, write it,
-        /// and settle the state writes it earned against what actually
+        /// and apply the state writes it earned iff that reply is what
         /// went out. Tests go through this rather than [`Adapter::handle`]
         /// alone, because "did this commit state?" is a question about
         /// the whole path and not about any one step of it.
@@ -916,11 +1100,14 @@ mod tests {
         /// Returns what the HOST receives -- which for a reply too large
         /// for a frame is the `err` [`write_reply`] substituted, not the
         /// reply it refused.
-        fn deliver(&self, frame: &str) -> Option<Reply<serde_json::Value>> {
-            let reply = self.handle(frame)?;
+        pub(crate) fn deliver(&self, frame: &str) -> Option<Reply<serde_json::Value>> {
+            let (reply, commits) = self.handle(frame)?;
             let mut out: Vec<u8> = Vec::new();
-            let delivered = write_reply(&mut out, &reply).unwrap();
-            self.settle(delivered);
+            if write_reply(&mut out, &reply).unwrap() {
+                for commit in commits {
+                    commit.apply(&self.store);
+                }
+            }
             let written = out.strip_suffix(b"\n").expect("one line, LF-terminated");
             Some(serde_json::from_slice(written).expect("a reply frame is a reply"))
         }
@@ -989,7 +1176,6 @@ mod tests {
             source: Source::replay(root, run),
             store: seen::Store::new(Some(state.to_path_buf())),
             crawls: RefCell::new(HashMap::new()),
-            pending: RefCell::new(Vec::new()),
         }
     }
 
@@ -1106,7 +1292,7 @@ mod tests {
 
     /// One address's `count` confirmed transactions, chained across the
     /// 25-per-page chain listing exactly as Esplora pages it.
-    fn paged_corpus(corpus: &Path, addr: &str, count: usize) {
+    pub(crate) fn paged_corpus(corpus: &Path, addr: &str, count: usize) {
         std::fs::create_dir_all(corpus).unwrap();
         std::fs::write(
             corpus.join(format!("address_{addr}_txs_mempool.json")),
@@ -1327,7 +1513,7 @@ mod tests {
     // an oversized frame is a fatal kill with no resync (spec/wire.md 2).
     // -----------------------------------------------------------------
 
-    fn tmp_root(tag: &str) -> PathBuf {
+    pub(crate) fn tmp_root(tag: &str) -> PathBuf {
         let root = std::env::temp_dir().join(format!(
             "sumer-btc-{tag}-{}-{:?}",
             std::process::id(),
@@ -1338,7 +1524,7 @@ mod tests {
         root
     }
 
-    fn write_at(root: &Path, rel: &str, body: &str) {
+    pub(crate) fn write_at(root: &Path, rel: &str, body: &str) {
         let path = root.join(rel);
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         std::fs::write(path, body).unwrap();
@@ -1348,19 +1534,18 @@ mod tests {
         serde_json::to_vec(reply).unwrap().len()
     }
 
-    fn wallets_json(root: &Path, wallets: serde_json::Value) -> PathBuf {
+    pub(crate) fn wallets_json(root: &Path, wallets: serde_json::Value) -> PathBuf {
         let config = root.join("wallets.json");
         std::fs::write(&config, serde_json::json!({"wallets": wallets}).to_string()).unwrap();
         config
     }
 
-    fn adapter_with(config: &Path, corpus: &Path, run: u64, state: &Path) -> Adapter {
+    pub(crate) fn adapter_with(config: &Path, corpus: &Path, run: u64, state: &Path) -> Adapter {
         Adapter {
             wallets: wallet::load(config).unwrap(),
             source: Source::replay(corpus, run),
             store: seen::Store::new(Some(state.to_path_buf())),
             crawls: RefCell::new(HashMap::new()),
-            pending: RefCell::new(Vec::new()),
         }
     }
 
@@ -1832,6 +2017,99 @@ mod tests {
             "day 1's amount must carry day 1's timestamp: a history read observed \
              no balance, and restamping one is a false freshness claim about money"
         );
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// One `resource_id` twice has no conforming answer: one status entry
+    /// drops a request the host made, two break "exactly once". So it is
+    /// an envelope error -- and one that does NOT name the id, because
+    /// `spec/wire.md` 8 makes that the signal a status outcome was right.
+    #[test]
+    fn a_repeated_resource_id_is_refused_without_naming_it() {
+        let root = fetch_fail_corpus(&"f".repeat(64));
+        let adapter = adapter_over(&root, 0, &root.join("state-repeat"));
+        let batches = [
+            (
+                OP_BALANCES_READ,
+                serde_json::json!({"resource_ids": ["w", "w"]}),
+            ),
+            (
+                OP_HISTORY_READ,
+                serde_json::json!({"resources": [{"resource_id": "w"}, {"resource_id": "w"}]}),
+            ),
+            (
+                OP_STATUS_READ,
+                serde_json::json!({"resource_ids": ["w", "w"]}),
+            ),
+        ];
+        for (op, params) in batches {
+            match adapter.deliver(&request(op, params)).unwrap() {
+                Reply::Err { err, .. } => {
+                    assert_eq!(err.code, WireErrorCode::InvalidRequest, "{op}");
+                    assert!(
+                        err.detail.is_none(),
+                        "{op}: an err payload naming a resource wanted a status instead"
+                    );
+                }
+                Reply::Ok { ok, .. } => {
+                    panic!("{op}: two statuses for one requested id break \"exactly once\": {ok}")
+                }
+            }
+        }
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// A provider identity rides in every observation this adapter emits.
+    /// Over the bound it is REFUSED, never truncated: a truncated
+    /// provenance is a false one, and exit 2 is the honest answer.
+    #[test]
+    fn an_oversized_source_is_a_usage_error_not_a_truncation() {
+        let long = format!("https://{}.invalid/api", "p".repeat(MAX_SOURCE_BYTES));
+        let args = ["--wallets", "w.json", "--source", &long];
+        let Err(e) = Options::parse(args.iter().map(|a| (*a).to_owned())) else {
+            panic!("a {}-byte --source must not be accepted", long.len());
+        };
+        assert!(e.contains("--source is"), "{e}");
+        assert!(
+            Options::parse(
+                [
+                    "--wallets",
+                    "w.json",
+                    "--source",
+                    &"x".repeat(MAX_SOURCE_BYTES)
+                ]
+                .iter()
+                .map(|a| (*a).to_owned())
+            )
+            .is_ok(),
+            "the bound itself is legal"
+        );
+    }
+
+    /// A --state-dir the operator declared and this process cannot use is
+    /// a failed configuration. `WouldBlock` is not one of those: another
+    /// adapter holding the lock proves the filesystem supports it.
+    #[test]
+    fn the_state_dir_probe_accepts_a_contended_dir_and_refuses_an_unusable_one() {
+        let root = tmp_root("state-probe");
+        let dir = root.join("nested/state");
+        probe_state_dir(&dir).unwrap();
+
+        // Held by "another adapter": try_lock answers WouldBlock, which is
+        // success. A blocking lock() here would hang startup instead.
+        let held = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(dir.join(".probe.lock"))
+            .unwrap();
+        held.lock().unwrap();
+        probe_state_dir(&dir).unwrap();
+        drop(held);
+
+        // A path that cannot be a directory at all.
+        std::fs::write(root.join("afile"), b"x").unwrap();
+        assert!(probe_state_dir(&root.join("afile")).is_err());
         std::fs::remove_dir_all(&root).unwrap();
     }
 

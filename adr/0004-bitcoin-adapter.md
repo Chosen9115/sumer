@@ -1,6 +1,6 @@
 # ADR 0004 — The watch-only Bitcoin adapter: Esplora, wallet-shaped resources, byte-cut pages, positive-evidence tombstones
 
-- **Status:** accepted (revision 2)
+- **Status:** accepted (revision 3)
 - **Date:** 2026-09-07
 - **Decision by:** Linus, Milestone 1
 
@@ -12,6 +12,12 @@ asserted a guarantee that concurrent writers did not provide.
 unlocked fallback when `flock` is unavailable, described there as
 acceptable. It is not — it reinstates the very overwrite the merge exists
 to prevent — and decision 5 now says what the code does.
+
+**Revision 3** adds decision 6: *when* a state write happens, and what
+exactly it is allowed to forget. Three successive fixes to that corner were
+each locally correct and each exposed the next, so it is stated here as a
+decision rather than patched a fourth time. Nothing in decisions 1–5
+changes.
 
 Corrections are marked **Revised** in place, with the claim they replace
 stated rather than deleted.
@@ -32,7 +38,7 @@ dropped from a mempool without anyone being told, an address listing is
 paginated newest-first by the provider, and a wallet is not an account —
 it is a set of scriptPubKeys with no server-side identity at all.
 
-Five decisions had to be made together.
+Five decisions had to be made together; revision 3 adds a sixth.
 
 ## Decision
 
@@ -209,6 +215,101 @@ fiction; a repeated one is noise.
 
 The torn-file case is unchanged: an unparseable file is a first run.
 
+### 6. A state write is a FIELD of the reply that earned it
+
+**Added in revision 3.**
+
+Nothing is marked reported until it has been sent. The write that records
+"this crawl's diff was delivered" must therefore happen after the frame
+carrying that diff has actually gone out — and only then. Three attempts
+got this wrong in three different ways: the byte budget was scoped per
+resource, the write happened before the reply, and then the write happened
+after *a* reply rather than after *that* one. The last is the interesting
+one, and it is why this is a decision and not a patch.
+
+**The shape, not a guard.** An op returns `Result<Outcome, ErrorBody>`,
+where `Outcome` is the reply body **and the commits that body earned, as
+one value**. `main` applies the commits if and only if `write_reply`
+reported that *that reply* was written. An op that fails returns `Err`, and
+`?` drops the `Ok` half holding the commits.
+
+That last sentence is the whole decision. The rejected alternative was a
+queue on the adapter, drained on "was the write successful?". An envelope
+error — a cursor the adapter did not mint, a `window` page request,
+a `resource_id` named twice — is a *small* reply. It fits a frame. It
+writes successfully. So a batch of `[a real wallet, a bad cursor]` wrote an
+error to stdout and committed the real wallet's baseline for observations
+the host never received. The queue made that expressible; making the
+commits a field of the body they belong to makes it unrepresentable, which
+is the only version of this that survives the next restructuring.
+
+**The whole commit is delivery-gated, not just its retractions.** The
+transaction map is delivery-sensitive too: `map::plan` reads recorded
+heights, so recording a new height — or recording `Some(height)` for a txid
+that was tracked as mempool — removes it from the by-txid re-emit set
+exactly as a removal does. What survives is not a gating asymmetry but a
+**recoverability** one: a lost `txs` update is re-derived from the provider
+on the next crawl, and a lost retraction never is, because nothing probes a
+txid no baseline holds.
+
+**`retracted` is what was EMITTED, not what was fetched.** The crawl
+subtracts every tombstone that `spec/observation.md` §6 step 2 omitted for
+size, accumulated across all of that crawl's pages, from the set it records
+as gone. Without that subtraction the failure is silent and permanent: an
+oversized tombstone is omitted, the crawl still drains, the baseline still
+forgets the txid, nothing ever probes it again, and the host is told only
+`degraded {}`. Omission is deterministic per observation — it depends on
+`MAX_OBSERVATION_BYTES` and the observation, not on the page budget — so
+the accumulator needs no delivery gate of its own.
+
+**`--source` is bounded at 256 bytes, rejected and not truncated.** It
+becomes `provenance.provider_id` on every observation this adapter emits,
+and it was the one unbounded field a tombstone carried. Truncating it would
+be a falsified provenance, so an over-long `--source` is a usage error and
+exit 2, exactly like a bad `resource_id`. With the bound, every field of a
+tombstone is bounded by construction and the omission above is unreachable
+in production. It is still implemented and still tested: the subtraction is
+what stops the bound from having to be re-argued the next time a field is
+added to `ObservationWire`.
+
+**A repeated `resource_id` is an envelope `invalid_request`.** Every
+requested `resource_id` appears in `statuses` exactly once
+(`spec/observation.md` §6); a repeat has no conforming answer, so the
+request cannot be processed as a whole. The offending id stays out of
+`err.detail` — `spec/wire.md` §8 makes an `err` payload naming a resource
+the signal that a status outcome was the right channel, and here it is not:
+the fault is the shape of the request, not a fact about any resource.
+
+**The residual hole, stated rather than engineered around.** Committing
+after delivery means there is a window in which the host has been told a
+transaction is active, the process dies or the state write fails before the
+commit, and the transaction vanishes before the next crawl. Nothing probes
+it, and no retraction is ever emitted. **That window is one `try_lock` plus
+one `rename`** — the state write itself, with no network call inside it.
+
+The alternative considered was committing *before* delivery. Its window is
+the entire reply: serialization, the frame ceiling check, and the write to
+a pipe whose reader may be gone. It also fails in the opposite and worse
+direction — the baseline says "already reported" for a retraction the host
+never received, which is exactly the loss the positive-evidence rule cannot
+absorb, and it fails silently and permanently at scale. This is the cheaper
+side of the trade, and the cost is written here rather than hidden.
+
+A **startup probe** narrows it further and does not close it. A
+`--state-dir` the operator declared and this process cannot create, write
+or lock is exit 2 at startup, before the hello reply — an operator's
+declared configuration must work, and the previous behaviour was to run for
+weeks reporting `unavailable`, emitting no tombstone, and saying so only in
+a stderr line per failed write. Omitting `--state-dir` stays an announced
+warning: that is a different configuration, and it works. The probe is
+`create_dir_all`, a temp write and a rename, then `File::try_lock` on
+`<dir>/.probe.lock` — `try_lock` and not `lock`, with `WouldBlock` counting
+as success, so a directory another adapter already holds cannot hang
+startup. **ENOSPC, a quota reached at write time, and a directory deleted
+mid-run all survive the probe verbatim**, and so does a wedged network
+mount that blocks inside `open` itself. It narrows the hole; it does not
+close it.
+
 ## Binding on PR 4: the address-set hash must invalidate the cursor
 
 **Adding an address to a wallet puts pre-cursor history at heights at or
@@ -274,6 +375,15 @@ process boundary as any other.
   last-writer-wins did.
 - **Last-writer-wins on `seen.json`.** Rejected in revision 1: see decision
   5. This ADR asserted it degraded to a missed tombstone, and it did not.
+- **A queue of pending state writes, drained on "did the write succeed?".**
+  Rejected in revision 3: see decision 6. An envelope error fits a frame,
+  so it succeeded, so it settled a different resource's commit.
+- **Committing the baseline BEFORE delivering the reply.** Rejected in
+  revision 3: its window is the whole reply rather than one `rename`, and
+  it fails in the direction that cannot be recovered from.
+- **Truncating an over-long `--source`.** Rejected in revision 3: a
+  truncated provider identity is a falsified provenance, which is a worse
+  answer than refusing to start.
 
 ## Consequences
 
@@ -308,6 +418,9 @@ process boundary as any other.
   name" has no answer to be faithful to; `confirmed` and `unconfirmed` are
   named by us, computed from `chain_stats`/`mempool_stats` funded minus
   spent, never summed, and `unconfirmed` may legitimately be negative.
+- **A retraction can still be lost, in one `rename`-wide window.** See
+  decision 6. The startup probe narrows it; ENOSPC, quota and a state
+  directory deleted mid-run go straight through it.
 - **The riskiest thing left is not mechanical.** Positive evidence means the
   adapter can no longer invent a vanish, so the remaining exposure is a
   **wrong mapping baked identically into `map.rs` and into the hand-written

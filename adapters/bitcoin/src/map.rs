@@ -768,8 +768,25 @@ pub struct Page {
     /// Set only when the page cut early, per `spec/observation.md` 5.
     pub page_size_reduced_to: Option<u32>,
     /// An observation this page dropped for size, per
-    /// `spec/observation.md` 6 step 2.
+    /// `spec/observation.md` 6 step 2. Only the FIRST one, because
+    /// `degraded` is one field on one status entry.
     pub degraded: Option<Degraded>,
+    /// The txids of every TOMBSTONE this page dropped at step 2 -- all of
+    /// them, not just the first.
+    ///
+    /// A tombstone that was omitted was not emitted, and a retraction the
+    /// host never received must not be recorded as reported: the txid must
+    /// stay in the baseline so the next crawl probes it again. `degraded`
+    /// cannot serve here, because it reports one omission and a page may
+    /// omit several.
+    ///
+    /// Every field of a tombstone is bounded by construction -- `local_id`
+    /// and `provider_id` by the txid and the `resource_id` bound, the
+    /// description and the reason by this module, `provider_id` in the
+    /// provenance by `main.rs`'s `--source` bound -- so this set is empty
+    /// in production. It is the reason that bound does not have to be
+    /// re-argued the next time a field is added to `ObservationWire`.
+    pub omitted: BTreeSet<String>,
     /// Serialized bytes of `observations`: what this page spent of the
     /// reply's budget, so the next resource in the same reply knows what
     /// is left.
@@ -800,6 +817,7 @@ pub fn cut_page(plan: Plan, from: Option<&Cursor>, budget: usize) -> Result<Page
     // withheld one: `exact` promises nothing at or below it is re-sent.
     let mut last_key: Option<Key> = None;
     let mut degraded: Option<Degraded> = None;
+    let mut omitted: BTreeSet<String> = BTreeSet::new();
     let mut used = 0usize;
     let mut cut = false;
 
@@ -833,6 +851,13 @@ pub fn cut_page(plan: Plan, from: Option<&Cursor>, budget: usize) -> Result<Page
                 local_id: Some(obs.local_id.clone()),
                 bytes: u64::try_from(size).unwrap_or(u64::MAX),
             });
+            // ...and if it was a RETRACTION, say which one. The caller
+            // records what it emitted, not what it fetched.
+            if obs.state == ObservationState::Tombstoned {
+                if let Some(txid) = obs.provider_id {
+                    omitted.insert(txid);
+                }
+            }
             continue;
         }
         // Plus the comma that joins it to the previous observation: a
@@ -867,6 +892,7 @@ pub fn cut_page(plan: Plan, from: Option<&Cursor>, budget: usize) -> Result<Page
         }),
         page_size_reduced_to: cut.then_some(emitted),
         degraded,
+        omitted,
         bytes: used,
     })
 }

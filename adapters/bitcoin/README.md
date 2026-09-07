@@ -47,6 +47,21 @@ sync is a first run, so **no tombstone is ever emitted** and a failed read
 answers `unavailable` instead of `stale`. The adapter says so on stderr at
 startup.
 
+**A `--state-dir` you *did* give and this process cannot use is exit 2, at
+startup.** Not creatable, not writable, not lockable: the adapter refuses
+to start rather than run for weeks reporting `unavailable`, emitting no
+tombstone, and mentioning it only in a stderr line per failed write. An
+operator's declared configuration has to work; omitting the flag is a
+different configuration, and it works. The probe is `create_dir_all`, a
+temp write and a rename, then a **non-blocking** lock attempt on
+`<dir>/.probe.lock` — a directory another adapter already holds is a
+success, not a hang. It narrows the window in "Known limits" below; it does
+not close it.
+
+**`--source` is capped at 256 bytes and over-long values are rejected, not
+truncated.** It becomes `provenance.provider_id` on every observation this
+adapter emits, and a truncated provider identity is a falsified one.
+
 ### `wallets.json`
 
 ```json
@@ -269,12 +284,10 @@ lives.** Nothing is written to disk, and `map.rs` stays pure.
   process has no memory of one — a fresh process resuming a cursor the host
   persisted — it takes a new crawl and serves the requested page from it.
 - A crawl that **drains** (`next: null`) writes its baseline to
-  `seen.json` and drops its snapshot — but only once the reply carrying
-  it has actually been written. A reply refused for size (below) is one
-  the host never received, so the baseline it earned is dropped unapplied
-  and the next sync re-derives the diff: nothing is marked reported until
-  it has been sent. A crawl the host abandons mid-page writes nothing and
-  is held until the process exits.
+  `seen.json` and drops its snapshot — but only once **that** reply has
+  actually been written. See "Nothing is marked reported until it has been
+  sent" below. A crawl the host abandons mid-page writes nothing and is
+  held until the process exits.
 - Every page of one crawl reports the same `observed_at`: the instant the
   crawl was taken. Pages two and three did not observe anything.
 
@@ -288,6 +301,36 @@ would let a transaction arriving mid-pagination shift every subsequent
 page — observations duplicated, skipped or reordered across a page
 boundary, with the cursor advancing over a dataset that changed underneath
 it. That is wrong regardless of how fast the re-walk is.
+
+### Nothing is marked reported until it has been sent
+
+The state writes a reply earns are a **field of that reply**, and they are
+applied if and only if that reply is the frame that went to stdout. A reply
+`write_reply` refused for size is one the host never received, so the
+baseline it earned is dropped unapplied and the next sync re-derives the
+diff.
+
+The subtlety, and the reason this is spelled out: an **envelope error is
+small**. A cursor this adapter did not mint, a `window` page request, a
+`resource_id` named twice — each of those writes successfully. Asking "did
+the write succeed?" therefore answered *yes* while a completely different
+resource in the same batch had already earned a baseline for observations
+that error replaced. Carrying the commits inside the body they belong to is
+what makes that unrepresentable rather than guarded.
+
+**A repeated `resource_id` is refused** with an envelope `invalid_request`,
+in all three batch ops. Every requested `resource_id` appears in `statuses`
+exactly once, so a repeat has no conforming answer. The offending id is
+deliberately **not** in `err.detail` (`spec/wire.md` §8).
+
+**What the baseline forgets is what was EMITTED, not what was fetched.** A
+tombstone that `spec/observation.md` §6 step 2 omitted for size was never
+reported, so its txid stays in the baseline and the next crawl probes it
+again. Forgetting it would leave the txid in nobody's baseline, and nothing
+probes a txid no baseline holds — the retraction would be suppressed
+permanently, with the host told only `degraded {}`. Bounding `--source`
+makes that unreachable in production; the subtraction is what keeps it that
+way when a field is next added to an observation.
 
 ### Outcomes — exactly five
 
@@ -489,6 +532,15 @@ is the rule working, not a corpus that failed.
   persistence must invalidate the stored cursor when the address-set hash
   changes**, or "adding an address is a revision" is false for history. See
   ADR 0004.
+- **A retraction can still be lost, in a window one `rename` wide.** The
+  host is told a transaction is active, this process dies (or the state
+  write fails) before the commit, and the transaction vanishes before the
+  next crawl: nothing probes it, so no tombstone is ever emitted. The
+  alternative — committing *before* the reply goes out — has a window the
+  size of the entire reply and fails in the direction that cannot be
+  recovered from. The startup probe narrows this one; ENOSPC, a quota
+  reached at write time and a `--state-dir` deleted mid-run go straight
+  through it. See ADR 0004 decision 6.
 - `window` page requests are not served (see above).
 - The mempool listing is capped by the provider at 50 transactions per
   address and is not paged.
@@ -505,6 +557,17 @@ degradation, and the full appear → confirm → 404 → revive lifecycle. Three
 end-to-end tests drive the adapter over a temporary corpus, including the
 one that matters most: a failed fetch produces zero tombstones,
 `stale { as_of }`, and the preserved balances.
+
+`tests/commit_boundary.rs` is the commit boundary, driven as request
+*sequences* — every pair of eight resource kinds, each run to exhaustion by
+following the cursors the adapter minted, with one injection at page k:
+none, an oversized reply, stdout dying mid-frame, death between the write
+and the commit, a failed state write, an unavailable lock. **Its oracle
+reads bytes on stdout and bytes on disk, and never names an internal
+type**: rules stated over the mechanism get rewritten alongside it and
+prove nothing. Two of its six rules are liveness rules, so an adapter that
+answers nothing fails rather than passes — delete the tombstone probe and
+exactly one rule goes red.
 
 The live invariant check (`SUMER_LIVE=1`, `#[ignore]`, nightly only, never
 required CI) and the replay conformance cases live in `conformance/`.

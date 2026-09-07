@@ -10,16 +10,20 @@
 //! on ZERO observations, and "both sides say 0" is this project's dominant
 //! failure species. So the first thing this check asserts is that the
 //! wallet is NOT empty: the address's oldest transaction must be there by
-//! txid, and there must be at least as many transactions as there were on
-//! the day the corpus was recorded. Bitcoin history only grows, so a floor
+//! txid AND carrying the figure it has carried since 2010, and there must
+//! be at least as many transactions as there were on the day the corpus
+//! was recorded. Bitcoin history only grows, so a floor
 //! never goes stale — it can only become more slack, and the txid half
 //! never does.
 //!
-//! What this cannot be: a test of the mapping. It has no independent oracle
-//! for what any of these transactions are worth, so it checks the shape of
-//! the answers and the relationships between them. The amounts are pinned
-//! by `map.rs`'s unit tests and by the replayed corpora, against JSON whose
-//! checksums are recorded.
+//! What this cannot be: a test of the mapping. It has one external figure
+//! and no more -- the pizza payment's 10,000 BTC, an ANCHOR (see
+//! `OLDEST_TX_SATS`) -- and otherwise checks the shape of the answers and
+//! the relationships between them. That one anchor is load-bearing: every
+//! other money assertion here compares the adapter against itself, and an
+//! adapter answering `0` to everything satisfied all of them at once. The
+//! amounts in general are pinned by `map.rs`'s unit tests and by the
+//! replayed corpora, against JSON whose checksums are recorded.
 //!
 //! # Proving this check has teeth
 //!
@@ -71,11 +75,13 @@
 
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 use sumer_host::{AdapterHandle, Terminal};
 use sumer_money::{Amount, AssetId};
-use sumer_wire::{Observation, ObservationState, PageRequest, Posting, ReadOutcome, ResourceQuery};
+use sumer_wire::{
+    Observation, ObservationState, PageRequest, Posting, RawSign, ReadOutcome, ResourceQuery,
+};
 
 /// The address this check watches: the one that received the 10,000 BTC of
 /// the 2010 "Bitcoin pizza" payment. A documented public artefact, not
@@ -93,6 +99,24 @@ const OLDEST_TXID: &str = "a1075db55d416d3ca199f55b6084e2115b9345e16c5cf302fc80e
 /// equality: the address is published, anyone can pay it, and the count
 /// only ever goes up.
 const TX_COUNT_FLOOR: usize = 17;
+
+/// What that transaction moved TO this address, in satoshis: the 10,000
+/// BTC of the pizza payment, with nothing of the address's own spent as an
+/// input, so the net delta is the whole of it.
+///
+/// THE ONLY EXTERNAL ORACLE THIS CHECK HAS. Every other money assertion
+/// here compares the adapter against itself -- section 3 and section 8
+/// reconcile two of its own endpoints, section 9b compares a resume
+/// against the read before it -- and an adapter that answers `0` to
+/// everything is perfectly self-consistent and passed all of them.
+/// Internal consistency is the easiest thing for a broken implementation
+/// to provide; one figure it did not learn from the adapter is what makes
+/// the rest of them mean anything.
+///
+/// An ANCHOR, not a test of the mapping: one observation, one number, and
+/// a number settled in block 57043 with ~900,000 blocks on top of it. It
+/// can no more go stale than `OLDEST_TXID` can.
+const OLDEST_TX_SATS: &str = "1000000000000";
 
 const SOURCE: &str = "https://blockstream.info/api";
 const RESOURCE: &str = "live";
@@ -112,6 +136,40 @@ fn adapter_binary() -> PathBuf {
 fn confirmed_key(o: &Observation) -> Option<(u64, String)> {
     let height = o.provider_extra.get("block_height")?.as_u64()?;
     Some((height, o.provider_id.clone()?))
+}
+
+/// The money an observation carries. What a resume owes is not just a set
+/// of `local_id`s: it is these figures, attached to those ids. Compared by
+/// VALUE, because `fees` is a nested money object and a comparison that
+/// settles for "present, and denominated in sat" tolerates the figure
+/// itself being rewritten -- the silent degradation the offline suite
+/// already shipped once.
+#[derive(Debug, PartialEq, Eq)]
+struct Money {
+    amount: Amount,
+    fees: Option<Amount>,
+    raw_sign: RawSign,
+}
+
+impl Money {
+    fn of(o: &Observation) -> Money {
+        Money {
+            amount: o.amount.clone(),
+            fees: o.fees.clone(),
+            raw_sign: o.raw_sign,
+        }
+    }
+}
+
+impl std::fmt::Display for Money {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{} {}", self.amount, self.amount.asset())?;
+        match &self.fees {
+            Some(fees) => write!(f, ", fees {fees} {}", fees.asset())?,
+            None => f.write_str(", no fees")?,
+        }
+        write!(f, ", {:?}", self.raw_sign)
+    }
 }
 
 /// The five outcomes this adapter may ever answer with
@@ -202,9 +260,16 @@ async fn the_live_invariants_hold() {
              in front of this adapter SURVIVED, so {expected} does not have the \
              teeth it is claimed to have"
         ),
-        (Some(expected), Ok(false)) => eprintln!(
-            "SKIP: the provider rate-limited this run, so nothing was proved about \
-             {expected} either way"
+        // A skipped mutant is NOT a kill. Printing SKIP and exiting 0 here
+        // is a green run that proved nothing -- the exact false pass this
+        // whole mechanism exists to make impossible, and a contradiction
+        // of the module docs above, which promise an inconclusive run
+        // fails. The un-expected path keeps its SKIP: a bare nightly that
+        // hits a 429 is the provider asking us to slow down, not a defect.
+        (Some(expected), Ok(false)) => panic!(
+            "SUMER_LIVE_EXPECT={expected}: the provider rate-limited this run, so \
+             nothing was proved about {expected} either way. A skipped mutant is not \
+             a kill -- run it again when the provider will talk to us"
         ),
         (Some(expected), Err(e)) => {
             let message = panic_message(e);
@@ -372,12 +437,31 @@ async fn check_the_invariants() -> bool {
          changed chain",
         confirmed.len()
     );
-    assert!(
-        observations
-            .iter()
-            .any(|o| o.local_id == format!("{RESOURCE}:{OLDEST_TXID}")),
-        "the address's oldest transaction ({OLDEST_TXID}, block 57043) is missing -- an answer \
-         without it is not this address's history, however well-formed it is"
+    // Against `confirmed`, not against every observation that came back:
+    // the floor's second half is a claim that this transaction is HERE,
+    // live and posted, and an id that arrives `tombstoned` or `pending` is
+    // an id that arrives saying the opposite. Nothing conforming can trip
+    // this -- block 57043 is 900k blocks deep, and with no `--state-dir`
+    // this adapter emits no tombstone at all -- so the only thing it can
+    // catch is a shortcut, which is the point.
+    let oldest = confirmed
+        .iter()
+        .find(|o| o.local_id == format!("{RESOURCE}:{OLDEST_TXID}"))
+        .unwrap_or_else(|| {
+            panic!(
+                "§5: the address's oldest transaction ({OLDEST_TXID}, block 57043) is missing \
+                 from the live, posted history -- an answer without it is not this address's \
+                 history, however well-formed it is"
+            )
+        });
+    assert_eq!(
+        oldest.amount,
+        Amount::parse(sat.clone(), OLDEST_TX_SATS).expect("the anchor parses"),
+        "§5: the pizza payment moved {OLDEST_TX_SATS} sat to {ADDRESS} in block 57043 and this \
+         adapter says it moved {}. That figure is settled history, so this is the mapping being \
+         wrong -- and it is the one number here that did not come from this adapter, which is \
+         what makes every other money assertion in this file worth making",
+        oldest.amount
     );
 
     // 6. Shape: every amount is an integer number of satoshis, and every
@@ -448,19 +532,38 @@ async fn check_the_invariants() -> bool {
     // all. Its grammar is documented (`"<height>:<txid>"`), and the whole
     // point of `exact` is that a caller may hold one.
     //
-    // THE EXEMPTION, verbatim from `adapters/bitcoin/README.md`: an
-    // observation is exempt if, and only if, its `posting` is `pending`, or
-    // its `state` is `tombstoned`, or a previous reply in this same
-    // connection reported the same `local_id` with `posting: "pending"`.
+    // THE EXEMPTION, verbatim from `adapters/bitcoin/README.md`, which says
+    // the checker "must use exactly this definition, or it fails a
+    // conforming adapter -- which is worse than not checking". An
+    // observation is EXEMPT if any of these hold:
+    //
+    //   1. its `posting` is `pending` (currently unconfirmed), or
+    //   2. its `state` is `tombstoned`, or
+    //   3. a previous reply in the same connection reported the same
+    //      `local_id` with `posting: "pending"` (it was in the tracked
+    //      mempool set, and has since confirmed -- this is the case the
+    //      exemption exists for), or with a different `block_height` (a
+    //      reorg re-mined it, possibly *downwards*, which the confirmed
+    //      section would otherwise suppress forever).
+    //
     // Everything else is section 1 and is not exempt. Re-emitting section 2
     // is REQUIRED behaviour -- it is what turns "this pending transaction
     // was mined into a block below your cursor" into a revision instead of
-    // a record that stays pending forever -- so a check without this clause
-    // would fail a conforming adapter, which is worse than not checking.
+    // a record that stays pending forever -- so a check without every
+    // clause of this would fail a conforming adapter. The second half of
+    // clause 3 was missing here until it was noticed: a reorg that re-mined
+    // a transaction DOWNWARDS, in the seconds between the two reads below,
+    // made an adapter doing exactly what the README requires fail 9a.
     let seen_pending: BTreeSet<String> = observations
         .iter()
         .filter(|o| o.posting == Posting::Pending)
         .map(|o| o.local_id.clone())
+        .collect();
+    // Clause 3's second half: the height each `local_id` was last reported
+    // at by the read that already happened.
+    let seen_height: BTreeMap<&String, u64> = observations
+        .iter()
+        .filter_map(|o| Some((&o.local_id, confirmed_key(o)?.0)))
         .collect();
     let middle = confirmed[confirmed.len() / 2];
     let (height, txid) = confirmed_key(middle).expect("a confirmed observation has both");
@@ -478,10 +581,10 @@ async fn check_the_invariants() -> bool {
     // exposure since it was written (a re-mined transaction would land
     // below the cursor) and this is the same bet, stated rather than
     // engineered around.
-    let owed: BTreeSet<String> = confirmed
+    let owed: BTreeMap<String, Money> = confirmed
         .iter()
         .filter(|o| confirmed_key(o).is_some_and(|key| key > mark))
-        .map(|o| o.local_id.clone())
+        .map(|o| (o.local_id.clone(), Money::of(o)))
         .collect();
     assert!(
         !owed.is_empty(),
@@ -502,39 +605,78 @@ async fn check_the_invariants() -> bool {
 
     // 9a. Nothing at or below the cursor, exemption aside.
     for o in &resumed.observations {
-        let exempt = o.posting == Posting::Pending
+        if o.posting == Posting::Pending
             || o.state == ObservationState::Tombstoned
-            || seen_pending.contains(&o.local_id);
-        if exempt {
+            || seen_pending.contains(&o.local_id)
+        {
             continue;
         }
         let key = confirmed_key(o).unwrap_or_else(|| panic!("{}: no height/txid", o.local_id));
+        // Clause 3's second half. Checked after the key is read, because
+        // the clauses above it cover the observations that have no height.
+        if seen_height
+            .get(&o.local_id)
+            .is_some_and(|before| *before != key.0)
+        {
+            continue;
+        }
         assert!(
             key > mark,
             "{} came back at {key:?}, at or below the cursor ({height}, {txid}), and it is not \
-             exempt: it is neither pending nor tombstoned, and it was never reported pending on \
-             this connection",
+             exempt: it is neither pending nor tombstoned, and the uninterrupted read reported it \
+             neither pending nor at a different block_height",
             o.local_id
         );
     }
 
     // 9b. And everything above it comes back, live, at the same terminal
-    // state the first read reached. `active` + `posted` is not decoration
-    // here: it is what makes "delivered" mean delivered. Every clause of
-    // the exemption above is an escape hatch a shortcut could hide behind
-    // -- a resume that answered `tombstoned` for the whole wallet would
-    // satisfy 9a completely -- and this run passes no `--state-dir`, so
-    // this adapter cannot emit a tombstone at all (`adapters/bitcoin/
-    // README.md`: without one, every sync is a first run and no tombstone
-    // is ever emitted). A conforming adapter therefore returns every one of
-    // these exactly as it returned them a moment ago.
-    let delivered: BTreeSet<String> = resumed
-        .observations
-        .iter()
-        .filter(|o| o.state == ObservationState::Active && o.posting == Posting::Posted)
-        .map(|o| o.local_id.clone())
-        .collect();
-    let missing: Vec<&String> = owed.difference(&delivered).collect();
+    // state the first read reached, CARRYING THE SAME MONEY. `active` +
+    // `posted` is not decoration here: it is what makes "delivered" mean
+    // delivered. Every clause of the exemption above is an escape hatch a
+    // shortcut could hide behind -- a resume that answered `tombstoned`
+    // for the whole wallet would satisfy 9a completely -- and this run
+    // passes no `--state-dir`, so this adapter cannot emit a tombstone at
+    // all (`adapters/bitcoin/README.md`: without one, every sync is a
+    // first run and no tombstone is ever emitted). A conforming adapter
+    // therefore returns every one of these exactly as it returned them a
+    // moment ago.
+    //
+    // "Exactly" has to include the FIGURES, or this section checks
+    // identity and state and nothing else: rewrite every resumed amount to
+    // zero, keep the ids, the heights, `active` and `posted`, and both 9a
+    // and 9b hold -- the cross-endpoint reconciliation in section 8 ran
+    // against the FIRST read and never sees a resumed value at all. The
+    // whole resumed history is then corrupt and this check is green. So
+    // the money is compared per `local_id` against what the first drain
+    // said it was, by VALUE and on every occurrence: `fees` is a nested
+    // money object, and comparing it as anything less than an `Amount`
+    // (presence, or asset, or a bare string that never parses) is the
+    // silent degradation this project has already shipped once.
+    //
+    // Confirmed money does not drift between two reads seconds apart: a
+    // transaction's net delta to this address, its fee and its sign are
+    // pure functions of a transaction that is already in a block. Only
+    // `block_height` can move under a reorg, and that is not compared here.
+    let mut delivered: BTreeSet<&String> = BTreeSet::new();
+    for o in &resumed.observations {
+        if o.state != ObservationState::Active || o.posting != Posting::Posted {
+            continue;
+        }
+        delivered.insert(&o.local_id);
+        let Some(before) = owed.get(&o.local_id) else {
+            continue;
+        };
+        let now = Money::of(o);
+        assert!(
+            now == *before,
+            "§9b: resuming at ({height}, {txid}) returned {} carrying {now}, but the \
+             uninterrupted read a moment ago said {before}. Same id, same state, different \
+             money: a host that trusts the resume writes the wrong figure into the history \
+             it already has",
+            o.local_id
+        );
+    }
+    let missing: Vec<&String> = owed.keys().filter(|id| !delivered.contains(id)).collect();
     assert!(
         missing.is_empty(),
         "§9b: resuming at ({height}, {txid}) dropped {} of the {} confirmed transactions the \

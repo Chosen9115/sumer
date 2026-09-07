@@ -198,17 +198,22 @@ impl Store {
     /// NOTHING else -- in particular not the balances' timestamp, which
     /// this read did not observe.
     ///
-    /// `tombstoned` is what THIS crawl proved gone. Everything else already
-    /// on disk survives: another process may have recorded a transaction
-    /// this crawl started too early to see, and dropping it would leave the
-    /// txid in nobody's baseline, never probed again, permanently.
+    /// `retracted` is what THIS crawl EMITTED a tombstone for -- not what
+    /// it found gone. A tombstone the page omitted for size was never
+    /// reported, so its txid is not in here and stays in the baseline for
+    /// the next crawl to probe again.
+    ///
+    /// Everything else already on disk survives: another process may have
+    /// recorded a transaction this crawl started too early to see, and
+    /// dropping it would leave the txid in nobody's baseline, never probed
+    /// again, permanently.
     pub fn save_history(
         &self,
         resource_id: &str,
         address_hash: &str,
         as_of: &Rfc3339,
         txs: &SeenTxs,
-        tombstoned: &BTreeSet<String>,
+        retracted: &BTreeSet<String>,
     ) -> io::Result<()> {
         self.update(resource_id, address_hash, |file| {
             let mut merged: BTreeMap<String, SeenTxFile> = txs
@@ -224,7 +229,7 @@ impl Store {
                 })
                 .collect();
             for (txid, entry) in std::mem::take(&mut file.history.txs) {
-                if !merged.contains_key(&txid) && !tombstoned.contains(&txid) {
+                if !merged.contains_key(&txid) && !retracted.contains(&txid) {
                     merged.insert(txid, entry);
                 }
             }
