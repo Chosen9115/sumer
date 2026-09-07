@@ -6,7 +6,8 @@ and who it asks — decisions made in code, in this crate, and not visible to
 the person running it unless they are written down. This is the writing
 down.
 
-Read this before pointing `--source` at anything you do not run yourself.
+Read this before pointing `--source` at anything that is not on this
+machine.
 
 ## What an address query discloses
 
@@ -58,8 +59,8 @@ subpoenaed, sold, and breached. Treat every sync against a third-party
 instance as a permanent, public-in-principle disclosure of your wallet's
 address set.
 
-Running your own `esplora`/`electrs` is the only configuration in which
-this disclosure does not happen. It is one line:
+Running your own `esplora`/`electrs` is the only configuration in which this
+disclosure does not go to a stranger. It is one line:
 
 ```
 --source http://localhost:3000
@@ -67,6 +68,25 @@ this disclosure does not happen. It is one line:
 
 Everything else about the adapter is identical: same protocol, same code
 path, no feature is lost.
+
+**"Your own instance" is not automatically "your own machine."** What the
+address set is exposed to depends on *where* that instance runs, and the
+adapter cannot tell:
+
+- **On this machine** (`localhost`, or a unix-domain-socket proxy in front
+  of one): nothing leaves the machine. This is the only case where that
+  sentence is true.
+- **On another machine you control** — a home server, a NAS, a VPS: the
+  address set crosses a network on every sync. On a LAN, anyone with access
+  to that network segment sees it; on a VPS, so does the hosting provider,
+  who can read the instance's memory and disk, and every network between you
+  and it. `--source http://…` is **plaintext**: the addresses are in the URL
+  path, in the clear, unless you put TLS in front of the instance yourself.
+  This adapter neither adds TLS nor warns when it is missing.
+
+The Bitcoin p2p traffic your node generates is a separate and much weaker
+disclosure — it reveals that a node exists, not which addresses you watch —
+but it is not zero either.
 
 ## We never transmit an xpub
 
@@ -110,13 +130,14 @@ the disclosure that matters is the address set, which no User-Agent hides.
 A public instance that wants to know which clients are costing it bandwidth
 is entitled to a truthful answer.
 
-## The three deployments, and what each costs you
+## The deployments, and what each costs you
 
 | Deployment | Privacy | Cost |
 |---|---|---|
 | `https://blockstream.info/api` (default) | Blockstream learns your address set, IP, and sync timing. Permanent. | Free; rate-limited; you are a guest. |
 | `https://mempool.space/api` | Same, with mempool.space as the observer. | Free; rate-limited; you are a guest. |
-| your own `esplora`/`electrs` | Nothing leaves your machine. Your node still connects to the Bitcoin p2p network, which is a separate and much weaker disclosure. | Your hardware, an initial block download, and the disk to keep it. |
+| your own `esplora`/`electrs`, **on this machine** | Nothing leaves the machine. Your node still connects to the Bitcoin p2p network, which is a separate and much weaker disclosure. | Your hardware, an initial block download, and the disk to keep it. |
+| your own `esplora`/`electrs`, **on another machine** (LAN, home server, VPS) | The address set crosses a network on every sync, in the clear over `http://`. Your hosting provider and anyone on the path is an observer; nobody learns it from a public API. | The same, plus the network — and TLS, if you want the addresses encrypted in transit. |
 
 Being a guest also carries an obligation. This adapter makes one request
 per address per history page, per sync. A large wallet polled aggressively
@@ -140,3 +161,7 @@ Stated plainly rather than reassuringly:
   your full transaction history. It exists for building test corpora.
   Recorded corpora that are committed anywhere public must use addresses
   you are content to publish forever.
+- **No TLS of its own.** `--source https://…` is encrypted because the
+  target is; `--source http://…` is not, and the adapter does not warn or
+  refuse. Pointing it at a remote instance over plain HTTP puts your
+  address set on the wire in the clear.

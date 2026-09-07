@@ -284,31 +284,61 @@ fn http_get(agent: &ureq::Agent, url: &str, path: &str) -> Result<Fetched, Fetch
     classify(status, body, retry_after, path)
 }
 
-/// Status to outcome. `provider_detail` carries the status and the body
-/// VERBATIM: `spec/observation.md` 7 makes it evidence for a human, never
-/// something this adapter or the host branches on.
+/// How much of a provider's error body rides in `provider_detail.raw`.
+///
+/// The body is evidence and goes verbatim (`spec/observation.md` 7) -- but
+/// *verbatim* is not *unbounded*. A status entry rides inside a frame with
+/// a hard ceiling, and one provider answering 503 with a megabyte of HTML
+/// would otherwise make the whole reply unwritable -- an oversized frame
+/// being a fatal kill with no resync (`spec/wire.md` 2). 4 KiB is more of
+/// an error page than any human reads, and what was dropped is stated in
+/// the marker rather than hidden.
+const MAX_DETAIL_BODY: usize = 4_096;
+
+/// Truncates an error body to [`MAX_DETAIL_BODY`], on a UTF-8 boundary,
+/// and says so. A `--record`ed corpus keeps the capped body: it is what the
+/// adapter kept, and a recording that claimed more than the adapter ever
+/// carried would replay differently from the run it recorded.
+fn cap_body(body: String) -> String {
+    if body.len() <= MAX_DETAIL_BODY {
+        return body;
+    }
+    let mut end = MAX_DETAIL_BODY;
+    while !body.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{} [truncated: {} bytes]", &body[..end], body.len())
+}
+
+/// Status to outcome. `provider_detail` carries the status and the body:
+/// `spec/observation.md` 7 makes it evidence for a human, never something
+/// this adapter or the host branches on. Capped at [`MAX_DETAIL_BODY`].
 fn classify(
     status: u16,
     body: String,
     retry_after_ms: Option<u64>,
     path: &str,
 ) -> Result<Fetched, FetchError> {
+    match status {
+        200 => return Ok(Fetched::Body(body)),
+        404 => return Ok(Fetched::NotFound),
+        _ => {}
+    }
+    let capped = cap_body(body);
     let detail = |code: &str| ProviderDetail {
         code: code.to_owned(),
         message: format!("{path}: HTTP {status}"),
-        raw: serde_json::json!({"status": status, "body": body}),
+        raw: serde_json::json!({"status": status, "body": capped}),
     };
-    match status {
-        200 => Ok(Fetched::Body(body)),
-        404 => Ok(Fetched::NotFound),
-        429 => Err(FetchError::RateLimited {
+    if status == 429 {
+        return Err(FetchError::RateLimited {
             retry_after_ms: retry_after_ms.unwrap_or(DEFAULT_RETRY_AFTER_MS),
             detail: detail("http_429"),
-        }),
-        _ => Err(FetchError::Unavailable {
-            detail: detail(&format!("http_{status}")),
-        }),
+        });
     }
+    Err(FetchError::Unavailable {
+        detail: detail(&format!("http_{status}")),
+    })
 }
 
 // ---------------------------------------------------------------------
@@ -438,6 +468,38 @@ mod tests {
             classify(503, "down".to_owned(), None, "/tx/x"),
             Err(FetchError::Unavailable { .. })
         ));
+    }
+
+    #[test]
+    fn a_huge_error_body_is_capped_and_says_so() {
+        let Err(e) = classify(503, "x".repeat(1_100_000), None, "/address/a") else {
+            panic!("503 must not be a success");
+        };
+        let body = e.detail().raw["body"].as_str().unwrap();
+        assert!(
+            body.len() < MAX_DETAIL_BODY + 64,
+            "{} bytes of evidence would make the reply unwritable",
+            body.len()
+        );
+        assert!(body.starts_with("xxxx"), "the head of the body survives");
+        assert!(
+            body.ends_with("[truncated: 1100000 bytes]"),
+            "what was dropped is stated, not hidden: {body:?}"
+        );
+    }
+
+    #[test]
+    fn a_capped_body_is_cut_on_a_character_boundary() {
+        // A multi-byte character straddling the cap must not panic and
+        // must not produce invalid UTF-8.
+        let body = format!(
+            "{}\u{00e9}{}",
+            "a".repeat(MAX_DETAIL_BODY - 1),
+            "b".repeat(10)
+        );
+        let capped = cap_body(body);
+        assert!(capped.starts_with('a'));
+        assert!(capped.contains("[truncated"));
     }
 
     #[test]

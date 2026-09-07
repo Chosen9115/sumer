@@ -1,8 +1,14 @@
 # ADR 0004 — The watch-only Bitcoin adapter: Esplora, wallet-shaped resources, byte-cut pages, positive-evidence tombstones
 
-- **Status:** accepted
+- **Status:** accepted (revision 1)
 - **Date:** 2026-09-07
 - **Decision by:** Linus, Milestone 1
+
+**Revision 1** corrects two things this document got wrong. Decision 3's
+page budget was per resource, which is not a frame limit; decision 5
+asserted a guarantee that concurrent writers did not provide. Both
+corrections are marked **Revised** in place, with the claim they replace
+stated rather than deleted.
 
 ## Context
 
@@ -38,7 +44,12 @@ The cost is stated in `adapters/bitcoin/PRIVACY.md`, and it is not small:
 whatever the intent, and that is permanent and unrevocable.** A public
 Esplora operator learns which addresses belong together and when they are
 watched. The mitigation is not a setting, it is a different deployment —
-run your own, and nothing leaves your machine.
+run your own instance, and the disclosure goes to a party you control
+instead of to a stranger. It leaves your *machine* only when that instance
+runs on the same machine: an instance on a VPS, a home server or another
+LAN box still puts the address set on a network, and `--source http://…` is
+plaintext unless you put TLS in front of it. `PRIVACY.md` states this per
+deployment.
 
 **Never a service that accepts an xpub.** An extended public key hands a
 third party every address the wallet will ever derive, past and future, in
@@ -78,11 +89,17 @@ correctly. One sync emits two sections: confirmed transactions strictly
 above the mark, ascending by `(height, txid)`; then a by-txid section — the
 tracked mempool set, everything currently unconfirmed, and every tombstone —
 re-emitted **in full every sync**, which is what turns "this pending
-transaction was mined into a block below your cursor" into a revision of the
-same `local_id` instead of a record that stays pending forever.
+transaction was mined into a block below your cursor" — and "a reorg re-mined
+a confirmed transaction *downwards*, below your cursor" — into a revision of
+the same `local_id` instead of a record that stays pending, or wrong,
+forever. A re-mined transaction never leaves the listings, so no probe runs
+and no tombstone is emitted; the confirmed section suppresses it as at or
+below the cursor. Section 2 is the only section exempt from that rule, so it
+is the only place the revision can arrive from.
 
-**Pages are cut at 512 KiB of serialized observations, never at a block
-boundary.** The rejected alternative — "a page never splits a block" — was a
+**Pages are cut at 512 KiB of serialized observations — and never past what
+the REPLY has left — never at a block boundary.** The rejected alternative
+— "a page never splits a block" — was a
 **third-party-triggerable permanent denial of service**: roughly 1300
 observations fill the 1 MiB `MAX_FRAME_BYTES`, a block holds up to ~6000
 transactions, and mailing dust to a published address is free and
@@ -92,6 +109,23 @@ resync (ADR 0003), so that block would poison every future sync of that
 wallet, forever, with no way for the victim to recover. Splitting a block is
 safe because a transaction's position inside it is fixed once mined — which
 is exactly what `exact` resumption promises.
+
+**Revised: the budget is the whole reply's, not one resource's.** A
+per-resource budget is not a frame limit at all — a reply carries every
+requested resource's observations, every resource's status entry and every
+`provider_detail` in one frame, and two wallets with ordinary transactions
+produced 1,049,218 bytes against the 1,048,576-byte cap. That is the same
+fatal-kill denial of service the byte-cut was chosen to prevent, arriving
+from the other side of the connection. The budget is now spent once across
+the reply; statuses are charged before observations, because a status entry
+is mandatory for every requested `resource_id` and an observation is not;
+`provider_detail.raw.body` is capped at 4 KiB with a marker; and
+`write_reply` refuses to write an oversized frame at all, answering `err` on
+the same `id` instead. A single observation that cannot fit runs
+`spec/observation.md` §6's two-step degrade — truncate `provider_extra`,
+then omit it and report it in `degraded` — rather than being withheld
+forever: `block_hash` is a provider scalar, and this adapter does not get to
+assume a provider scalar is small.
 
 ### 4. A tombstone requires positive evidence
 
@@ -116,19 +150,46 @@ The asymmetry is deliberate. A missed tombstone is noticed on the next sync.
 An invented one is a retraction written into a permanent record of something
 that never happened.
 
-### 5. Concurrent writers are last-writer-wins, on purpose
+### 5. Concurrent writers MERGE; they never overwrite wholesale
 
-`seen.json` is written temp-file + rename (atomic within one directory), and
-only once a crawl has been delivered in full. Two adapter processes syncing
-the same wallet can lose one another's update, and **that is accepted rather
-than locked against**, because of decision 4: under positive evidence a lost
-update degrades to a *missed* tombstone, caught on the next sync, and can
-never produce an invented one. The torn-file case is covered by the same
-rule — an unparseable file is a first run.
+**Revised.** This decision originally read "last-writer-wins, on purpose",
+on the grounds that under positive evidence a lost update degrades to a
+*missed* tombstone, caught on the next sync. **That claim was false, and
+this is the correction.**
 
-A lock would buy a stronger guarantee than the failure mode needs, and would
-introduce a failure mode the current design does not have (a stale lock file
-wedging a wallet).
+The counterexample: process B completes a sync and records a transaction T
+that arrived after process A's crawl began. A then writes its own snapshot,
+which does not contain T. T is now in nobody's baseline — so nothing ever
+probes it, no tombstone is ever emitted for it, and if it is later dropped
+from the mempool or reorged out, the `active` observation A already emitted
+for it stays uncorrected **forever**. That is not a delayed tombstone, it is
+a permanent one that never comes, and it is the single failure mode the
+positive-evidence rule cannot absorb.
+
+So `seen.json` is still written temp-file + rename, and still only once a
+crawl has been delivered in full, but the write is now a **merge**: it keeps
+every txid already on disk that this crawl did not itself prove gone. The
+read-modify-write runs under an advisory `flock` on
+`<state-dir>/<resource_id>.lock`.
+
+**The merge is the fix; the lock only makes it atomic.** A lock alone would
+not close this: the racing window is the whole crawl — load the baseline,
+fetch for tens of seconds, write — and holding a lock across a network fetch
+is how one slow provider wedges every other process on that wallet, past the
+host's 30s deadline. The lock is held for a file read and a rename, and
+nothing else. The stale-lock failure this ADR previously feared belongs to a
+lock *file* with a pid in it; `flock` is released by the kernel when the
+process dies, so there is nothing to go stale.
+
+A duplicate tombstone is the price: a txid this process tombstoned can be
+re-added by a racing writer that still had it, and the next sync probes it
+and tombstones it again. That is a repeated true statement about a
+transaction that really is gone — positive evidence both times — and
+`spec/observation.md` §4 makes the chain append-only precisely so a restated
+fact is a legal entry rather than a contradiction. A missed retraction is
+fiction; a repeated one is noise.
+
+The torn-file case is unchanged: an unparseable file is a first run.
 
 ## Binding on PR 4: the address-set hash must invalidate the cursor
 
@@ -185,7 +246,13 @@ process boundary as any other.
 - **Absence from a listing as evidence of a vanish.** Rejected: see decision
   4. It is the cheapest possible implementation and it writes fiction into
   an append-only chain the first time a provider is flaky.
-- **Locking `seen.json` across processes.** Rejected: see decision 5.
+- **Locking `seen.json` across the whole crawl.** Rejected: the lock would
+  be held across a network fetch, so one slow provider wedges every other
+  process on that wallet past the host's 30s deadline. The lock decision 5
+  does take is held for a file read and a rename only, and the merge — not
+  the lock — is what makes the guarantee true.
+- **Last-writer-wins on `seen.json`.** Rejected in revision 1: see decision
+  5. This ADR asserted it degraded to a missed tombstone, and it did not.
 
 ## Consequences
 
@@ -202,6 +269,19 @@ process boundary as any other.
   `strong_auth_expires_at` are always absent. A watch-only wallet has no
   credential, no session, and nothing that can be revoked. The live
   invariant check asserts it.
+- **Balances and history are stamped separately in `seen.json`.** A history
+  read observes no balance, so it may not restamp one. They shared one
+  `as_of` until revision 1, which made a failed balance read report the
+  previous day's amounts under the day a *history* read happened — a false
+  freshness claim about money, which is the one claim this project refuses
+  to make. The state file's schema number carries the split, so an old file
+  is a first run rather than a reinterpreted timestamp.
+- **A batch too large to answer.** A reply must carry one status entry per
+  requested `resource_id`, and no paging mechanism in this protocol can shed
+  a status. So a request naming enough resources that their statuses alone
+  exceed `MAX_FRAME_BYTES` is answered with an envelope `err` rather than a
+  fatal oversized frame. Fewer resources per request is the answer, and the
+  error says so.
 - **Balance category names are this adapter's own.** Esplora exposes no
   balance field at all, so `spec/observation.md`'s "the provider's verbatim
   name" has no answer to be faithful to; `confirmed` and `unconfirmed` are

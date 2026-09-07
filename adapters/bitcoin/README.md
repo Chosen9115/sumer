@@ -10,13 +10,19 @@ and it is not revocable.
 
 ## Backend
 
-Esplora's REST API. One protocol, three deployments, one config line:
+Esplora's REST API. One protocol, several deployments, one config line:
 
 | Deployment | `--source` | Cost |
 |---|---|---|
 | Blockstream (default) | `https://blockstream.info/api` | free, rate-limited, run by Blockstream |
 | mempool.space | `https://mempool.space/api` | free, rate-limited, run by mempool.space |
-| your own `esplora`/`electrs` | `http://localhost:3000` | your hardware; nothing leaves your machine |
+| your own `esplora`/`electrs`, on this machine | `http://localhost:3000` | your hardware; nothing leaves the machine |
+| your own `esplora`/`electrs`, elsewhere | `http://nas.lan:3000` | your hardware, plus the address set crossing a network in the clear on every sync — see `PRIVACY.md` |
+
+**"Your own instance" is not automatically "your own machine."** Only the
+`localhost` row keeps the address set off a network; the adapter adds no TLS
+and does not warn when `--source` is a remote `http://`. `PRIVACY.md` states
+what each deployment discloses, and to whom.
 
 **Never a service that wants an xpub.** Handing a third party an extended
 public key hands it every address you will ever derive, past and future, in
@@ -146,13 +152,18 @@ still resumes confirmed reads. One sync emits two sections, in this order:
 1. **Confirmed** — every confirmed transaction strictly above the cursor's
    `(height, txid)`, ascending, *excluding* anything in section 2.
 2. **By txid** — the tracked mempool set (whatever the last completed sync
-   recorded as unconfirmed), everything currently in the mempool, and every
-   tombstone; ascending by txid, each at its **current** state.
+   recorded as unconfirmed), everything currently in the mempool, every
+   tombstone, and every transaction whose recorded height no longer matches
+   the chain's; ascending by txid, each at its **current** state.
 
 **Section 2 is re-emitted in full every sync, regardless of height.** That
 is what turns "a pending transaction got mined into a block at or below the
-cursor" into a revision of the same `local_id` rather than a record that
-stays pending forever.
+cursor" — or "a reorg moved a confirmed transaction *down* to one" — into a
+revision of the same `local_id` rather than a record that stays pending, or
+wrong, forever. A re-mined transaction never leaves the listings, so no
+probe runs and no tombstone is emitted; section 1 would suppress it as at
+or below the cursor. Section 2 is the only place its revision can arrive
+from.
 
 > **The live-check invariant "resuming at C returns no confirmed
 > transaction at or below C" exempts section 2, and section 2 only.**
@@ -170,15 +181,17 @@ stays pending forever.
 > 2. its `state` is `tombstoned`, or
 > 3. a previous reply in the same connection reported the same `local_id`
 >    with `posting: "pending"` (it was in the tracked mempool set, and has
->    since confirmed — this is the case the exemption exists for).
+>    since confirmed — this is the case the exemption exists for), or with
+>    a different `block_height` (a reorg re-mined it, possibly *downwards*,
+>    which the confirmed section would otherwise suppress forever).
 >
 > **Everything else is section 1 and is NOT exempt**: a `posting: "posted"`
 > observation whose `local_id` was never seen pending must be strictly
 > above C, with no exception.
 
-**Pages are cut by SERIALIZED BYTES, never by block.** Budget 512 KiB per
-reply, half of `MAX_FRAME_BYTES`. Blocks split freely, and
-`page_size_reduced_to` reports the count when a page cuts early. The
+**Pages are cut by SERIALIZED BYTES, never by block.** A page spends at
+most 512 KiB, and never more than the reply has left. Blocks split freely,
+and `page_size_reduced_to` reports the count when a page cuts early. The
 rejected alternative — "a page never splits a block" — was a
 third-party-triggerable permanent denial of service: ~1300 observations
 fill a 1 MiB frame, a block holds up to ~6000 transactions, anyone can mail
@@ -192,6 +205,50 @@ A drained page returns `next: null` (`exact`'s terminal state). A page
 request of kind `window` is refused with an envelope `invalid_request`:
 this adapter serves cursor pages only, and Bitcoin history is ordered by
 block, not by wall-clock time.
+
+### `MAX_FRAME_BYTES` bounds the whole reply, not one resource
+
+A reply carries **every** requested resource's observations, plus one
+status entry per resource with its `provider_detail` evidence, in one
+frame. So the byte budget is spent once across the whole reply, not once
+per resource: two wallets with ordinary transactions used to produce a
+1,049,218-byte frame against a 1,048,576-byte cap, and an oversized frame
+is a fatal kill with no resync — the same denial of service the byte-cut
+exists to prevent, arriving from the other side. What rides along and is
+therefore counted:
+
+- **Every observation**, plus the comma that joins it to the last one.
+- **Every status entry**, charged before that resource's observations,
+  because a status entry is mandatory for every requested `resource_id`
+  and an observation is not.
+- **`provider_detail.raw.body`**, capped at 4 KiB with a
+  `[truncated: N bytes]` marker. It is evidence and it goes verbatim
+  (`spec/observation.md` §7) — but *verbatim* is not *unbounded*, and one
+  provider answering 503 with a megabyte of HTML would otherwise make the
+  reply unwritable.
+
+A page that cannot afford even one observation emits none and returns the
+cursor it started from, so the host asks again with the whole budget.
+`write_reply` enforces the ceiling regardless: a reply that would still
+exceed `MAX_FRAME_BYTES` is answered with an `err` on the same `id` rather
+than written. Reaching that means the request asked for more resources than
+a frame can carry *in statuses alone*, which no paging mechanism can shed —
+every requested `resource_id` appears in `statuses` exactly once. Ask for
+fewer resources per request; the error says so.
+
+### Oversized observations: `spec/observation.md` §6's two-step degrade
+
+`block_hash` is a provider-supplied scalar with no length this adapter gets
+to assume. When an observation exceeds `MAX_OBSERVATION_BYTES` (64 KiB):
+
+1. its `provider_extra` — the one field with no bounded shape — is replaced
+   by exactly `{"_truncated": true, "_original_bytes": N}` and its
+   provenance `completeness` becomes `partial`. Nothing else about the
+   record changes;
+2. if it is *still* too large, it is omitted entirely, its resource's status
+   entry gains `degraded {local_id, bytes}` **beside** its `outcome` (never
+   instead of it), and the page keeps emitting everything else. One
+   pathological record must never brick a resource.
 
 ### A crawl is one point-in-time snapshot
 
@@ -253,17 +310,30 @@ State lives in `<state-dir>/<resource_id>.json`, one file per resource:
 
 ```json
 {
-  "schema": 1,
+  "schema": 2,
   "local_id_derivation": "btc-txid@1",
   "address_set_sha256": "…",
-  "as_of": "2026-01-01T00:00:00Z",
-  "balances": {"confirmed": "130000", "unconfirmed": "-5000"},
-  "txs": {
-    "<txid>": {"height": 800000, "delta": "150000"},
-    "<txid>": {"delta": "-20000"}
+  "balances": {
+    "as_of": "2026-01-01T00:00:00Z",
+    "confirmed": "130000",
+    "unconfirmed": "-5000"
+  },
+  "history": {
+    "as_of": "2026-01-02T00:00:00Z",
+    "txs": {
+      "<txid>": {"height": 800000, "delta": "150000"},
+      "<txid>": {"delta": "-20000"}
+    }
   }
 }
 ```
+
+**The two halves are stamped separately, and each read writes only its
+own.** A history read observes no balance, so it may not restamp one:
+`stale { as_of }` on a balance answer carries the instant those figures
+were actually observed. Schema 1 had a single `as_of` covering both, which
+made a failed balance read report yesterday's amounts under today's date —
+a false freshness claim about money. A schema-1 file is a first run.
 
 An entry with no `height` was in the mempool. `delta` is what the
 transaction was worth to this wallet when last seen, so a tombstone carries
@@ -280,10 +350,17 @@ the figure it retracts instead of a fabricated zero.
   derivation-mismatched or hash-mismatched file is a **FIRST RUN**: zero
   remembered transactions, zero tombstones. Never a partial parse.
 - Writes are temp-file + rename (atomic), and only once a sync has been
-  delivered **in full** (`next: null`). Concurrent processes are
-  last-writer-wins on purpose: combined with positive evidence, a lost
-  update degrades to a *missed* tombstone caught next sync, never an
-  invented one.
+  delivered **in full** (`next: null`).
+- **Concurrent writers merge; they never overwrite wholesale.** A write
+  keeps every txid already on disk that it did not itself prove gone, and
+  the read-modify-write runs under an advisory lock on
+  `<state-dir>/<resource_id>.lock` — held for a file read and a rename,
+  never across a network fetch, and released by the kernel if the process
+  dies, so there is no lock that can go stale. Wholesale overwrite was not
+  a *missed* tombstone: a transaction another process recorded after this
+  one's crawl began would end up in nobody's baseline, so nothing would
+  ever probe it and no tombstone would ever be emitted for it — a
+  permanent loss.
 - A tombstone is not terminal. A re-mined transaction comes back `active`
   on the same `local_id` (`spec/observation.md` §4).
 

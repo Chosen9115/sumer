@@ -15,8 +15,8 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use sumer_money::{Amount, AssetId, MoneyError};
 use sumer_wire::{
-    BalanceWire, CanonicalHint, Completeness, ObservationState, ObservationWire, Posting,
-    ProvenanceWire, RawSign, Rfc3339, Rfc3339Error,
+    BalanceWire, CanonicalHint, Completeness, Degraded, ObservationState, ObservationWire, Posting,
+    ProvenanceWire, RawSign, Rfc3339, Rfc3339Error, MAX_OBSERVATION_BYTES,
 };
 
 /// The `local_id` derivation this adapter declares in its hello reply.
@@ -34,9 +34,15 @@ pub const SURFACE_TX: &str = "esplora.tx";
 /// The surface a balance line was computed from.
 pub const SURFACE_STATS: &str = "esplora.address_stats";
 
-/// Serialized-byte budget for one reply's observations: half of
-/// `sumer_wire::MAX_FRAME_BYTES`, leaving the other half for the envelope,
-/// the statuses, and JSON punctuation.
+/// The most one PAGE of observations may serialize to: half of
+/// `sumer_wire::MAX_FRAME_BYTES`.
+///
+/// **This is a cap on a page, not the frame limit.** The frame limit
+/// belongs to the whole REPLY -- every resource's observations, every
+/// resource's status entry and every `provider_detail` share one frame --
+/// and lives in `main.rs`'s `Budget`. A page gets the smaller of the two.
+/// Confusing the two is what let two resources produce a 1,049,218-byte
+/// frame against a 1,048,576-byte cap.
 ///
 /// **Pages are cut by bytes, never by block.** The rejected alternative --
 /// "a page never splits a block" -- was a denial of service anyone could
@@ -632,13 +638,15 @@ pub struct Plan {
 ///    resume cursor's `(height, txid)`, ascending, *excluding* anything in
 ///    section 2.
 /// 2. **By txid** -- the tracked mempool set (whatever `seen.json` recorded
-///    as unconfirmed), everything currently in the mempool, and every
-///    tombstone; ascending by txid, each at its CURRENT state.
+///    as unconfirmed), everything currently in the mempool, every
+///    tombstone, and every transaction whose recorded height no longer
+///    matches the chain's; ascending by txid, each at its CURRENT state.
 ///
 /// Section 2 is re-emitted in full every sync regardless of height, and
 /// that is what turns "a pending transaction got mined into a block at or
-/// below the cursor" into a revision of the same `local_id` instead of a
-/// record that stays pending forever. It is also why the "resuming at C
+/// below the cursor" -- or "a reorg moved a confirmed transaction DOWN to
+/// one" -- into a revision of the same `local_id` instead of a record that
+/// stays pending, or wrong, forever. It is also why the "resuming at C
 /// returns no confirmed transaction at or below C" invariant exempts this
 /// section: re-emitting it is required behaviour, not a violation.
 pub fn plan(
@@ -650,9 +658,21 @@ pub fn plan(
 ) -> Result<Plan, MapError> {
     let mut by_txid: BTreeSet<&str> = BTreeSet::new();
     for (txid, s) in seen {
-        // The tracked mempool set, plus any previously-confirmed
-        // transaction the probe just proved gone.
-        if s.height.is_none() || chain.gone.contains(txid) {
+        // The tracked mempool set; any previously-confirmed transaction
+        // the probe just proved gone; and any transaction the chain now
+        // reports at a DIFFERENT height than the one recorded.
+        //
+        // That last clause is a reorg, and it is why the by-txid section
+        // exists at all. A transaction re-mined at a lower height stays in
+        // the listings, so no probe runs and no tombstone is emitted -- and
+        // the confirmed section would suppress it as "at or below the
+        // cursor". Section 2 is exempt from that rule, so it is the only
+        // place the revision can reach the host from.
+        let revised = chain
+            .txs
+            .get(txid)
+            .is_some_and(|tx| tx.height() != s.height);
+        if s.height.is_none() || chain.gone.contains(txid) || revised {
             by_txid.insert(txid);
         }
     }
@@ -747,40 +767,107 @@ pub struct Page {
     pub next: Option<Cursor>,
     /// Set only when the page cut early, per `spec/observation.md` 5.
     pub page_size_reduced_to: Option<u32>,
+    /// An observation this page dropped for size, per
+    /// `spec/observation.md` 6 step 2.
+    pub degraded: Option<Degraded>,
+    /// Serialized bytes of `observations`: what this page spent of the
+    /// reply's budget, so the next resource in the same reply knows what
+    /// is left.
+    pub bytes: usize,
 }
 
-/// Cuts a plan at `budget` SERIALIZED BYTES.
+/// Cuts a plan at `budget` SERIALIZED BYTES, and runs
+/// `spec/observation.md` 6's two-step degrade over what it emits.
 ///
-/// Never at a block boundary: see [`PAGE_BUDGET_BYTES`]. At least one
-/// observation is always emitted, so a page can never fail to make
-/// progress.
-pub fn cut_page(plan: Plan, budget: usize) -> Result<Page, MapError> {
+/// Never at a block boundary: see [`PAGE_BUDGET_BYTES`].
+///
+/// **The budget is never exceeded, not even by the first observation.** It
+/// used to be: one observation was admitted unconditionally so that a page
+/// could always make progress. That made the budget advisory, and a reply
+/// carrying several resources could then exceed `MAX_FRAME_BYTES` -- a
+/// fatal kill with no resync (`spec/wire.md` 2), which is the denial of
+/// service the byte-cut exists to prevent, arriving from the other side. A
+/// page that cannot afford even one observation emits none and names the
+/// point it started from, so the host asks again with the whole budget.
+///
+/// The degrade is what keeps that from stalling a resource: an observation
+/// no page could ever afford is not withheld forever, it is truncated and,
+/// failing that, omitted and reported.
+pub fn cut_page(plan: Plan, from: Option<&Cursor>, budget: usize) -> Result<Page, MapError> {
+    let Plan { items, high_water } = plan;
     let mut observations = Vec::new();
     // The resume cursor names the LAST EMITTED item, never the first
     // withheld one: `exact` promises nothing at or below it is re-sent.
     let mut last_key: Option<Key> = None;
+    let mut degraded: Option<Degraded> = None;
     let mut used = 0usize;
+    let mut cut = false;
 
-    for (key, obs) in plan.items {
-        let size = serde_json::to_vec(&obs)?.len();
-        if !observations.is_empty() && used + size > budget {
-            let next = last_key.map(|k| k.cursor(&plan.high_water));
-            let emitted = u32::try_from(observations.len()).unwrap_or(u32::MAX);
-            return Ok(Page {
-                observations,
-                next,
-                page_size_reduced_to: Some(emitted),
-            });
+    for (key, mut obs) in items {
+        let mut size = serde_json::to_vec(&obs)?.len();
+        if size > MAX_OBSERVATION_BYTES {
+            // Step 1. `provider_extra` is the only field with no bounded
+            // shape -- here it is Esplora's `block_hash`, a provider scalar
+            // this adapter does not get to assume is small -- so it is the
+            // only truncation target. The record itself survives intact.
+            let discarded = serde_json::to_vec(&obs.provider_extra)?.len();
+            obs.provider_extra = [
+                ("_truncated".to_owned(), serde_json::Value::Bool(true)),
+                ("_original_bytes".to_owned(), discarded.into()),
+            ]
+            .into_iter()
+            .collect();
+            obs.provenance.completeness = Completeness::Partial;
+            size = serde_json::to_vec(&obs)?.len();
         }
-        used += size;
+        if size > MAX_OBSERVATION_BYTES {
+            // Step 2. Omit it, report it, and KEEP GOING: one pathological
+            // record must never brick a resource. The cursor is not
+            // advanced onto it -- it does not need to be, because the page
+            // continues and a later emitted item names a resume point above
+            // it. Only the FIRST omission is reported: `degraded` is one
+            // field on one status entry, and inventing a second entry to
+            // carry a second omission would break "every requested
+            // resource_id appears exactly once".
+            degraded.get_or_insert(Degraded {
+                local_id: Some(obs.local_id.clone()),
+                bytes: u64::try_from(size).unwrap_or(u64::MAX),
+            });
+            continue;
+        }
+        // Plus the comma that joins it to the previous observation: a
+        // budget that ignores JSON punctuation is a budget a thousand
+        // observations walk straight through.
+        let cost = size.saturating_add(1);
+        if used + cost > budget {
+            cut = true;
+            break;
+        }
+        used += cost;
         observations.push(obs);
         last_key = Some(key);
     }
 
+    let emitted = u32::try_from(observations.len()).unwrap_or(u32::MAX);
     Ok(Page {
         observations,
-        next: None,
-        page_size_reduced_to: None,
+        next: cut.then(|| {
+            last_key.map_or_else(
+                // Nothing was emitted, so nothing new is resumable FROM:
+                // the next page starts exactly where this one did.
+                || {
+                    from.cloned().unwrap_or(Cursor {
+                        height: 0,
+                        txid: String::new(),
+                        mempool: None,
+                    })
+                },
+                |k| k.cursor(&high_water),
+            )
+        }),
+        page_size_reduced_to: cut.then_some(emitted),
+        degraded,
+        bytes: used,
     })
 }
 
@@ -1116,7 +1203,12 @@ mod tests {
 
         // Room for two observations and no more: the cut lands between
         // txid(2) and txid(3), both of which are in block 800_000.
-        let page = cut_page(plan_for(&txs, &mempool, &gone, &seen, None), one * 2 + 8).unwrap();
+        let page = cut_page(
+            plan_for(&txs, &mempool, &gone, &seen, None),
+            None,
+            one * 2 + 8,
+        )
+        .unwrap();
         assert_eq!(page.observations.len(), 2);
         assert_eq!(page.page_size_reduced_to, Some(2));
         let next = page.next.unwrap();
@@ -1128,6 +1220,7 @@ mod tests {
 
         let rest = cut_page(
             plan_for(&txs, &mempool, &gone, &seen, Some(&next)),
+            Some(&next),
             PAGE_BUDGET_BYTES,
         )
         .unwrap();
@@ -1181,6 +1274,7 @@ mod tests {
         for _ in 0..10 {
             let page = cut_page(
                 plan_for(&txs, &mempool, &gone, &seen, from.as_ref()),
+                from.as_ref(),
                 one + 8,
             )
             .unwrap();
@@ -1244,6 +1338,235 @@ mod tests {
             format!("800000:{}:m:{}", txid(1), pending),
             "the confirmed high-water mark rides along, so a cursor persisted \
              mid-mempool still resumes confirmed reads"
+        );
+    }
+
+    /// A confirmed transaction RE-MINED BELOW THE CURSOR. It never left the
+    /// listings, so the probe never runs and there is no tombstone; the
+    /// confirmed section suppresses it because its new key is at or below
+    /// the cursor. Without the by-txid section, the reorg's revised block
+    /// metadata is lost permanently.
+    #[test]
+    fn a_reorg_that_moves_a_transaction_below_the_cursor_is_still_delivered() {
+        let moved = txid(2);
+        let (txs, mempool) = chain_of(vec![tx(
+            &moved,
+            Some(700_000),
+            &[(THEM, 2_000)],
+            &[(ME, 1_900)],
+            100,
+        )]);
+        // Last sync recorded it CONFIRMED, at a height above the cursor.
+        let seen: SeenTxs = [(
+            moved.clone(),
+            SeenTx {
+                height: Some(800_001),
+                delta: 1_900,
+            },
+        )]
+        .into_iter()
+        .collect();
+        let from = Cursor::parse(&format!("800000:{}", txid(1))).unwrap();
+
+        let plan = plan_for(&txs, &mempool, &BTreeSet::new(), &seen, Some(&from));
+        assert_eq!(
+            plan.items.len(),
+            1,
+            "the revision has to reach the host through SOME section, or a reorg \
+             downwards is a silent loss"
+        );
+        assert!(
+            matches!(&plan.items[0].0, Key::Mempool { txid } if *txid == moved),
+            "the by-txid section is the only one exempt from \
+             no-confirmed-tx-at-or-below-C, so it is where a revision below the \
+             cursor belongs"
+        );
+        assert_eq!(plan.items[0].1.provider_extra["block_height"], 700_000);
+    }
+
+    /// And once delivered, it stops being re-delivered: the next sync's
+    /// baseline records the new height, so the revision is emitted once
+    /// rather than on every sync forever.
+    #[test]
+    fn a_delivered_reorg_revision_is_not_reemitted_next_sync() {
+        let moved = txid(2);
+        let (txs, mempool) = chain_of(vec![tx(
+            &moved,
+            Some(700_000),
+            &[(THEM, 2_000)],
+            &[(ME, 1_900)],
+            100,
+        )]);
+        let gone = BTreeSet::new();
+        let chain = Chain {
+            txs: &txs,
+            mempool: &mempool,
+            gone: &gone,
+        };
+        let seen: SeenTxs = [(
+            moved.clone(),
+            SeenTx {
+                height: Some(800_001),
+                delta: 1_900,
+            },
+        )]
+        .into_iter()
+        .collect();
+        let from = Cursor::parse(&format!("800000:{}", txid(1))).unwrap();
+
+        let after = next_seen(&chain, &owned(), &seen);
+        assert_eq!(after.get(&moved).unwrap().height, Some(700_000));
+        let plan = plan_for(&txs, &mempool, &gone, &after, Some(&from));
+        assert!(
+            plan.items.is_empty(),
+            "nothing changed since the revision was delivered; re-emitting it \
+             every sync would be noise, not a revision"
+        );
+    }
+
+    // -----------------------------------------------------------------
+    // The frame limit and spec/observation.md section 6's two-step degrade
+    // -----------------------------------------------------------------
+
+    /// `block_hash` is a provider-supplied scalar with no bounded length,
+    /// and it rides in `provider_extra`. Step 1 of the degrade replaces
+    /// that field with a marker; everything else about the observation
+    /// survives.
+    #[test]
+    fn an_oversized_observation_loses_its_provider_extra_and_nothing_else() {
+        let mut big = tx(&txid(1), Some(800_000), &[(THEM, 1_000)], &[(ME, 900)], 100);
+        big.status.block_hash = Some("f".repeat(100_000));
+        let (txs, mempool) = chain_of(vec![big]);
+        let page = cut_page(
+            plan_for(&txs, &mempool, &BTreeSet::new(), &SeenTxs::new(), None),
+            None,
+            PAGE_BUDGET_BYTES,
+        )
+        .unwrap();
+
+        assert_eq!(page.observations.len(), 1);
+        let obs = &page.observations[0];
+        let bytes = serde_json::to_vec(obs).unwrap().len();
+        assert!(
+            bytes <= MAX_OBSERVATION_BYTES,
+            "{bytes} bytes on the wire, over MAX_OBSERVATION_BYTES \
+             ({MAX_OBSERVATION_BYTES})"
+        );
+        assert_eq!(
+            obs.provider_extra.len(),
+            2,
+            "the marker REPLACES provider_extra; it does not sit beside what \
+             was discarded"
+        );
+        assert_eq!(
+            obs.provider_extra["_truncated"],
+            serde_json::Value::Bool(true)
+        );
+        assert!(obs.provider_extra["_original_bytes"].as_u64().unwrap() > 100_000);
+        assert_eq!(obs.provenance.completeness, Completeness::Partial);
+        assert_eq!(
+            obs.amount.to_string(),
+            "900",
+            "provider_extra is the ONLY truncation target"
+        );
+    }
+
+    /// Step 2: an observation step 1 could not save is OMITTED, reported in
+    /// `degraded`, and the page keeps going. One pathological record must
+    /// never brick a resource.
+    #[test]
+    fn an_observation_step_one_cannot_save_is_omitted_and_reported() {
+        let small = |n: u32| {
+            active(
+                &ctx(),
+                &tx(&txid(n), Some(800_000), &[(THEM, 1_000)], &[(ME, 900)], 100),
+                &owned(),
+            )
+            .unwrap()
+        };
+        let mut huge = small(2);
+        // Not `provider_extra`, so step 1 cannot rescue it.
+        huge.description = "x".repeat(200_000);
+        let plan = Plan {
+            items: vec![
+                (
+                    Key::Confirmed {
+                        height: 800_000,
+                        txid: txid(1),
+                    },
+                    small(1),
+                ),
+                (
+                    Key::Confirmed {
+                        height: 800_000,
+                        txid: txid(2),
+                    },
+                    huge,
+                ),
+                (
+                    Key::Confirmed {
+                        height: 800_000,
+                        txid: txid(3),
+                    },
+                    small(3),
+                ),
+            ],
+            high_water: (800_000, txid(3)),
+        };
+
+        let page = cut_page(plan, None, PAGE_BUDGET_BYTES).unwrap();
+        let ids: Vec<&str> = page
+            .observations
+            .iter()
+            .map(|o| o.local_id.as_str())
+            .collect();
+        assert_eq!(
+            ids,
+            vec![local_id("w", &txid(1)), local_id("w", &txid(3))],
+            "every other observation on the page is emitted regardless"
+        );
+        let degraded = page
+            .degraded
+            .expect("the omitted record is reported, never silently dropped");
+        assert_eq!(
+            degraded.local_id.as_deref(),
+            Some(local_id("w", &txid(2)).as_str())
+        );
+        assert!(degraded.bytes > 200_000, "the REAL measured size");
+        assert!(
+            page.next.is_none(),
+            "the plan drained; the resource is readable, not stuck on the record \
+             it could not deliver"
+        );
+    }
+
+    /// A page cut against a budget smaller than its first observation emits
+    /// nothing -- and still names where to resume, or the crawl is lost.
+    /// Admitting the first observation unconditionally is what lets two
+    /// resources in one reply overflow one frame.
+    #[test]
+    fn a_page_never_spends_more_than_its_budget() {
+        let (txs, mempool) = split_block_fixture();
+        let page = cut_page(
+            plan_for(&txs, &mempool, &BTreeSet::new(), &SeenTxs::new(), None),
+            None,
+            10,
+        )
+        .unwrap();
+        let spent: usize = page
+            .observations
+            .iter()
+            .map(|o| serde_json::to_vec(o).unwrap().len())
+            .sum();
+        assert!(
+            spent <= 10,
+            "a page spent {spent} bytes of a 10-byte budget"
+        );
+        assert_eq!(
+            page.next.map(|c| c.encode()),
+            Some("0:".to_owned()),
+            "nothing was emitted and the plan is not drained: resumption is from \
+             where this page started"
         );
     }
 

@@ -29,7 +29,7 @@ use sumer_wire::{
     BalancesReadParams, BalancesReadReply, CursorResumable, ErrorBody, HelloParams, HelloReply,
     HistoryReadParams, HistoryReadReply, PageReply, PageRequest, ProviderDetail, ReadOutcome,
     Reply, Request, RequestId, ResourceDescriptor, ResourceStatus, ResourcesListParams,
-    ResourcesListReply, Rfc3339, StatusReadParams, StatusReadReply, WireErrorCode,
+    ResourcesListReply, Rfc3339, StatusReadParams, StatusReadReply, WireErrorCode, MAX_FRAME_BYTES,
     OP_BALANCES_READ, OP_HELLO, OP_HISTORY_READ, OP_RESOURCES_LIST, OP_STATUS_READ,
 };
 use wallet::Wallet;
@@ -106,12 +106,97 @@ fn main() -> std::process::ExitCode {
     std::process::ExitCode::SUCCESS
 }
 
-/// The only place this process writes to stdout.
+/// The only place this process writes to stdout, and the only place the
+/// frame ceiling is *enforced* rather than budgeted for.
+///
+/// A frame over `MAX_FRAME_BYTES` is a fatal kill with no resync
+/// (`spec/wire.md` 2), so the one thing this function must never do is
+/// write one. [`Budget`] upstream is what keeps a reply inside the ceiling;
+/// this is the proof, and it answers an over-sized reply with an `err`
+/// addressed to the same `id` -- something the host can read and act on --
+/// instead of a connection it has to kill.
+///
+/// Reaching it means the request asked for more than a frame can carry:
+/// hundreds of resources whose STATUS entries alone overflow it, which no
+/// paging mechanism in this protocol can shed (every requested
+/// `resource_id` appears in `statuses` exactly once). Fewer resources per
+/// request is the answer, and the error says so.
 fn write_reply(out: &mut impl Write, reply: &Reply<serde_json::Value>) -> io::Result<()> {
-    let line = serde_json::to_string(reply)?;
+    let mut line = serde_json::to_string(reply)?;
+    if line.len() > MAX_FRAME_BYTES {
+        let (Reply::Ok { id, .. } | Reply::Err { id, .. }) = reply;
+        eprintln!(
+            "sumer-bitcoin-adapter: a {}-byte reply does not fit MAX_FRAME_BYTES \
+             ({MAX_FRAME_BYTES}); answering err instead of writing a fatal frame",
+            line.len()
+        );
+        let err: Reply<serde_json::Value> = Reply::err(
+            *id,
+            internal(format!(
+                "this reply is {} bytes and MAX_FRAME_BYTES is {MAX_FRAME_BYTES}; \
+                 ask for fewer resources per request",
+                line.len()
+            )),
+        );
+        line = serde_json::to_string(&err)?;
+    }
     out.write_all(line.as_bytes())?;
     out.write_all(b"\n")?;
     out.flush()
+}
+
+// ---------------------------------------------------------------------
+// The reply's byte budget
+// ---------------------------------------------------------------------
+
+/// The bytes of a reply that are neither a status entry nor an
+/// observation: `{"id":18446744073709551615,"ok":{"observations":[],
+/// "statuses":[]}}` is 66 of them, plus one comma per element. 512 is
+/// slack, deliberately -- the accounting here does not have to be exact,
+/// because [`write_reply`] is what makes the ceiling true.
+const ENVELOPE_BYTES: usize = 512;
+
+/// What a status entry can still grow by after it has been measured: the
+/// `page` object it does not carry yet (`{"cursor_resumable":"exact",
+/// "next":{"kind":"cursor","cursor":"<20>:<64>:m:<64>"},
+/// "page_size_reduced_to":4294967295}`), and the byte between
+/// `"page_empty":false` and `"page_empty":true`.
+const PAGE_REPLY_BYTES: usize = 320;
+
+/// One reply's remaining byte budget.
+///
+/// **`MAX_FRAME_BYTES` bounds the whole REPLY, not one resource's share of
+/// it.** A reply carries every requested resource's observations, its
+/// statuses and their `provider_detail` evidence in one frame, so a budget
+/// spent per resource is not a frame limit at all: two resources with
+/// ordinary transactions overflowed it, and an oversized frame is a fatal
+/// kill with no resync (`spec/wire.md` 2). This is that budget, spent once
+/// across the whole reply.
+struct Budget(usize);
+
+impl Budget {
+    fn new() -> Budget {
+        Budget(MAX_FRAME_BYTES.saturating_sub(ENVELOPE_BYTES))
+    }
+
+    /// Charges what a status entry costs the reply, and hands it back.
+    /// Every status entry goes through here -- an entry is mandatory for
+    /// every requested resource, so it is charged before any observation.
+    fn charge(&mut self, entry: ResourceStatus) -> ResourceStatus {
+        let cost = serde_json::to_vec(&entry).map_or(0, |v| v.len());
+        self.0 = self.0.saturating_sub(cost.saturating_add(PAGE_REPLY_BYTES));
+        entry
+    }
+
+    fn spend(&mut self, bytes: usize) {
+        self.0 = self.0.saturating_sub(bytes);
+    }
+
+    /// What one page of observations may spend: never more than this reply
+    /// has left, and never more than a page's own cap (ADR 0004 3).
+    fn page(&self) -> usize {
+        self.0.min(PAGE_BUDGET_BYTES)
+    }
 }
 
 // ---------------------------------------------------------------------
@@ -218,10 +303,14 @@ fn internal(e: impl Display) -> ErrorBody {
 /// A status entry with every field this adapter never populates left
 /// absent by construction: `credential_expires_at` and
 /// `strong_auth_expires_at` do not exist for a watch-only wallet -- there
-/// is no credential and no authentication session -- and `degraded` is
-/// unreachable because this adapter's `provider_extra` is a fixed handful
-/// of scalars, so no observation it builds approaches
-/// `MAX_OBSERVATION_BYTES`.
+/// is no credential and no authentication session.
+///
+/// `degraded` starts absent and is filled in by [`map::cut_page`] when a
+/// page had to drop a record for size. It used to be documented here as
+/// unreachable, on the grounds that this adapter's `provider_extra` is a
+/// fixed handful of scalars -- which was wrong: `block_hash` is one of
+/// them, it comes from the provider, and a provider scalar has no length
+/// this adapter gets to assume.
 fn status(resource_id: &str, outcome: ReadOutcome) -> ResourceStatus {
     ResourceStatus {
         resource_id: resource_id.to_owned(),
@@ -367,10 +456,7 @@ impl Adapter {
                     Ok((c, u)) => {
                         confirmed = Some(c);
                         unconfirmed = Some(u);
-                        let mut recorded = self.store.load(&w.resource_id, &w.address_hash);
-                        recorded.confirmed = confirmed;
-                        recorded.unconfirmed = unconfirmed;
-                        self.record_state(w, &observed_at, &recorded);
+                        self.record_balances(w, &observed_at, confirmed, unconfirmed);
                         status(resource_id, ReadOutcome::Fetched { page_empty: false })
                     }
                     Err(FetchError::RateLimited {
@@ -388,7 +474,10 @@ impl Adapter {
                     }
                     Err(FetchError::Unavailable { detail }) => {
                         let recorded = self.store.load(&w.resource_id, &w.address_hash);
-                        match recorded.as_of.clone() {
+                        // The BALANCES' own timestamp. A history read
+                        // observes no balance and never stamps one, so this
+                        // is when the figures below were actually seen.
+                        match recorded.balances_as_of.clone() {
                             Some(as_of) => {
                                 confirmed = recorded.confirmed;
                                 unconfirmed = recorded.unconfirmed;
@@ -420,6 +509,8 @@ impl Adapter {
         let mut observations = Vec::new();
         let mut statuses = Vec::new();
         let mut abandoned = false;
+        // ONE budget for the whole reply, not one per resource.
+        let mut budget = Budget::new();
 
         for query in &params.resources {
             let resource_id = &query.resource_id;
@@ -444,11 +535,11 @@ impl Adapter {
                 }
             };
             let Some(w) = self.lookup(resource_id) else {
-                statuses.push(unknown_resource(resource_id));
+                statuses.push(budget.charge(unknown_resource(resource_id)));
                 continue;
             };
             if abandoned {
-                statuses.push(status(resource_id, ReadOutcome::NotFetched));
+                statuses.push(budget.charge(status(resource_id, ReadOutcome::NotFetched)));
                 continue;
             }
 
@@ -480,24 +571,32 @@ impl Adapter {
                         detail,
                     }) => {
                         abandoned = true;
-                        statuses.push(with_detail(
+                        statuses.push(budget.charge(with_detail(
                             status(resource_id, ReadOutcome::RateLimited { retry_after_ms }),
                             &detail,
-                        ));
+                        )));
                         continue;
                     }
                     Err(FetchError::Unavailable { detail }) => {
-                        statuses.push(with_detail(
-                            match recorded.as_of {
+                        statuses.push(budget.charge(with_detail(
+                            match recorded.history_as_of {
                                 Some(as_of) => status(resource_id, ReadOutcome::Stale { as_of }),
                                 None => status(resource_id, ReadOutcome::Unavailable),
                             },
                             &detail,
-                        ));
+                        )));
                         continue;
                     }
                 }
             }
+
+            // The status entry is mandatory for every requested resource,
+            // so the reply pays for it before it pays for any of this
+            // resource's observations.
+            let mut entry = budget.charge(status(
+                resource_id,
+                ReadOutcome::Fetched { page_empty: true },
+            ));
 
             // Every page of one crawl is served from the SAME snapshot --
             // the same transactions, the same remembered state, the same
@@ -518,40 +617,31 @@ impl Adapter {
                 let ctx = self.ctx(w, &crawl.observed_at);
                 let plan = map::plan(&ctx, &chain, &w.owned, &crawl.seen_txs, from.as_ref())
                     .map_err(internal)?;
-                let page = map::cut_page(plan, PAGE_BUDGET_BYTES).map_err(internal)?;
-                let delivered = page
-                    .next
-                    .is_none()
-                    .then(|| map::next_seen(&chain, &w.owned, &crawl.seen_txs));
+                let page = map::cut_page(plan, from.as_ref(), budget.page()).map_err(internal)?;
+                let delivered = page.next.is_none().then(|| {
+                    (
+                        map::next_seen(&chain, &w.owned, &crawl.seen_txs),
+                        crawl.chain.gone.clone(),
+                    )
+                });
                 (page, crawl.observed_at.clone(), delivered)
             };
+            budget.spend(page.bytes);
 
             // The baseline moves only once the crawl has been delivered in
             // full, and the spent snapshot is dropped. A crawl the host
             // abandons mid-page leaves the old baseline in place, so the
             // next sync re-derives it rather than trusting a
             // half-delivered diff.
-            if let Some(txs) = delivered_in_full {
-                let recorded = self.store.load(&w.resource_id, &w.address_hash);
-                self.record_state(
-                    w,
-                    &snapshot_at,
-                    &seen::Seen {
-                        as_of: Some(snapshot_at.clone()),
-                        confirmed: recorded.confirmed,
-                        unconfirmed: recorded.unconfirmed,
-                        txs,
-                    },
-                );
+            if let Some((txs, tombstoned)) = delivered_in_full {
+                self.record_history(w, &snapshot_at, &txs, &tombstoned);
                 self.crawls.borrow_mut().remove(resource_id);
             }
 
-            let mut entry = status(
-                resource_id,
-                ReadOutcome::Fetched {
-                    page_empty: page.observations.is_empty(),
-                },
-            );
+            entry.outcome = ReadOutcome::Fetched {
+                page_empty: page.observations.is_empty(),
+            };
+            entry.degraded = page.degraded;
             entry.page = Some(PageReply {
                 cursor_resumable: CursorResumable::Exact,
                 next: page
@@ -615,11 +705,43 @@ impl Adapter {
     /// A state write that fails is logged and survived: the next sync
     /// simply sees an older baseline, which under positive evidence costs
     /// a delayed tombstone and never an invented one.
-    fn record_state(&self, w: &Wallet, as_of: &Rfc3339, state: &seen::Seen) {
-        if let Err(e) = self
-            .store
-            .save(&w.resource_id, &w.address_hash, as_of, state)
-        {
+    fn record_balances(
+        &self,
+        w: &Wallet,
+        as_of: &Rfc3339,
+        confirmed: Option<i128>,
+        unconfirmed: Option<i128>,
+    ) {
+        self.recorded(
+            w,
+            self.store.save_balances(
+                &w.resource_id,
+                &w.address_hash,
+                as_of,
+                confirmed,
+                unconfirmed,
+            ),
+        );
+    }
+
+    /// `tombstoned` is what this crawl PROVED gone; everything else already
+    /// on disk survives the write. See `seen.rs` rule 3.
+    fn record_history(
+        &self,
+        w: &Wallet,
+        as_of: &Rfc3339,
+        txs: &map::SeenTxs,
+        tombstoned: &std::collections::BTreeSet<String>,
+    ) {
+        self.recorded(
+            w,
+            self.store
+                .save_history(&w.resource_id, &w.address_hash, as_of, txs, tombstoned),
+        );
+    }
+
+    fn recorded(&self, w: &Wallet, outcome: io::Result<()>) {
+        if let Err(e) = outcome {
             eprintln!(
                 "sumer-bitcoin-adapter: could not record state for {}: {e}",
                 w.resource_id
@@ -870,14 +992,12 @@ mod tests {
         std::fs::remove_dir_all(&root).unwrap();
     }
 
-    /// A corpus with `count` confirmed transactions, chained across the
+    /// One address's `count` confirmed transactions, chained across the
     /// 25-per-page chain listing exactly as Esplora pages it.
-    fn paged_corpus(root: &Path, count: usize) {
-        let corpus = root.join("corpus/run0");
-        std::fs::create_dir_all(&corpus).unwrap();
-        std::fs::write(corpus.join("now"), "1767225600").unwrap();
+    fn paged_corpus(corpus: &Path, addr: &str, count: usize) {
+        std::fs::create_dir_all(corpus).unwrap();
         std::fs::write(
-            corpus.join(format!("address_{ADDR}_txs_mempool.json")),
+            corpus.join(format!("address_{addr}_txs_mempool.json")),
             "[]",
         )
         .unwrap();
@@ -899,7 +1019,7 @@ mod tests {
             })
             .collect();
 
-        let mut name = format!("address_{ADDR}_txs_chain");
+        let mut name = format!("address_{addr}_txs_chain");
         for chunk in txs.chunks(25) {
             std::fs::write(
                 corpus.join(format!("{name}.json")),
@@ -907,7 +1027,7 @@ mod tests {
             )
             .unwrap();
             let last = chunk.last().unwrap()["txid"].as_str().unwrap().to_owned();
-            name = format!("address_{ADDR}_txs_chain_{last}");
+            name = format!("address_{addr}_txs_chain_{last}");
         }
         // A final short page ends the crawl. When the last chunk was
         // exactly full, that page has to be an empty one.
@@ -929,7 +1049,10 @@ mod tests {
         ));
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(&root).unwrap();
-        paged_corpus(&root, COUNT);
+        let corpus = root.join("corpus/run0");
+        std::fs::create_dir_all(&corpus).unwrap();
+        std::fs::write(corpus.join("now"), "1767225600").unwrap();
+        paged_corpus(&corpus, ADDR, COUNT);
         let config = root.join("wallets.json");
         std::fs::write(
             &config,
@@ -1012,8 +1135,8 @@ mod tests {
         let state: serde_json::Value =
             serde_json::from_str(&std::fs::read_to_string(root.join("state/w.json")).unwrap())
                 .unwrap();
-        assert_eq!(state["txs"].as_object().unwrap().len(), COUNT);
-        assert_eq!(state["as_of"], "2026-01-01T00:00:00Z");
+        assert_eq!(state["history"]["txs"].as_object().unwrap().len(), COUNT);
+        assert_eq!(state["history"]["as_of"], "2026-01-01T00:00:00Z");
 
         // A new `page: None` starts a NEW crawl -- which, with the corpus
         // deleted, cannot be taken. That is the proof the snapshot was
@@ -1091,6 +1214,354 @@ mod tests {
             }
             Reply::Ok { .. } => panic!("this adapter serves cursor pages only"),
         }
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    // -----------------------------------------------------------------
+    // The frame limit: MAX_FRAME_BYTES is the whole REPLY's ceiling, and
+    // an oversized frame is a fatal kill with no resync (spec/wire.md 2).
+    // -----------------------------------------------------------------
+
+    fn tmp_root(tag: &str) -> PathBuf {
+        let root = std::env::temp_dir().join(format!(
+            "sumer-btc-{tag}-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        root
+    }
+
+    fn write_at(root: &Path, rel: &str, body: &str) {
+        let path = root.join(rel);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, body).unwrap();
+    }
+
+    fn frame_bytes(reply: &Reply<serde_json::Value>) -> usize {
+        serde_json::to_vec(reply).unwrap().len()
+    }
+
+    fn wallets_json(root: &Path, wallets: serde_json::Value) -> PathBuf {
+        let config = root.join("wallets.json");
+        std::fs::write(&config, serde_json::json!({"wallets": wallets}).to_string()).unwrap();
+        config
+    }
+
+    fn adapter_with(config: &Path, corpus: &Path, run: u64, state: &Path) -> Adapter {
+        Adapter {
+            wallets: wallet::load(config).unwrap(),
+            source: Source::replay(corpus, run),
+            store: seen::Store::new(Some(state.to_path_buf())),
+            crawls: RefCell::new(HashMap::new()),
+        }
+    }
+
+    /// TWO RESOURCES, ordinary synthetic transactions, one reply. A budget
+    /// spent per resource is not a frame limit: the reply carries both.
+    #[test]
+    fn two_resources_share_one_frames_budget() {
+        const COUNT: usize = 1_200;
+        let root = tmp_root("frame-two-resources");
+        let corpus = root.join("corpus/run0");
+        std::fs::create_dir_all(&corpus).unwrap();
+        std::fs::write(corpus.join("now"), "1767225600").unwrap();
+        paged_corpus(&corpus, "bc1qexample0", COUNT);
+        paged_corpus(&corpus, "bc1qexample1", COUNT);
+        let config = wallets_json(
+            &root,
+            serde_json::json!([
+                {"resource_id": "w0", "addresses": ["bc1qexample0"]},
+                {"resource_id": "w1", "addresses": ["bc1qexample1"]},
+            ]),
+        );
+        let adapter = adapter_with(&config, &root.join("corpus"), 0, &root.join("state"));
+
+        let reply = adapter
+            .handle(&request(
+                OP_HISTORY_READ,
+                serde_json::json!({"resources": [
+                    {"resource_id": "w0"}, {"resource_id": "w1"}
+                ]}),
+            ))
+            .unwrap();
+        let bytes = frame_bytes(&reply);
+        assert!(
+            bytes <= sumer_wire::MAX_FRAME_BYTES,
+            "{bytes} bytes on the wire, over MAX_FRAME_BYTES ({}): an oversized \
+             frame is a fatal kill with no resync, which is the denial of service \
+             the byte-cut exists to prevent",
+            sumer_wire::MAX_FRAME_BYTES
+        );
+
+        // ...and a budget shared between two resources must SHARE it, not
+        // starve one of them. Drain both and count.
+        let mut ids: Vec<String> = Vec::new();
+        let mut reply = reply;
+        for round in 0..40 {
+            let ok = ok_of(reply);
+            assert_eq!(
+                ok["statuses"].as_array().unwrap().len(),
+                2,
+                "every requested resource_id appears in statuses exactly once"
+            );
+            ids.extend(
+                ok["observations"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|o| o["local_id"].as_str().unwrap().to_owned()),
+            );
+            let resources: Vec<serde_json::Value> = ok["statuses"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter(|s| !s["page"]["next"].is_null())
+                .map(|s| {
+                    serde_json::json!({
+                        "resource_id": s["resource_id"], "page": s["page"]["next"]
+                    })
+                })
+                .collect();
+            if resources.is_empty() {
+                break;
+            }
+            assert!(round < 39, "not draining");
+            reply = adapter
+                .handle(&request(
+                    OP_HISTORY_READ,
+                    serde_json::json!({"resources": resources}),
+                ))
+                .unwrap();
+        }
+        let mut expected: Vec<String> = (0..COUNT)
+            .flat_map(|n| [format!("w0:{n:064x}"), format!("w1:{n:064x}")])
+            .collect();
+        expected.sort();
+        let mut got = ids.clone();
+        got.sort();
+        assert_eq!(
+            got, expected,
+            "every transaction of BOTH wallets, exactly once: a shared budget \
+             must page the surplus, never drop it"
+        );
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// The ceiling itself, at the only place bytes reach stdout. A frame
+    /// over `MAX_FRAME_BYTES` is a fatal kill with no resync, so it is
+    /// never written -- the host gets an `err` on the same id instead.
+    #[test]
+    fn a_reply_too_large_for_a_frame_is_answered_with_an_err() {
+        let huge: Reply<serde_json::Value> = Reply::ok(
+            RequestId(7),
+            serde_json::json!({"pad": "y".repeat(MAX_FRAME_BYTES)}),
+        );
+        let mut out: Vec<u8> = Vec::new();
+        write_reply(&mut out, &huge).unwrap();
+        assert!(
+            out.len() <= MAX_FRAME_BYTES + 1,
+            "{} bytes written, and the trailing LF is the only byte allowed \
+             past the cap",
+            out.len()
+        );
+        assert_eq!(out.last(), Some(&b'\n'));
+        let back: serde_json::Value = serde_json::from_slice(&out[..out.len() - 1]).unwrap();
+        assert_eq!(back["id"], 7, "the same id: this is an answer, not a drop");
+        assert_eq!(back["err"]["code"], "internal");
+        assert!(back.get("ok").is_none());
+    }
+
+    /// A provider error body is evidence and rides verbatim -- but verbatim
+    /// is not unbounded. A 503 with a megabyte of HTML must not make the
+    /// reply unrepresentable.
+    #[test]
+    fn a_provider_error_body_cannot_overflow_a_frame() {
+        let root = tmp_root("frame-error-body");
+        write_at(&root, "corpus/run0/now", "1767225600");
+        write_at(
+            &root,
+            &format!("corpus/run0/address_{ADDR}.status"),
+            &format!("503\n{}", "x".repeat(1_100_000)),
+        );
+        let config = wallets_json(
+            &root,
+            serde_json::json!([{"resource_id": "w", "addresses": [ADDR]}]),
+        );
+        let adapter = adapter_with(&config, &root.join("corpus"), 0, &root.join("state"));
+
+        let reply = adapter
+            .handle(&request(
+                OP_BALANCES_READ,
+                serde_json::json!({"resource_ids": ["w"]}),
+            ))
+            .unwrap();
+        let bytes = frame_bytes(&reply);
+        assert!(
+            bytes <= sumer_wire::MAX_FRAME_BYTES,
+            "{bytes} bytes on the wire, over MAX_FRAME_BYTES ({})",
+            sumer_wire::MAX_FRAME_BYTES
+        );
+        let ok = ok_of(reply);
+        assert_eq!(ok["statuses"][0]["outcome"], "unavailable");
+        let body = ok["statuses"][0]["provider_detail"]["raw"]["body"]
+            .as_str()
+            .unwrap();
+        assert!(
+            body.starts_with('x') && body.ends_with("[truncated: 1100000 bytes]"),
+            "a capped body says so, rather than silently pretending it is verbatim: \
+             {body:?}"
+        );
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// `block_hash` is a provider scalar with no bounded length, and it
+    /// rides in `provider_extra`. spec/observation.md 6 step 1 is exactly
+    /// the mechanism for it.
+    #[test]
+    fn a_giant_block_hash_is_truncated_rather_than_fatal() {
+        let root = tmp_root("frame-block-hash");
+        let txid = "a".repeat(64);
+        write_at(&root, "corpus/run0/now", "1767225600");
+        write_at(
+            &root,
+            &format!("corpus/run0/address_{ADDR}_txs_chain.json"),
+            &serde_json::json!([{
+                "txid": txid,
+                "fee": 100,
+                "status": {
+                    "confirmed": true, "block_height": 800_000,
+                    "block_hash": "0".repeat(1_100_000), "block_time": 1_600_000_000i64
+                },
+                "vin": [{"prevout": {"scriptpubkey_address": "bc1qthem0000", "value": 1_000}}],
+                "vout": [{"scriptpubkey_address": ADDR, "value": 900}],
+            }])
+            .to_string(),
+        );
+        write_at(
+            &root,
+            &format!("corpus/run0/address_{ADDR}_txs_mempool.json"),
+            "[]",
+        );
+        let config = wallets_json(
+            &root,
+            serde_json::json!([{"resource_id": "w", "addresses": [ADDR]}]),
+        );
+        let adapter = adapter_with(&config, &root.join("corpus"), 0, &root.join("state"));
+
+        let reply = adapter
+            .handle(&request(
+                OP_HISTORY_READ,
+                serde_json::json!({"resources": [{"resource_id": "w"}]}),
+            ))
+            .unwrap();
+        let bytes = frame_bytes(&reply);
+        assert!(
+            bytes <= sumer_wire::MAX_FRAME_BYTES,
+            "{bytes} bytes on the wire, over MAX_FRAME_BYTES ({})",
+            sumer_wire::MAX_FRAME_BYTES
+        );
+        let ok = ok_of(reply);
+        let obs = &ok["observations"][0];
+        assert_eq!(obs["amount"]["amount"], "900", "the record survives");
+        assert_eq!(obs["provider_extra"]["_truncated"], true);
+        assert_eq!(obs["provenance"]["completeness"], "partial");
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// Balances read on day 1, history on day 2, balance fetch fails on
+    /// day 3. The cached AMOUNTS are day 1's, so day 1 is the only honest
+    /// `as_of`: a history read observed no balance and may not restamp one.
+    #[test]
+    fn history_never_restamps_the_balances_it_did_not_fetch() {
+        let root = tmp_root("freshness-split");
+        let txid = "e".repeat(64);
+        let listing = serde_json::json!([{
+            "txid": txid,
+            "fee": 100,
+            "status": {
+                "confirmed": true, "block_height": 800_000,
+                "block_hash": "0".repeat(64), "block_time": 1_600_000_000i64
+            },
+            "vin": [{"prevout": {"scriptpubkey_address": "bc1qthem0000", "value": 1_000}}],
+            "vout": [{"scriptpubkey_address": ADDR, "value": 900}],
+        }])
+        .to_string();
+        let stats = serde_json::json!({
+            "address": ADDR,
+            "chain_stats": {"funded_txo_sum": 900, "spent_txo_sum": 0, "tx_count": 1},
+            "mempool_stats": {"funded_txo_sum": 0, "spent_txo_sum": 0, "tx_count": 0},
+        })
+        .to_string();
+
+        // Day 1: balances answer.
+        write_at(&root, "corpus/run0/now", "1767225600");
+        write_at(&root, &format!("corpus/run0/address_{ADDR}.json"), &stats);
+        // Day 2: history answers. Nothing here observes a balance.
+        write_at(&root, "corpus/run1/now", "1767312000");
+        write_at(
+            &root,
+            &format!("corpus/run1/address_{ADDR}_txs_chain.json"),
+            &listing,
+        );
+        write_at(
+            &root,
+            &format!("corpus/run1/address_{ADDR}_txs_mempool.json"),
+            "[]",
+        );
+        // Day 3: the balance fetch fails.
+        write_at(&root, "corpus/run2/now", "1767398400");
+        write_at(
+            &root,
+            &format!("corpus/run2/address_{ADDR}.status"),
+            "503\nupstream is on fire",
+        );
+
+        let config = wallets_json(
+            &root,
+            serde_json::json!([{"resource_id": "w", "addresses": [ADDR]}]),
+        );
+        let corpus = root.join("corpus");
+        let state = root.join("state");
+
+        let day1 = ok_of(
+            adapter_with(&config, &corpus, 0, &state)
+                .handle(&request(
+                    OP_BALANCES_READ,
+                    serde_json::json!({"resource_ids": ["w"]}),
+                ))
+                .unwrap(),
+        );
+        assert_eq!(day1["observations"][0]["amount"]["amount"], "900");
+
+        let day2 = ok_of(
+            adapter_with(&config, &corpus, 1, &state)
+                .handle(&request(
+                    OP_HISTORY_READ,
+                    serde_json::json!({"resources": [{"resource_id": "w"}]}),
+                ))
+                .unwrap(),
+        );
+        assert_eq!(day2["observations"].as_array().unwrap().len(), 1);
+
+        let day3 = ok_of(
+            adapter_with(&config, &corpus, 2, &state)
+                .handle(&request(
+                    OP_BALANCES_READ,
+                    serde_json::json!({"resource_ids": ["w"]}),
+                ))
+                .unwrap(),
+        );
+        assert_eq!(
+            day3["observations"][0]["amount"]["amount"], "900",
+            "day 1's amount, preserved"
+        );
+        assert_eq!(
+            day3["statuses"][0]["outcome"]["stale"]["as_of"], "2026-01-01T00:00:00Z",
+            "day 1's amount must carry day 1's timestamp: a history read observed \
+             no balance, and restamping one is a false freshness claim about money"
+        );
         std::fs::remove_dir_all(&root).unwrap();
     }
 

@@ -20,6 +20,26 @@
 //! the answers and the relationships between them. The amounts are pinned
 //! by `map.rs`'s unit tests and by the replayed corpora, against JSON whose
 //! checksums are recorded.
+//!
+//! # Proving this check has teeth
+//!
+//! Every assertion here runs against the network, so the mutation battery
+//! (`tests/mutations.rs`, which drives recorded fixtures) cannot reach it.
+//! `SUMER_LIVE_WRAPPER` is what replaces it: it puts one of the battery's
+//! man-in-the-middle wrappers (`conformance/mutations/adapters/`) in front
+//! of the real adapter, so a break can be performed on the live check the
+//! same way it is performed on a fixture.
+//!
+//! ```text
+//! SUMER_LIVE=1 \
+//! SUMER_LIVE_WRAPPER=conformance/mutations/adapters/btc_resumed_pages_emptied.py \
+//!   cargo test -p sumer-conformance --test live_bitcoin -- --ignored --nocapture
+//! ```
+//!
+//! The nightly leaves it unset. It exists because a check nobody has ever
+//! seen go red for the right reason is a check nobody knows the shape of --
+//! and the resume bracket below was exactly that: it passed against an
+//! adapter whose every resumed page came back empty.
 
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
@@ -81,6 +101,60 @@ fn outcome_is_allowed(outcome: &ReadOutcome) -> bool {
     )
 }
 
+/// One history read, followed to its terminal page.
+#[derive(Default)]
+struct Drained {
+    observations: Vec<Observation>,
+    /// The cursors the adapter handed out along the way, in order.
+    cursors: Vec<String>,
+}
+
+/// Reads history from `from` to EXHAUSTION -- following every `next` until
+/// the adapter answers with a terminal page -- checking each page's status
+/// on the way. Both the uninterrupted read and the resumed one go through
+/// here, so "resuming" means the same thing as "reading": drain it, or the
+/// answer is not an answer.
+///
+/// `None` means the provider rate-limited us and the caller must SKIP.
+async fn drain(handle: &AdapterHandle, from: Option<PageRequest>) -> Option<Drained> {
+    let mut out = Drained::default();
+    let mut page = from;
+    loop {
+        let reply = handle
+            .history_read(vec![ResourceQuery {
+                resource_id: RESOURCE.to_owned(),
+                page: page.clone(),
+            }])
+            .await
+            .expect("history.read");
+        assert_eq!(reply.statuses.len(), 1);
+        let status = &reply.statuses[0];
+        assert_eq!(status.resource_id, RESOURCE);
+        assert!(outcome_is_allowed(&status.outcome), "{:?}", status.outcome);
+        if let ReadOutcome::RateLimited { retry_after_ms } = status.outcome {
+            eprintln!("SKIP: {SOURCE} rate-limited us (retry after {retry_after_ms}ms)");
+            return None;
+        }
+        assert!(
+            matches!(status.outcome, ReadOutcome::Fetched { .. }),
+            "history.read: {:?} -- provider_detail: {:?}",
+            status.outcome,
+            status.provider_detail
+        );
+        let next = status.page.as_ref().and_then(|p| p.next.clone());
+        out.observations.extend(reply.observations);
+        match next {
+            Some(PageRequest::Cursor { cursor }) => {
+                out.cursors.push(cursor.clone());
+                page = Some(PageRequest::Cursor { cursor });
+            }
+            Some(other) => panic!("this adapter serves cursor pages only, got {other:?}"),
+            None => return Some(out),
+        }
+        assert!(out.cursors.len() < 64, "history.read never drained");
+    }
+}
+
 #[tokio::test]
 #[ignore = "live: talks to a public Esplora deployment; nightly only"]
 async fn the_live_invariants_hold() {
@@ -104,18 +178,25 @@ async fn the_live_invariants_hold() {
     // No --state-dir on purpose: this check must not leave state behind for
     // the next night's run to be quietly influenced by, and every tombstone
     // it could produce would be one it had no way to verify.
-    let handle = AdapterHandle::spawn(
-        vec![
-            binary.to_string_lossy().into_owned(),
-            "--wallets".to_owned(),
-            wallets.to_string_lossy().into_owned(),
-            "--source".to_owned(),
-            SOURCE.to_owned(),
-        ],
-        [],
-    )
-    .await
-    .expect("the adapter handshakes");
+    //
+    // `SUMER_LIVE_WRAPPER`, when set, puts one of the mutation battery's
+    // man-in-the-middle wrappers in front of the adapter (see the module
+    // docs). Unset everywhere except when someone is deliberately breaking
+    // the adapter to watch this check catch it.
+    let mut argv: Vec<String> = match std::env::var("SUMER_LIVE_WRAPPER") {
+        Ok(wrapper) => vec!["python3".to_owned(), wrapper],
+        Err(_) => Vec::new(),
+    };
+    argv.extend([
+        binary.to_string_lossy().into_owned(),
+        "--wallets".to_owned(),
+        wallets.to_string_lossy().into_owned(),
+        "--source".to_owned(),
+        SOURCE.to_owned(),
+    ]);
+    let handle = AdapterHandle::spawn(argv, [])
+        .await
+        .expect("the adapter handshakes");
 
     // 1. The handshake.
     let hello = handle.hello();
@@ -191,43 +272,10 @@ async fn the_live_invariants_hold() {
     }
 
     // 4. History, paginated to exhaustion, on the same connection.
-    let mut observations: Vec<Observation> = Vec::new();
-    let mut cursors: Vec<String> = Vec::new();
-    let mut page: Option<PageRequest> = None;
-    loop {
-        let reply = handle
-            .history_read(vec![ResourceQuery {
-                resource_id: RESOURCE.to_owned(),
-                page: page.clone(),
-            }])
-            .await
-            .expect("history.read");
-        assert_eq!(reply.statuses.len(), 1);
-        let status = &reply.statuses[0];
-        assert_eq!(status.resource_id, RESOURCE);
-        assert!(outcome_is_allowed(&status.outcome), "{:?}", status.outcome);
-        if let ReadOutcome::RateLimited { retry_after_ms } = status.outcome {
-            eprintln!("SKIP: {SOURCE} rate-limited us (retry after {retry_after_ms}ms)");
-            return;
-        }
-        assert!(
-            matches!(status.outcome, ReadOutcome::Fetched { .. }),
-            "history.read: {:?} -- provider_detail: {:?}",
-            status.outcome,
-            status.provider_detail
-        );
-        observations.extend(reply.observations);
-        let next = status.page.as_ref().and_then(|p| p.next.clone());
-        match next {
-            Some(PageRequest::Cursor { cursor }) => {
-                cursors.push(cursor.clone());
-                page = Some(PageRequest::Cursor { cursor });
-            }
-            Some(other) => panic!("this adapter serves cursor pages only, got {other:?}"),
-            None => break,
-        }
-        assert!(cursors.len() < 64, "history.read never drained");
-    }
+    let Some(first) = drain(&handle, None).await else {
+        return;
+    };
+    let (observations, cursors) = (first.observations, first.cursors);
 
     // 5. THE FLOOR. Everything after this passes on an empty answer.
     let confirmed: Vec<&Observation> = observations
@@ -298,7 +346,19 @@ async fn the_live_invariants_hold() {
     );
 
     // 9. The resume bracket: read again from a cursor in the middle of the
-    // confirmed section, and nothing at or below it may come back.
+    // confirmed section. TWO things are owed, and only together do they
+    // mean anything:
+    //
+    //   (a) nothing at or below the cursor comes back, and
+    //   (b) everything above it DOES.
+    //
+    // (a) alone is satisfied by an adapter that answers a resume with an
+    // empty, successfully-fetched terminal page -- total data loss, dressed
+    // as a clean read, and it passed this check for as long as (a) was all
+    // there was. An assertion about the observations a reply happened to
+    // contain cannot see the reply that contains none; the history a resume
+    // OWES has to be named independently, and it is: the uninterrupted read
+    // above already established it.
     //
     // The cursor is built here rather than taken from a reply's `next`,
     // because this wallet drains in one page and so hands out no `next` at
@@ -321,15 +381,43 @@ async fn the_live_invariants_hold() {
         .collect();
     let middle = confirmed[confirmed.len() / 2];
     let (height, txid) = confirmed_key(middle).expect("a confirmed observation has both");
-    let resumed = handle
-        .history_read(vec![ResourceQuery {
-            resource_id: RESOURCE.to_owned(),
-            page: Some(PageRequest::Cursor {
-                cursor: format!("{height}:{txid}"),
-            }),
-        }])
-        .await
-        .expect("history.read (resumed)");
+    let mark = (height, txid.clone());
+
+    // What the resume owes, from the read that already happened: every
+    // confirmed observation strictly above the cursor. Drift between the
+    // two reads can only ADD to this set -- a drained crawl drops its
+    // snapshot, so the resume takes a fresh one, and confirmed Bitcoin
+    // history does not shrink. So this is a floor on the resume, never an
+    // equality, and a transaction arriving between the two reads cannot
+    // make it fail. The one thing that could: a reorg at the tip, in the
+    // seconds between the two reads, of a block carrying a brand-new
+    // payment to this address. Section 9a below has carried exactly that
+    // exposure since it was written (a re-mined transaction would land
+    // below the cursor) and this is the same bet, stated rather than
+    // engineered around.
+    let owed: BTreeSet<String> = confirmed
+        .iter()
+        .filter(|o| confirmed_key(o).is_some_and(|key| key > mark))
+        .map(|o| o.local_id.clone())
+        .collect();
+    assert!(
+        !owed.is_empty(),
+        "the cursor was placed above every confirmed transaction, so nothing is owed and the \
+         resume below would prove nothing"
+    );
+
+    let Some(resumed) = drain(
+        &handle,
+        Some(PageRequest::Cursor {
+            cursor: format!("{height}:{txid}"),
+        }),
+    )
+    .await
+    else {
+        return;
+    };
+
+    // 9a. Nothing at or below the cursor, exemption aside.
     for o in &resumed.observations {
         let exempt = o.posting == Posting::Pending
             || o.state == ObservationState::Tombstoned
@@ -339,13 +427,40 @@ async fn the_live_invariants_hold() {
         }
         let key = confirmed_key(o).unwrap_or_else(|| panic!("{}: no height/txid", o.local_id));
         assert!(
-            key > (height, txid.clone()),
+            key > mark,
             "{} came back at {key:?}, at or below the cursor ({height}, {txid}), and it is not \
              exempt: it is neither pending nor tombstoned, and it was never reported pending on \
              this connection",
             o.local_id
         );
     }
+
+    // 9b. And everything above it comes back, live, at the same terminal
+    // state the first read reached. `active` + `posted` is not decoration
+    // here: it is what makes "delivered" mean delivered. Every clause of
+    // the exemption above is an escape hatch a shortcut could hide behind
+    // -- a resume that answered `tombstoned` for the whole wallet would
+    // satisfy 9a completely -- and this run passes no `--state-dir`, so
+    // this adapter cannot emit a tombstone at all (`adapters/bitcoin/
+    // README.md`: without one, every sync is a first run and no tombstone
+    // is ever emitted). A conforming adapter therefore returns every one of
+    // these exactly as it returned them a moment ago.
+    let delivered: BTreeSet<String> = resumed
+        .observations
+        .iter()
+        .filter(|o| o.state == ObservationState::Active && o.posting == Posting::Posted)
+        .map(|o| o.local_id.clone())
+        .collect();
+    let missing: Vec<&String> = owed.difference(&delivered).collect();
+    assert!(
+        missing.is_empty(),
+        "resuming at ({height}, {txid}) dropped {} of the {} confirmed transactions the \
+         uninterrupted read placed above it: {missing:?}. The resumed read drained to a terminal \
+         page and reported success, so this is not a truncated answer -- it is history the host \
+         asked for, was told it had received, and will never ask for again",
+        missing.len(),
+        owed.len(),
+    );
 
     // 10. status.read: the only reply that may carry the two clocks and
     // `history_start` at all (`spec/observation.md` §7), which is why the
@@ -363,6 +478,20 @@ async fn the_live_invariants_hold() {
     assert_eq!(status.resource_id, RESOURCE);
     assert!(outcome_is_allowed(&status.outcome), "{:?}", status.outcome);
     assert!(!matches!(status.outcome, ReadOutcome::Stale { .. }));
+    if let ReadOutcome::RateLimited { retry_after_ms } = status.outcome {
+        eprintln!("SKIP: {SOURCE} rate-limited us (retry after {retry_after_ms}ms)");
+        return;
+    }
+    // The same bar the two reads above are held to. Without it every
+    // assertion in this section is about a clock that is absent because
+    // NOTHING WAS READ: `not_fetched` carries no clocks either, and it is
+    // what an adapter that answers this op by declining would say.
+    assert!(
+        matches!(status.outcome, ReadOutcome::Fetched { .. }),
+        "status.read: {:?} -- provider_detail: {:?}",
+        status.outcome,
+        status.provider_detail
+    );
     assert!(
         status.credential_expires_at.is_none()
             && status.strong_auth_expires_at.is_none()

@@ -5,7 +5,7 @@
 //! *completed* sync established: the wallet's balances, and every
 //! transaction it knew about with the height it was at (or the mempool).
 //!
-//! Three rules this module exists to enforce:
+//! Four rules this module exists to enforce:
 //!
 //! 1. **A missing, unreadable, unparseable, version-mismatched or
 //!    hash-mismatched file is a FIRST RUN.** Never a partial parse, never
@@ -18,32 +18,57 @@
 //! 2. **Writes are atomic** (temp file + rename). A torn file would be
 //!    unparseable, which rule 1 turns into a first run rather than a
 //!    corrupt baseline.
-//! 3. **Concurrent writers are last-writer-wins, deliberately.** Two
-//!    adapter processes syncing the same wallet can lose one another's
-//!    update. Under the positive-evidence rule that degrades to a MISSED
-//!    tombstone, caught on the next sync -- never an invented one. Locking
-//!    would buy a stronger guarantee than the failure mode needs.
+//! 3. **Concurrent writers merge; they never overwrite wholesale.** Two
+//!    adapter processes syncing the same wallet used to be
+//!    last-writer-wins, on the theory that a lost update degrades to a
+//!    missed tombstone. It does not. B records a transaction that arrived
+//!    after A's crawl began; A then writes its own snapshot, which does not
+//!    contain it; the txid is now in nobody's baseline, so nothing ever
+//!    probes it and no tombstone is ever emitted for it. That loss is
+//!    PERMANENT, and it is the one failure mode the positive-evidence rule
+//!    cannot absorb. So a write keeps every txid on disk that it did not
+//!    itself prove gone, and the read-modify-write runs under an advisory
+//!    lock on `<resource_id>.lock` -- held for a file read and a rename,
+//!    never across a network fetch, and released by the kernel if the
+//!    process dies, so there is no lock to go stale.
+//! 4. **Balances and history are stamped separately.** A history read
+//!    observes no balance, so it may not restamp one: a `stale { as_of }`
+//!    answer carries the instant the figure it is reporting was actually
+//!    observed, never the instant something else was.
 
 use crate::map::{SeenTx, SeenTxs};
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::io;
 use std::path::{Path, PathBuf};
 use sumer_wire::Rfc3339;
 
 /// Bumped whenever the on-disk shape changes. An older or newer number is
 /// a first run, not a migration.
-const SCHEMA: u32 = 1;
+///
+/// 2: `as_of` split into `balances.as_of` and `history.as_of`. A schema-1
+/// file has one timestamp covering both, and there is no way to tell which
+/// read set it, so it is a first run rather than a guess.
+const SCHEMA: u32 = 2;
 
 /// What the previous completed sync left behind.
+///
+/// **Two independently-stamped halves.** `balances_as_of` is when the
+/// balances were observed and `history_as_of` is when the transaction
+/// baseline was; nothing but a balance read moves the first and nothing but
+/// a history read moves the second. They used to be one field, which meant
+/// a history read restamped balances it never fetched -- and the next
+/// failed balance read then reported yesterday's amounts under today's
+/// date, which is a false freshness claim about money.
 #[derive(Debug, Clone, Default)]
 pub struct Seen {
-    /// When the recorded answer was taken. `None` == first run: there is
-    /// no prior answer, so a failed read reports `unavailable`, not
-    /// `stale`.
-    pub as_of: Option<Rfc3339>,
+    /// `None` == no balance has ever been recorded: a failed read reports
+    /// `unavailable`, not `stale`.
+    pub balances_as_of: Option<Rfc3339>,
     pub confirmed: Option<i128>,
     pub unconfirmed: Option<i128>,
+    /// `None` == no completed crawl: no tombstones, and no `stale` answer.
+    pub history_as_of: Option<Rfc3339>,
     pub txs: SeenTxs,
 }
 
@@ -55,22 +80,31 @@ struct SeenFile {
     schema: u32,
     local_id_derivation: String,
     address_set_sha256: String,
-    as_of: String,
     #[serde(default)]
     balances: BalancesFile,
     #[serde(default)]
-    txs: BTreeMap<String, SeenTxFile>,
+    history: HistoryFile,
 }
 
 #[derive(Serialize, Deserialize, Default)]
 struct BalancesFile {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    as_of: Option<String>,
     #[serde(default)]
     confirmed: Option<String>,
     #[serde(default)]
     unconfirmed: Option<String>,
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Serialize, Deserialize, Default)]
+struct HistoryFile {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    as_of: Option<String>,
+    #[serde(default)]
+    txs: BTreeMap<String, SeenTxFile>,
+}
+
+#[derive(Serialize, Deserialize, Clone)]
 struct SeenTxFile {
     /// Absent == the transaction was in the mempool.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -116,108 +150,50 @@ impl Store {
         let Some(path) = self.path(resource_id) else {
             return Seen::default();
         };
-        let first_run = |why: &str| -> Seen {
-            eprintln!(
-                "sumer-bitcoin-adapter: {}: {why}; treating this as a first run \
-                 (zero tombstones)",
-                path.display()
-            );
-            Seen::default()
+        let Some(file) = read_file(&path, address_hash) else {
+            return Seen::default();
         };
-        let raw = match std::fs::read_to_string(&path) {
-            Ok(raw) => raw,
-            // Absent is the ordinary first run and is not worth a line of
-            // stderr on every fresh install.
-            Err(e) if e.kind() == io::ErrorKind::NotFound => return Seen::default(),
-            Err(e) => return first_run(&format!("unreadable ({e})")),
-        };
-        let file: SeenFile = match serde_json::from_str(&raw) {
-            Ok(f) => f,
-            Err(e) => return first_run(&format!("unparseable ({e})")),
-        };
-        if file.schema != SCHEMA {
-            return first_run(&format!("schema {} is not {SCHEMA}", file.schema));
-        }
-        if file.local_id_derivation != crate::map::LOCAL_ID_DERIVATION {
-            return first_run(&format!(
-                "local_id_derivation {:?} is not {:?}",
-                file.local_id_derivation,
-                crate::map::LOCAL_ID_DERIVATION
-            ));
-        }
-        if file.address_set_sha256 != address_hash {
-            // ADR 0004: the address set changed. For tombstone purposes
-            // this is a different wallet and a first run. It ALSO means a
-            // host-held cursor is stale -- adding an address puts history
-            // below that cursor, which `exact` forbids re-emitting and
-            // this adapter has no channel to invalidate. PR 4's cursor
-            // persistence must invalidate on this hash.
-            return first_run("the address set changed");
-        }
-        let Ok(as_of) = Rfc3339::new(file.as_of.clone()) else {
-            return first_run(&format!("as_of {:?} is not RFC 3339", file.as_of));
-        };
-
-        let mut txs = SeenTxs::new();
-        for (txid, entry) in file.txs {
-            let Ok(delta) = entry.delta.parse::<i128>() else {
-                return first_run(&format!(
-                    "tx {txid}: delta {:?} is not an integer",
-                    entry.delta
-                ));
-            };
-            txs.insert(
-                txid,
-                SeenTx {
-                    height: entry.height,
-                    delta,
-                },
-            );
-        }
-        let parse_balance = |v: &Option<String>| -> Result<Option<i128>, ()> {
-            match v {
-                None => Ok(None),
-                Some(s) => s.parse::<i128>().map(Some).map_err(|_| ()),
-            }
-        };
-        let (Ok(confirmed), Ok(unconfirmed)) = (
-            parse_balance(&file.balances.confirmed),
-            parse_balance(&file.balances.unconfirmed),
-        ) else {
-            return first_run("a recorded balance is not an integer");
-        };
-
-        Seen {
-            as_of: Some(as_of),
-            confirmed,
-            unconfirmed,
-            txs,
-        }
+        decode(&path, file).unwrap_or_default()
     }
 
-    /// Writes one resource's state, atomically. A no-op without a
-    /// `--state-dir`.
-    pub fn save(
+    /// Records the balances a balance read observed, and NOTHING else: the
+    /// transaction baseline and its own timestamp are left exactly as they
+    /// are on disk.
+    pub fn save_balances(
         &self,
         resource_id: &str,
         address_hash: &str,
         as_of: &Rfc3339,
-        seen: &Seen,
+        confirmed: Option<i128>,
+        unconfirmed: Option<i128>,
     ) -> io::Result<()> {
-        let (Some(dir), Some(path)) = (self.dir.as_ref(), self.path(resource_id)) else {
-            return Ok(());
-        };
-        let file = SeenFile {
-            schema: SCHEMA,
-            local_id_derivation: crate::map::LOCAL_ID_DERIVATION.to_owned(),
-            address_set_sha256: address_hash.to_owned(),
-            as_of: as_of.as_str().to_owned(),
-            balances: BalancesFile {
-                confirmed: seen.confirmed.map(|v| v.to_string()),
-                unconfirmed: seen.unconfirmed.map(|v| v.to_string()),
-            },
-            txs: seen
-                .txs
+        self.update(resource_id, address_hash, |file| {
+            file.balances = BalancesFile {
+                as_of: Some(as_of.as_str().to_owned()),
+                confirmed: confirmed.map(|v| v.to_string()),
+                unconfirmed: unconfirmed.map(|v| v.to_string()),
+            };
+        })
+    }
+
+    /// Records the transaction baseline a completed crawl established, and
+    /// NOTHING else -- in particular not the balances' timestamp, which
+    /// this read did not observe.
+    ///
+    /// `tombstoned` is what THIS crawl proved gone. Everything else already
+    /// on disk survives: another process may have recorded a transaction
+    /// this crawl started too early to see, and dropping it would leave the
+    /// txid in nobody's baseline, never probed again, permanently.
+    pub fn save_history(
+        &self,
+        resource_id: &str,
+        address_hash: &str,
+        as_of: &Rfc3339,
+        txs: &SeenTxs,
+        tombstoned: &BTreeSet<String>,
+    ) -> io::Result<()> {
+        self.update(resource_id, address_hash, |file| {
+            let mut merged: BTreeMap<String, SeenTxFile> = txs
                 .iter()
                 .map(|(txid, s)| {
                     (
@@ -228,11 +204,180 @@ impl Store {
                         },
                     )
                 })
-                .collect(),
+                .collect();
+            for (txid, entry) in std::mem::take(&mut file.history.txs) {
+                if !merged.contains_key(&txid) && !tombstoned.contains(&txid) {
+                    merged.insert(txid, entry);
+                }
+            }
+            file.history = HistoryFile {
+                as_of: Some(as_of.as_str().to_owned()),
+                txs: merged,
+            };
+        })
+    }
+
+    /// Read, modify one section, write -- under an advisory lock, so two
+    /// processes cannot interleave the read and the write and lose each
+    /// other's half. No network call happens inside it: the lock is held
+    /// for a file read and a rename.
+    fn update(
+        &self,
+        resource_id: &str,
+        address_hash: &str,
+        edit: impl FnOnce(&mut SeenFile),
+    ) -> io::Result<()> {
+        let (Some(dir), Some(path)) = (self.dir.as_ref(), self.path(resource_id)) else {
+            return Ok(());
         };
         std::fs::create_dir_all(dir)?;
+        let _guard = lock(&dir.join(format!("{resource_id}.lock")));
+        let mut file = read_file(&path, address_hash).unwrap_or_else(|| SeenFile {
+            schema: SCHEMA,
+            local_id_derivation: crate::map::LOCAL_ID_DERIVATION.to_owned(),
+            address_set_sha256: address_hash.to_owned(),
+            balances: BalancesFile::default(),
+            history: HistoryFile::default(),
+        });
+        edit(&mut file);
         write_atomic(&path, &serde_json::to_vec_pretty(&file)?)
     }
+}
+
+/// The exclusive advisory lock a read-modify-write runs under. It is held
+/// by the returned open file and released when that is dropped -- or by the
+/// kernel if the process dies, which is why this is a `flock` on a file
+/// rather than a lock file with a pid in it: there is no stale lock that
+/// can wedge a wallet.
+///
+/// A filesystem that cannot take it (some network mounts) gets one line on
+/// stderr and an UNLOCKED read-modify-write. That is deliberate: the merge
+/// is what makes the guarantee, and the lock only narrows the window
+/// between the merge's read and its rename. Refusing to write state at all
+/// would trade a narrow race for no tombstones ever.
+fn lock(path: &Path) -> Option<std::fs::File> {
+    let taken = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(path)
+        .and_then(|file| file.lock().map(|()| file));
+    match taken {
+        Ok(file) => Some(file),
+        Err(e) => {
+            eprintln!(
+                "sumer-bitcoin-adapter: {}: could not lock ({e}); merging state \
+                 without it",
+                path.display()
+            );
+            None
+        }
+    }
+}
+
+/// Reads the file at `path` if it is a state file for THIS wallet, and
+/// `None` -- a first run -- on any doubt at all.
+fn read_file(path: &Path, address_hash: &str) -> Option<SeenFile> {
+    let first_run = |why: &str| -> Option<SeenFile> {
+        eprintln!(
+            "sumer-bitcoin-adapter: {}: {why}; treating this as a first run \
+             (zero tombstones)",
+            path.display()
+        );
+        None
+    };
+    let raw = match std::fs::read_to_string(path) {
+        Ok(raw) => raw,
+        // Absent is the ordinary first run and is not worth a line of
+        // stderr on every fresh install.
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return None,
+        Err(e) => return first_run(&format!("unreadable ({e})")),
+    };
+    let file: SeenFile = match serde_json::from_str(&raw) {
+        Ok(f) => f,
+        Err(e) => return first_run(&format!("unparseable ({e})")),
+    };
+    if file.schema != SCHEMA {
+        return first_run(&format!("schema {} is not {SCHEMA}", file.schema));
+    }
+    if file.local_id_derivation != crate::map::LOCAL_ID_DERIVATION {
+        return first_run(&format!(
+            "local_id_derivation {:?} is not {:?}",
+            file.local_id_derivation,
+            crate::map::LOCAL_ID_DERIVATION
+        ));
+    }
+    if file.address_set_sha256 != address_hash {
+        // ADR 0004: the address set changed. For tombstone purposes
+        // this is a different wallet and a first run. It ALSO means a
+        // host-held cursor is stale -- adding an address puts history
+        // below that cursor, which `exact` forbids re-emitting and
+        // this adapter has no channel to invalidate. PR 4's cursor
+        // persistence must invalidate on this hash.
+        return first_run("the address set changed");
+    }
+    Some(file)
+}
+
+/// The on-disk shape as this adapter uses it. `None` on any unreadable
+/// field: a partially-recovered baseline is what rule 1 forbids.
+fn decode(path: &Path, file: SeenFile) -> Option<Seen> {
+    let first_run = |why: String| -> Option<Seen> {
+        eprintln!(
+            "sumer-bitcoin-adapter: {}: {why}; treating this as a first run \
+             (zero tombstones)",
+            path.display()
+        );
+        None
+    };
+    let stamp = |v: Option<String>| match v {
+        None => Ok(None),
+        Some(s) => Rfc3339::new(s.clone()).map(Some).map_err(|_| s),
+    };
+    let (balances_as_of, history_as_of) =
+        match (stamp(file.balances.as_of), stamp(file.history.as_of)) {
+            (Ok(b), Ok(h)) => (b, h),
+            (Err(bad), _) | (_, Err(bad)) => {
+                return first_run(format!("as_of {bad:?} is not RFC 3339"))
+            }
+        };
+
+    let mut txs = SeenTxs::new();
+    for (txid, entry) in file.history.txs {
+        let Ok(delta) = entry.delta.parse::<i128>() else {
+            return first_run(format!(
+                "tx {txid}: delta {:?} is not an integer",
+                entry.delta
+            ));
+        };
+        txs.insert(
+            txid,
+            SeenTx {
+                height: entry.height,
+                delta,
+            },
+        );
+    }
+    let parse_balance = |v: &Option<String>| -> Result<Option<i128>, ()> {
+        match v {
+            None => Ok(None),
+            Some(s) => s.parse::<i128>().map(Some).map_err(|_| ()),
+        }
+    };
+    let (Ok(confirmed), Ok(unconfirmed)) = (
+        parse_balance(&file.balances.confirmed),
+        parse_balance(&file.balances.unconfirmed),
+    ) else {
+        return first_run("a recorded balance is not an integer".to_owned());
+    };
+
+    Some(Seen {
+        balances_as_of,
+        confirmed,
+        unconfirmed,
+        history_as_of,
+        txs,
+    })
 }
 
 /// Temp file in the same directory, then rename. Same directory matters:
@@ -336,21 +481,19 @@ mod tests {
             emitted,
             vec![("w:".to_owned() + &a, ObservationState::Active, None)]
         );
-        let next = Seen {
-            as_of: Some(as_of.clone()),
-            confirmed: Some(0),
-            unconfirmed: Some(5_000),
-            txs: map::next_seen(
-                &Chain {
-                    txs: &txs,
-                    mempool: &mempool,
-                    gone: &none,
-                },
-                &owned(),
-                &seen0.txs,
-            ),
-        };
-        store.save("w", hash, &as_of, &next).unwrap();
+        let next = map::next_seen(
+            &Chain {
+                txs: &txs,
+                mempool: &mempool,
+                gone: &none,
+            },
+            &owned(),
+            &seen0.txs,
+        );
+        store
+            .save_balances("w", hash, &as_of, Some(0), Some(5_000))
+            .unwrap();
+        store.save_history("w", hash, &as_of, &next, &none).unwrap();
 
         // 2. CONFIRM: the tracked mempool entry is re-emitted at its new
         // state -- as a revision of the same local_id, not a new record.
@@ -365,21 +508,19 @@ mod tests {
             emitted,
             vec![("w:".to_owned() + &a, ObservationState::Active, None)]
         );
-        let next = Seen {
-            as_of: Some(as_of.clone()),
-            confirmed: Some(5_000),
-            unconfirmed: Some(0),
-            txs: map::next_seen(
-                &Chain {
-                    txs: &txs,
-                    mempool: &none,
-                    gone: &none,
-                },
-                &owned(),
-                &seen1.txs,
-            ),
-        };
-        store.save("w", hash, &as_of, &next).unwrap();
+        let next = map::next_seen(
+            &Chain {
+                txs: &txs,
+                mempool: &none,
+                gone: &none,
+            },
+            &owned(),
+            &seen1.txs,
+        );
+        store
+            .save_balances("w", hash, &as_of, Some(5_000), Some(0))
+            .unwrap();
+        store.save_history("w", hash, &as_of, &next, &none).unwrap();
 
         // 3. VANISH: absent from every listing AND a direct probe 404s.
         let seen2 = store.load("w", hash);
@@ -395,23 +536,24 @@ mod tests {
             )],
             "a previously-confirmed transaction proved gone is reorged_out"
         );
-        let next = Seen {
-            txs: map::next_seen(
-                &Chain {
-                    txs: &BTreeMap::new(),
-                    mempool: &none,
-                    gone: &gone,
-                },
-                &owned(),
-                &seen2.txs,
-            ),
-            ..seen2
-        };
+        let next = map::next_seen(
+            &Chain {
+                txs: &BTreeMap::new(),
+                mempool: &none,
+                gone: &gone,
+            },
+            &owned(),
+            &seen2.txs,
+        );
         assert!(
-            next.txs.is_empty(),
+            next.is_empty(),
             "a tombstoned transaction stops being tracked"
         );
-        store.save("w", hash, &as_of, &next).unwrap();
+        store.save_history("w", hash, &as_of, &next, &gone).unwrap();
+        assert!(
+            store.load("w", hash).txs.is_empty(),
+            "and the merge does not bring it back: this write PROVED it gone"
+        );
 
         // 4. REVIVE: re-mined. Tombstone is not terminal.
         let seen3 = store.load("w", hash);
@@ -492,32 +634,48 @@ mod tests {
             "{".to_owned(),
             serde_json::json!({
                 "schema": 99, "local_id_derivation": "btc-txid@1",
-                "address_set_sha256": "h", "as_of": "2026-01-01T00:00:00Z",
-                "txs": {"x": {"delta": "1"}}
+                "address_set_sha256": "h",
+                "history": {"as_of": "2026-01-01T00:00:00Z", "txs": {"x": {"delta": "1"}}}
             })
             .to_string(),
-            serde_json::json!({
-                "schema": 1, "local_id_derivation": "something-else",
-                "address_set_sha256": "h", "as_of": "2026-01-01T00:00:00Z",
-                "txs": {"x": {"delta": "1"}}
-            })
-            .to_string(),
-            serde_json::json!({
-                "schema": 1, "local_id_derivation": "btc-txid@1",
-                "address_set_sha256": "A DIFFERENT WALLET", "as_of": "2026-01-01T00:00:00Z",
-                "txs": {"x": {"delta": "1"}}
-            })
-            .to_string(),
+            // Schema 1: one `as_of` covering both halves, and no way to
+            // tell which read set it.
             serde_json::json!({
                 "schema": 1, "local_id_derivation": "btc-txid@1",
                 "address_set_sha256": "h", "as_of": "2026-01-01T00:00:00Z",
-                "txs": {"x": {"delta": "not a number"}}
+                "txs": {"x": {"delta": "1"}}
+            })
+            .to_string(),
+            serde_json::json!({
+                "schema": 2, "local_id_derivation": "something-else",
+                "address_set_sha256": "h",
+                "history": {"as_of": "2026-01-01T00:00:00Z", "txs": {"x": {"delta": "1"}}}
+            })
+            .to_string(),
+            serde_json::json!({
+                "schema": 2, "local_id_derivation": "btc-txid@1",
+                "address_set_sha256": "A DIFFERENT WALLET",
+                "history": {"as_of": "2026-01-01T00:00:00Z", "txs": {"x": {"delta": "1"}}}
+            })
+            .to_string(),
+            serde_json::json!({
+                "schema": 2, "local_id_derivation": "btc-txid@1",
+                "address_set_sha256": "h",
+                "history": {"as_of": "2026-01-01T00:00:00Z", "txs": {"x": {"delta": "no"}}}
+            })
+            .to_string(),
+            serde_json::json!({
+                "schema": 2, "local_id_derivation": "btc-txid@1",
+                "address_set_sha256": "h",
+                "balances": {"as_of": "the day before yesterday", "confirmed": "1"}
             })
             .to_string(),
         ] {
             std::fs::write(&path, &bad).unwrap();
             let seen = store.load("w", "h");
-            assert!(seen.as_of.is_none(), "first run: {bad}");
+            assert!(seen.history_as_of.is_none(), "first run: {bad}");
+            assert!(seen.balances_as_of.is_none(), "first run: {bad}");
+            assert!(seen.confirmed.is_none(), "no partial parse: {bad}");
             assert!(seen.txs.is_empty(), "no partial parse: {bad}");
         }
         std::fs::remove_dir_all(&dir).unwrap();
@@ -529,24 +687,28 @@ mod tests {
         let store = Store::new(Some(dir.clone()));
         let as_of = Rfc3339::new("2026-09-07T11:22:33Z").unwrap();
         let a = "d".repeat(64);
-        let seen = Seen {
-            as_of: Some(as_of.clone()),
-            confirmed: Some(2_100_000_000_000_000),
-            unconfirmed: Some(-1_234),
-            txs: [(
-                a.clone(),
-                SeenTx {
-                    height: Some(1),
-                    delta: -9,
-                },
-            )]
-            .into_iter()
-            .collect(),
-        };
-        store.save("w", "h", &as_of, &seen).unwrap();
+        let txs: SeenTxs = [(
+            a.clone(),
+            SeenTx {
+                height: Some(1),
+                delta: -9,
+            },
+        )]
+        .into_iter()
+        .collect();
+        store
+            .save_balances("w", "h", &as_of, Some(2_100_000_000_000_000), Some(-1_234))
+            .unwrap();
+        store
+            .save_history("w", "h", &as_of, &txs, &BTreeSet::new())
+            .unwrap();
         let back = store.load("w", "h");
         assert_eq!(
-            back.as_of.map(|t| t.as_str().to_owned()),
+            back.balances_as_of.map(|t| t.as_str().to_owned()),
+            Some("2026-09-07T11:22:33Z".to_owned())
+        );
+        assert_eq!(
+            back.history_as_of.map(|t| t.as_str().to_owned()),
             Some("2026-09-07T11:22:33Z".to_owned())
         );
         assert_eq!(back.confirmed, Some(2_100_000_000_000_000));
@@ -559,11 +721,63 @@ mod tests {
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
+    /// Two adapter processes syncing the same wallet. B records a
+    /// transaction A's crawl predates; A then writes its own snapshot.
+    /// A wholesale overwrite drops B's txid, and since nothing tracks it
+    /// any more, nothing ever probes it: the loss is PERMANENT, not the
+    /// missed-tombstone-caught-next-sync ADR 0004 5 claims.
+    #[test]
+    fn a_concurrent_writer_cannot_erase_a_txid_it_never_saw() {
+        let dir = tmpdir("concurrent");
+        let store = Store::new(Some(dir.clone()));
+        let t1 = Rfc3339::new("2026-09-07T00:00:00Z").unwrap();
+        let t2 = Rfc3339::new("2026-09-07T00:00:05Z").unwrap();
+        let theirs = "f".repeat(64);
+
+        // Process A loaded this baseline, then began a long crawl.
+        assert!(store.load("w", "h").txs.is_empty());
+
+        // Process B finished a sync in the meantime and recorded a
+        // transaction that arrived after A's crawl had started.
+        let b_txs: SeenTxs = [(
+            theirs.clone(),
+            SeenTx {
+                height: None,
+                delta: 900,
+            },
+        )]
+        .into_iter()
+        .collect();
+        store
+            .save_history("w", "h", &t1, &b_txs, &BTreeSet::new())
+            .unwrap();
+
+        // A now writes what ITS crawl saw -- which does not include it.
+        store
+            .save_history("w", "h", &t2, &SeenTxs::new(), &BTreeSet::new())
+            .unwrap();
+
+        assert!(
+            store.load("w", "h").txs.contains_key(&theirs),
+            "a txid another process recorded is gone from the baseline, so no \
+             future sync will ever probe it: that is a permanent loss, not a \
+             missed tombstone"
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
     #[test]
     fn no_state_dir_means_no_state() {
         let store = Store::new(None);
         let as_of = Rfc3339::new("2026-09-07T00:00:00Z").unwrap();
-        store.save("w", "h", &as_of, &Seen::default()).unwrap();
-        assert!(store.load("w", "h").as_of.is_none());
+        store
+            .save_balances("w", "h", &as_of, Some(1), Some(2))
+            .unwrap();
+        store
+            .save_history("w", "h", &as_of, &SeenTxs::new(), &BTreeSet::new())
+            .unwrap();
+        let back = store.load("w", "h");
+        assert!(back.balances_as_of.is_none());
+        assert!(back.history_as_of.is_none());
     }
 }
