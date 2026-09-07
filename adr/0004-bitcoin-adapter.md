@@ -1,6 +1,6 @@
-# ADR 0004 — The watch-only Bitcoin adapter: Esplora, wallet-shaped resources, byte-cut pages, positive-evidence tombstones
+# ADR 0004 — The watch-only Bitcoin adapter: Esplora, wallet-shaped resources, byte-cut pages, and no retraction
 
-- **Status:** accepted (revision 3)
+- **Status:** accepted (revision 4)
 - **Date:** 2026-09-07
 - **Decision by:** Linus, Milestone 1
 
@@ -18,6 +18,14 @@ exactly it is allowed to forget. Three successive fixes to that corner were
 each locally correct and each exposed the next, so it is stated here as a
 decision rather than patched a fourth time. Nothing in decisions 1–5
 changes.
+
+**Revision 4 deletes decision 4, decision 5 and decision 6, and replaces
+them with decision 7: this adapter no longer retracts.** A fourth
+adversarial round found the same defect class again through a new path, and
+the corner is deleted rather than designed a fifth time. Decisions 1, 2 and
+3 are unchanged. The three superseded decisions are kept below, marked
+**Superseded in revision 4**, because what they claimed and why it stopped
+being claimed is the whole argument.
 
 Corrections are marked **Revised** in place, with the claim they replace
 stated rather than deleted.
@@ -38,7 +46,8 @@ dropped from a mempool without anyone being told, an address listing is
 paginated newest-first by the provider, and a wallet is not an account —
 it is a set of scriptPubKeys with no server-side identity at all.
 
-Five decisions had to be made together; revision 3 adds a sixth.
+Five decisions had to be made together; revision 3 added a sixth, and
+revision 4 replaced three of them with a seventh.
 
 ## Decision
 
@@ -47,7 +56,8 @@ Five decisions had to be made together; revision 3 adds a sixth.
 The adapter speaks the **Esplora REST API**, defaulting to
 `https://blockstream.info/api`. One protocol, three deployments, one config
 line: Blockstream, mempool.space's `/api`, or your own `esplora`/`electrs`
-instance. Five endpoints are ever requested, and the `User-Agent` is
+instance. Four endpoints are ever requested (a fifth, `GET /tx/:txid`, was
+the tombstone probe and went with decision 7), and the `User-Agent` is
 `sumer-bitcoin/0.1` — a browser forgery would be dishonest and would not
 change the disclosure that matters.
 
@@ -98,16 +108,24 @@ The cursor is `"<height>:<txid>"`, optionally suffixed `":m:<mempool_txid>"`,
 and `cursor_resumable` is `exact`. The confirmed high-water mark is always
 present, so a cursor persisted mid-mempool still resumes confirmed reads
 correctly. One sync emits two sections: confirmed transactions strictly
-above the mark, ascending by `(height, txid)`; then a by-txid section — the
-tracked mempool set, everything currently unconfirmed, and every tombstone —
-re-emitted **in full every sync**, which is what turns "this pending
-transaction was mined into a block below your cursor" — and "a reorg re-mined
-a confirmed transaction *downwards*, below your cursor" — into a revision of
-the same `local_id` instead of a record that stays pending, or wrong,
-forever. A re-mined transaction never leaves the listings, so no probe runs
-and no tombstone is emitted; the confirmed section suppresses it as at or
-below the cursor. Section 2 is the only section exempt from that rule, so it
-is the only place the revision can arrive from.
+above the mark, ascending by `(height, txid)`; then a by-txid section —
+everything the provider currently reports as unconfirmed — re-emitted **in
+full on every page request**, which is what turns "this pending transaction
+was mined into a block below your cursor" into a revision of the same
+`local_id` instead of a record that stays pending. The confirmed section
+suppresses it as at or below the cursor; section 2 is the only section
+exempt from that rule, so it is the only place the revision can arrive from.
+
+**Revised in revision 4: section 2 carries only the CURRENT mempool.** It
+also carried the tracked mempool set and every height revision remembered
+from the last completed crawl, which made those revisions survive a cursor
+the host had persisted across processes. That memory was the transaction
+baseline decision 7 deletes. The cost is stated as a known limit rather than
+engineered around: a transaction reported `pending` by one crawl and seen
+confirmed at or below the host's cursor by a *later* crawl is not
+re-emitted until a `history.read` with no `page`, which re-emits everything
+at its current state. It is the same family as the address-set/cursor
+defect below, and closes the same way — in PR 4, with persistence.
 
 **Pages are cut at 512 KiB of serialized observations — and never past what
 the REPLY has left — never at a block boundary.** The rejected alternative
@@ -141,6 +159,11 @@ assume a provider scalar is small.
 
 ### 4. A tombstone requires positive evidence
 
+**Superseded in revision 4 — this adapter emits no tombstones at all.**
+What follows is the rule as it stood, kept because decision 7 is an
+argument about it. The one part that survives verbatim is the first bullet:
+any fetch failure anywhere in a sync still suppresses the diff entirely.
+
 **A tombstone requires a direct `GET /tx/:txid` answering 404. Absence from
 a listing is never evidence.** The reason — `reorged_out` versus
 `dropped_from_mempool` — is decided by the state recorded in `seen.json`,
@@ -163,6 +186,12 @@ An invented one is a retraction written into a permanent record of something
 that never happened.
 
 ### 5. Concurrent writers MERGE; they never overwrite wholesale
+
+**Superseded in revision 4.** The merge and the `flock` existed for one
+reason — a txid in nobody's baseline is never probed again — and there is
+no baseline and no probe any more. The balance cache that replaced it is
+written temp-file + rename, unlocked, and a lost update costs one
+`unavailable`.
 
 **Revised.** This decision originally read "last-writer-wins, on purpose",
 on the grounds that under positive evidence a lost update degrades to a
@@ -216,6 +245,10 @@ fiction; a repeated one is noise.
 The torn-file case is unchanged: an unparseable file is a first run.
 
 ### 6. A state write is a FIELD of the reply that earned it
+
+**Superseded in revision 4.** There is nothing left to gate: see decision
+7. Kept here because the four rounds it survived are the evidence for
+deleting it.
 
 **Added in revision 3.**
 
@@ -310,6 +343,104 @@ mid-run all survive the probe verbatim**, and so does a wedged network
 mount that blocks inside `open` itself. It narrows the hole; it does not
 close it.
 
+### 7. This adapter does not report disappearances
+
+**Added in revision 4, and it deletes decisions 4, 5 and 6.**
+
+**The rule.** The adapter reads balances and history and reports what the
+provider says now. It keeps no record of what it saw last time, performs no
+`GET /tx/:txid` probe, and emits no `tombstoned` observation under any
+circumstance. `map.rs` has no tombstone constructor left to call.
+
+**Why, and why now rather than after a fifth design.** The transactional
+boundary between writing a reply and committing local state took four
+adversarial rounds and produced four different defects: the byte budget
+scoped per resource instead of per reply; the commit applied before the
+reply went out; the commit applied after *a* reply rather than after *that*
+one; and finally a cursor-resumed page filtering an omitted tombstone out of
+the crawl's accumulator while the baseline still forgot it forever. Four
+rounds, one corner. The fourth was judged evidence that the design was
+wrong rather than that the refinement was incomplete.
+
+**That corner existed for exactly one reason.** A retraction is the only
+unrecoverable write this adapter makes. Everything else it records is
+re-derived from the provider on the next crawl. Absence is not expressible
+on this wire — there is no "and nothing else exists" frame — and the host
+cannot tell an adapter what it has already seen, so the adapter has to
+remember it, and a lost retraction is lost permanently: nothing probes a
+txid no baseline holds. That single asymmetry is what forced the write to
+be gated on delivery, and the gate is what four rounds failed to get right.
+
+**Remove the retraction and the asymmetry disappears.** With no
+unrecoverable write there is no delivery gate, no `Outcome` carrying
+commits, no omitted-tombstone accumulator, no `flock`, no wholesale-overwrite
+merge, and no startup probe that refuses to run without a usable state
+directory. Every failure mode — a dead process, a failed rename, a refused
+reply, a full disk, a directory deleted mid-run, two adapters racing the
+same file — collapses to *re-derive on the next sync*, which needs no
+transactional reasoning at all.
+
+**What `seen.json` is now.** A balance cache: `schema`,
+`address_set_sha256`, and the `confirmed`/`unconfirmed` figures the last
+successful `balances.read` observed with the instant it observed them. It
+exists so a failed balance read can answer `stale { as_of }` instead of
+`unavailable`. Nothing it holds is unrecoverable, and that is the whole
+point: losing the file, failing to write it, or writing it for a reply the
+host never received all cost the same thing — one `unavailable` where a
+`stale` was possible, until the next successful read. So the write is not
+gated, is not locked, and is not merged. A schema-2 file (which carried the
+transaction baseline) is a first run.
+
+The rules that DO survive from decision 4, because they are about what the
+adapter is allowed to claim rather than about what it remembers:
+
+- **Any fetch failure anywhere in a sync suppresses the diff entirely.** No
+  observations, no `page`, and the resource reports `unavailable`. There are
+  no partial diffs: half a wallet's history reported as if it were the whole
+  of it is a claim with no evidence behind it.
+- **A missing, unreadable, unparseable or hash-mismatched cache is a FIRST
+  RUN.** Never a partial parse. A figure this adapter cannot stand behind,
+  under a date it did not observe, is worse than no figure.
+- **`--source` is bounded at 256 bytes, rejected and not truncated**, and a
+  **repeated `resource_id` is an envelope `invalid_request`**. Both are out
+  of this corner and both stand as revision 3 wrote them.
+
+**What the caller loses, stated plainly.** A transaction dropped from the
+mempool or reorged out of the chain **stays in the host's live set**. The
+host was told it was active; nothing ever tells it otherwise; no later sync
+of this adapter corrects it. Everything else self-corrects on the next
+crawl. This is the one thing that does not, and it is written at the top of
+`adapters/bitcoin/README.md` and in `PRIVACY.md` rather than left to be
+discovered.
+
+**It returns in PR 4, designed once.** Retraction needs durable state that
+survives a process, is written under the host's own transaction rather than
+a file this adapter races itself on, and can express "delivered" as
+something other than "a byte reached a pipe". That is what PR 4's
+persistence is. Retraction lands there or not at all; it does not come back
+as a fifth patch to a file-based baseline.
+
+**The wire's tombstone shape is unaffected and stays proven.**
+`spec/observation.md` §4's tombstone semantics, the host fold, and the
+append-only chain are all exercised by `conformance/cases/reorg_vanish.json`
+against the reference adapter — one `local_id` going
+active → tombstoned → active, with
+`reorg_vanish__tombstone_page_dropped` as the mutant that keeps it honest.
+Nothing about the protocol changed here; one adapter stopped claiming a
+capability it could not implement safely.
+
+**`bitcoin/btc_reorg` and its corpus are deleted, not weakened.** The case
+drove the real adapter over `corpus/reorg/` and declared a `reorged_out`
+tombstone; the adapter cannot produce one, so the case asserts a claim that
+is no longer made. Editing its `expect` to drop the tombstone would be
+weakening a fixture, which this project does not do — so the fixture, the
+corpus, the `btc_reorg__tombstone_page_dropped` mutant and its wrapper go
+together, and the `COVERAGE` row with them. What that corpus proved was
+never a live capability in the first place: its own `RECORDED.md` says
+`run1/` is a synthesized counterfactual and "development scaffolding …
+never evidence of a live connection". It is recoverable from git when PR 4
+restores the capability it was written for.
+
 ## Binding on PR 4: the address-set hash must invalidate the cursor
 
 **Adding an address to a wallet puts pre-cursor history at heights at or
@@ -384,6 +515,23 @@ process boundary as any other.
 - **Truncating an over-long `--source`.** Rejected in revision 3: a
   truncated provider identity is a falsified provenance, which is a worse
   answer than refusing to start.
+- **A fifth design of the commit boundary.** Rejected in revision 4: see
+  decision 7. Four rounds produced four distinct defects in one corner, and
+  the fifth attempt would have been the fourth time the same class was
+  called a bounded refinement.
+- **Keeping the transaction baseline for the by-txid re-emission set
+  only.** Rejected in revision 4. It is not unrecoverable, so it would not
+  have needed a gate — but it keeps `seen.json`'s history section, the
+  merge, the lock and the schema rules around a section that, in this PR,
+  buys exactly one thing: a revision surviving a cursor a host persisted
+  across processes, which is a path this PR already documents as PR 4's
+  (cursors die with the crawl here). Speculative generality, paid for in
+  the file that caused four defects.
+- **Emitting a tombstone from a crawl's own view alone**, with no memory —
+  "it was in an earlier page of this crawl and is not in a later one".
+  Rejected: within one snapshot nothing disappears, so this can only be
+  built from absence across snapshots, which is decision 4 again with a
+  shorter memory.
 
 ## Consequences
 
@@ -400,13 +548,13 @@ process boundary as any other.
   `strong_auth_expires_at` are always absent. A watch-only wallet has no
   credential, no session, and nothing that can be revoked. The live
   invariant check asserts it.
-- **Balances and history are stamped separately in `seen.json`.** A history
-  read observes no balance, so it may not restamp one. They shared one
-  `as_of` until revision 1, which made a failed balance read report the
-  previous day's amounts under the day a *history* read happened — a false
-  freshness claim about money, which is the one claim this project refuses
-  to make. The state file's schema number carries the split, so an old file
-  is a first run rather than a reinterpreted timestamp.
+- **Only balances are stamped in `seen.json`, because only balances are in
+  it.** They shared one `as_of` with the history baseline until revision 1,
+  which made a failed balance read report the previous day's amounts under
+  the day a *history* read happened — a false freshness claim about money,
+  which is the one claim this project refuses to make. Revision 4 removes
+  the other half of the file entirely, so a history read structurally cannot
+  restamp a balance.
 - **A batch too large to answer.** A reply must carry one status entry per
   requested `resource_id`, and no paging mechanism in this protocol can shed
   a status. So a request naming enough resources that their statuses alone
@@ -418,11 +566,18 @@ process boundary as any other.
   name" has no answer to be faithful to; `confirmed` and `unconfirmed` are
   named by us, computed from `chain_stats`/`mempool_stats` funded minus
   spent, never summed, and `unconfirmed` may legitimately be negative.
-- **A retraction can still be lost, in one `rename`-wide window.** See
-  decision 6. The startup probe narrows it; ENOSPC, quota and a state
-  directory deleted mid-run go straight through it.
-- **The riskiest thing left is not mechanical.** Positive evidence means the
-  adapter can no longer invent a vanish, so the remaining exposure is a
+- **No disappearance is ever reported.** See decision 7. A transaction
+  dropped from the mempool or reorged out stays in the host's live set until
+  PR 4.
+- **A revision can be missed by a host that persists a cursor across
+  processes.** See decision 3 as revised. Repaired by any `history.read`
+  with no `page`.
+- **`history.read` never answers `stale`.** Nothing about a history is
+  cached, so a failed history read has no prior answer to be stale about:
+  it is `unavailable`. Balances are unaffected — that is what the cache is
+  for.
+- **The riskiest thing left is not mechanical.** The adapter cannot report a
+  vanish at all, so the remaining exposure is a
   **wrong mapping baked identically into `map.rs` and into the hand-written
   `expect` blocks** of the replay cases — which every automated gate passes,
   including the mutation battery, whose Bitcoin mutants rewrite the

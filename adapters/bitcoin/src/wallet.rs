@@ -32,8 +32,8 @@ pub struct Wallet {
     /// balance, since Esplora's counters are per scriptPubKey.
     pub addresses: Vec<String>,
     pub owned: BTreeSet<String>,
-    /// SHA-256 of the address set. A change means a different wallet as
-    /// far as `seen.json` is concerned.
+    /// SHA-256 of the address set. A change means the cached balances on
+    /// disk are a different address set's figures.
     pub address_hash: String,
 }
 
@@ -123,21 +123,15 @@ pub fn load(path: &Path) -> Result<Vec<Wallet>, String> {
 pub struct ChainData {
     pub txs: BTreeMap<String, Tx>,
     pub mempool: BTreeSet<String>,
-    pub gone: BTreeSet<String>,
 }
 
-/// Fetches one wallet's whole current state, plus positive evidence about
-/// anything `seen` remembers that is no longer in a listing.
+/// Fetches one wallet's whole current state: what the provider says NOW.
 ///
 /// **Any failure anywhere returns `Err` and the caller emits no
-/// observations at all.** There is no partial `ChainData`: a diff computed
-/// from a half-read chain would tombstone transactions that were merely
-/// unreachable, and an append-only chain never forgets a tombstone.
-pub fn sync(
-    source: &Source,
-    wallet: &Wallet,
-    seen: &BTreeMap<String, crate::map::SeenTx>,
-) -> Result<ChainData, FetchError> {
+/// observations at all.** There is no partial `ChainData`: half a wallet's
+/// history reported as if it were the whole of it is a claim this adapter
+/// has no evidence for.
+pub fn sync(source: &Source, wallet: &Wallet) -> Result<ChainData, FetchError> {
     let mut txs: BTreeMap<String, Tx> = BTreeMap::new();
     for address in &wallet.addresses {
         let confirmed = source.address_chain(address)?;
@@ -168,19 +162,7 @@ pub fn sync(
         .map(|tx| tx.txid.clone())
         .collect();
 
-    // POSITIVE EVIDENCE ONLY. A transaction missing from every listing is
-    // not gone until `GET /tx/:txid` says so, in as many words.
-    let mut gone = BTreeSet::new();
-    for txid in seen.keys() {
-        if txs.contains_key(txid) || !is_txid(txid) {
-            continue;
-        }
-        if !source.tx_exists(txid)? {
-            gone.insert(txid.clone());
-        }
-    }
-
-    Ok(ChainData { txs, mempool, gone })
+    Ok(ChainData { txs, mempool })
 }
 
 /// The wallet's two balances: `(confirmed, unconfirmed)`, in satoshis.
@@ -277,8 +259,8 @@ const SHA256_K: [u32; 64] = [
 /// SHA-256, hex-encoded lowercase.
 ///
 /// Hand-written rather than adding a hash dependency for the one use this
-/// crate has: fingerprinting a wallet's address set so `seen.json` can
-/// tell one wallet's state from another's. Pinned against the published
+/// crate has: fingerprinting a wallet's address set so the balance cache
+/// can tell one wallet's figures from another's. Pinned against the published
 /// FIPS 180-4 test vectors below.
 #[must_use]
 pub fn sha256_hex(msg: &[u8]) -> String {

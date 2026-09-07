@@ -7,9 +7,10 @@
 //! **no `script`**, because there is no script to write -- the adapter's
 //! replies come from a provider recording, not from a fixture.
 //!
-//! Two of the three cases are two adapter lifetimes over one `--state-dir`
-//! (write `seen.json`, then meet a changed provider), which the conformance
-//! runner has no notion of: it spawns one argv per execution. That is what
+//! One of the two cases is two adapter lifetimes over one `--state-dir`
+//! (record a balance, then meet a provider that has gone dark), which the
+//! conformance runner has no notion of: it spawns one argv per execution.
+//! That is what
 //! `conformance/cases/bitcoin/two_phase.py` is for -- it makes "the phase-2
 //! adapter, with a state file phase 1 actually wrote" a single command
 //! line, and gives every launch a fresh state directory so the two
@@ -29,7 +30,6 @@ use std::path::{Path, PathBuf};
 const CASES: &[(&str, &str, &str)] = &[
     // (fixture, corpus, runs)
     ("btc_basic", "basic", "0"),
-    ("btc_reorg", "reorg", "0,1"),
     ("btc_fetch_fail", "fetch_fail", "0,1"),
 ];
 
@@ -94,7 +94,7 @@ async fn the_bitcoin_adapter_passes_every_bitcoin_case() {
         binary.is_file(),
         "{} is not built. Run `cargo test --workspace` (or `cargo build -p \
          sumer-bitcoin-adapter`): this gate drives the real adapter, and silently \
-         skipping it would leave three cases unrun.",
+         skipping it would leave two cases unrun.",
         binary.display()
     );
 

@@ -315,9 +315,9 @@ async fn check_the_invariants() -> bool {
     )
     .expect("the wallet file");
 
-    // No --state-dir on purpose: this check must not leave state behind for
-    // the next night's run to be quietly influenced by, and every tombstone
-    // it could produce would be one it had no way to verify.
+    // No --state-dir on purpose: this check must not leave a cached balance
+    // behind for the next night's run to be quietly influenced by. Every
+    // figure it reads has to come off the network.
     //
     // `SUMER_LIVE_WRAPPER`, when set, puts one of the mutation battery's
     // man-in-the-middle wrappers in front of the adapter (see the module
@@ -441,9 +441,9 @@ async fn check_the_invariants() -> bool {
     // the floor's second half is a claim that this transaction is HERE,
     // live and posted, and an id that arrives `tombstoned` or `pending` is
     // an id that arrives saying the opposite. Nothing conforming can trip
-    // this -- block 57043 is 900k blocks deep, and with no `--state-dir`
-    // this adapter emits no tombstone at all -- so the only thing it can
-    // catch is a shortcut, which is the point.
+    // this -- block 57043 is 900k blocks deep, and this adapter emits no
+    // tombstone under any circumstances (ADR 0004 decision 7) -- so the
+    // only thing it can catch is a shortcut, which is the point.
     let oldest = confirmed
         .iter()
         .find(|o| o.local_id == format!("{RESOURCE}:{OLDEST_TXID}"))
@@ -634,12 +634,12 @@ async fn check_the_invariants() -> bool {
     // `posted` is not decoration here: it is what makes "delivered" mean
     // delivered. Every clause of the exemption above is an escape hatch a
     // shortcut could hide behind -- a resume that answered `tombstoned`
-    // for the whole wallet would satisfy 9a completely -- and this run
-    // passes no `--state-dir`, so this adapter cannot emit a tombstone at
-    // all (`adapters/bitcoin/README.md`: without one, every sync is a
-    // first run and no tombstone is ever emitted). A conforming adapter
-    // therefore returns every one of these exactly as it returned them a
-    // moment ago.
+    // for the whole wallet would satisfy 9a completely -- and this adapter
+    // cannot emit a tombstone at all (ADR 0004 decision 7). The exemption
+    // clauses stay in the checker because they are the contract for any
+    // conforming adapter; this one can only ever trip clause 1. A
+    // conforming adapter therefore returns every one of these exactly as it
+    // returned them a moment ago.
     //
     // "Exactly" has to include the FIGURES, or this section checks
     // identity and state and nothing else: rewrite every resumed amount to

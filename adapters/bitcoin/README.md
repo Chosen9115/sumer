@@ -8,6 +8,37 @@ Read `PRIVACY.md` before pointing this at a public Esplora instance. What
 addresses you query, and from where, is the disclosure that matters here,
 and it is not revocable.
 
+## What this adapter does NOT do: it never reports a disappearance
+
+**This adapter emits no tombstones.** It reads balances and history and
+reports what the provider says now. It does not remember what it saw last
+time in order to announce that something has gone.
+
+What that means for you, concretely: **a transaction dropped from the
+mempool, or reorged out of the chain, stays in the host's live set.** The
+host was told the transaction was there, nothing ever tells it otherwise,
+and no later sync of this adapter corrects it. Everything else is
+self-correcting — a re-mined transaction, a changed height, a new
+transaction all arrive on the next crawl — but a *disappearance* does not,
+because absence is not expressible on this wire without a tombstone and a
+tombstone is exactly what this adapter no longer sends.
+
+**Why it was removed rather than fixed.** Retracting needs the adapter to
+remember what it reported, and a lost retraction is lost permanently:
+nothing probes a transaction no baseline holds. That one unrecoverable
+write forced every state write to be gated on the reply actually reaching
+stdout, and four adversarial rounds each found a different defect in that
+one boundary — a budget scoped wrong, a commit ordered wrong, a commit
+predicate wrong, and a cursor-resumed page filtering an omitted tombstone
+out of the accumulator. The fifth design was not attempted. Without
+retraction there is no unrecoverable write, so there is no delivery gate
+and no boundary to get wrong: every failure mode collapses to "re-derive on
+the next sync".
+
+**It comes back in PR 4**, designed once against the host's own persistence
+rather than against a file this adapter races itself on. See
+`adr/0004-bitcoin-adapter.md` decision 7.
+
 ## Backend
 
 Esplora's REST API. One protocol, several deployments, one config line:
@@ -42,21 +73,12 @@ sumer-bitcoin-adapter --wallets wallets.json [options]
                        corpus (HTTP source only)
 ```
 
-`--state-dir` is optional and its absence is not free: without it every
-sync is a first run, so **no tombstone is ever emitted** and a failed read
-answers `unavailable` instead of `stale`. The adapter says so on stderr at
-startup.
-
-**A `--state-dir` you *did* give and this process cannot use is exit 2, at
-startup.** Not creatable, not writable, not lockable: the adapter refuses
-to start rather than run for weeks reporting `unavailable`, emitting no
-tombstone, and mentioning it only in a stderr line per failed write. An
-operator's declared configuration has to work; omitting the flag is a
-different configuration, and it works. The probe is `create_dir_all`, a
-temp write and a rename, then a **non-blocking** lock attempt on
-`<dir>/.probe.lock` — a directory another adapter already holds is a
-success, not a hang. It narrows the window in "Known limits" below; it does
-not close it.
+`--state-dir` holds one thing: a **cached balance per resource**, so that a
+failed `balances.read` can answer `stale { as_of }` instead of
+`unavailable`. Without it, that answer is `unavailable`; the adapter says so
+on stderr at startup. A `--state-dir` this process cannot write to is the
+same cost, announced once per failed write — the adapter does not refuse to
+start over it, because nothing it stores there is unrecoverable.
 
 **`--source` is capped at 256 bytes and over-long values are rejected, not
 truncated.** It becomes `provenance.provider_id` on every observation this
@@ -90,10 +112,11 @@ adapter emits, and a truncated provider identity is a falsified one.
   under `--state-dir`. Addresses must be 10–100 ASCII alphanumeric bytes,
   which every base58check and bech32/bech32m address is. A duplicate
   address in one wallet is rejected — it would double-count the balance.
-- Adding an address to an existing wallet is treated as a first run for
-  tombstone purposes (the address-set hash changed) and logged to stderr.
-  **It does not, and in this PR cannot, invalidate a cursor the host is
-  holding** — see "Known limits".
+- Adding an address to an existing wallet invalidates that wallet's cached
+  balances (the address-set hash changed) and is logged to stderr: the
+  figures on disk are a different address set's. **It does not, and in this
+  PR cannot, invalidate a cursor the host is holding** — see "Known
+  limits".
 
 ## What it emits
 
@@ -112,8 +135,7 @@ The `resource_id` prefix is required, not decoration. The host keys
 observation chains by `(adapter_id, local_id)` and **not** by resource
 (`spec/observation.md` §3). Two of your own wallets paying each other is
 routine, and they share a txid; a bare-txid `local_id` would merge their
-chains, so one wallet's tombstone would delete the other wallet's
-transaction.
+chains, so one wallet's records would revise the other wallet's.
 
 - `fees` is set **only when the wallet spent** — a payment in was paid for
   by whoever sent it. The fee is already inside the net delta (inputs =
@@ -165,20 +187,24 @@ The confirmed mark is **always present**, so a cursor persisted mid-mempool
 still resumes confirmed reads. One sync emits two sections, in this order:
 
 1. **Confirmed** — every confirmed transaction strictly above the cursor's
-   `(height, txid)`, ascending, *excluding* anything in section 2.
-2. **By txid** — the tracked mempool set (whatever the last completed sync
-   recorded as unconfirmed), everything currently in the mempool, every
-   tombstone, and every transaction whose recorded height no longer matches
-   the chain's; ascending by txid, each at its **current** state.
+   `(height, txid)`, ascending.
+2. **By txid** — everything the provider currently reports as unconfirmed,
+   ascending by txid.
 
-**Section 2 is re-emitted in full every sync, regardless of height.** That
-is what turns "a pending transaction got mined into a block at or below the
-cursor" — or "a reorg moved a confirmed transaction *down* to one" — into a
-revision of the same `local_id` rather than a record that stays pending, or
-wrong, forever. A re-mined transaction never leaves the listings, so no
-probe runs and no tombstone is emitted; section 1 would suppress it as at
-or below the cursor. Section 2 is the only place its revision can arrive
-from.
+**Section 2 is re-emitted in full every page request, regardless of
+height.** That is what turns "a pending transaction got mined into a block
+at or below the cursor" into a revision of the same `local_id` rather than
+a record that stays pending — for as long as the crawl that saw it pending
+is the crawl that sees it confirmed. Section 1 would suppress it as at or
+below the cursor; section 2 is the only place the revision can arrive from.
+
+**It reads nothing about previous syncs.** Section 2 used to also carry the
+tracked mempool set and every height revision remembered from the last
+completed crawl, which made the revision survive a cursor the host had
+persisted across processes. That memory lived in the same file the
+retraction did, and went with it. A `history.read` with no `page` re-emits
+everything at its current state and repairs any record left behind — see
+"Known limits".
 
 > **The live-check invariant "resuming at C returns no confirmed
 > transaction at or below C" exempts section 2, and section 2 only.**
@@ -186,6 +212,11 @@ from.
 > would fail this conforming adapter. The checker must use exactly this
 > definition, or it fails a conforming adapter — which is worse than not
 > checking:
+>
+> The checker keeps all four clauses below, because they are the contract
+> for *any* conforming adapter and narrowing them would fail one. This
+> adapter now only ever produces clause 1: it emits no tombstones
+> (clause 2) and remembers nothing across crawls (clauses 3 and 4).
 >
 > **An observation is EXEMPT if, and only if, its cursor is a section-2
 > cursor** — that is, if the cursor that resumes after it carries a `:m:`
@@ -277,17 +308,14 @@ of it is served from that snapshot, in memory, for as long as the process
 lives.** Nothing is written to disk, and `map.rs` stays pure.
 
 - A `history.read` with **no `page`** starts a **new** crawl: the address
-  listings are re-fetched, the tombstone probes are re-run, and the
-  snapshot is replaced. That is what "from the start of available history"
+  listings are re-fetched and the snapshot is replaced. That is what "from the start of available history"
   (Ruling A8) means here.
 - A `history.read` with a **cursor** continues the crawl in hand. If this
   process has no memory of one — a fresh process resuming a cursor the host
   persisted — it takes a new crawl and serves the requested page from it.
-- A crawl that **drains** (`next: null`) writes its baseline to
-  `seen.json` and drops its snapshot — but only once **that** reply has
-  actually been written. See "Nothing is marked reported until it has been
-  sent" below. A crawl the host abandons mid-page writes nothing and is
-  held until the process exits.
+- A crawl that **drains** (`next: null`) drops its snapshot. It writes
+  nothing: a `history.read` touches no state at all. A crawl the host
+  abandons mid-page is held until the process exits.
 - Every page of one crawl reports the same `observed_at`: the instant the
   crawl was taken. Pages two and three did not observe anything.
 
@@ -302,35 +330,24 @@ page — observations duplicated, skipped or reordered across a page
 boundary, with the cursor advancing over a dataset that changed underneath
 it. That is wrong regardless of how fast the re-walk is.
 
-### Nothing is marked reported until it has been sent
+### A `history.read` writes no state, so there is nothing to gate
 
-The state writes a reply earns are a **field of that reply**, and they are
-applied if and only if that reply is the frame that went to stdout. A reply
-`write_reply` refused for size is one the host never received, so the
-baseline it earned is dropped unapplied and the next sync re-derives the
-diff.
+The state writes a reply could earn used to be a field of that reply,
+applied if and only if that reply was the frame that went to stdout. The
+whole machinery existed for one write — the retraction baseline — because
+a retraction the host never received is one no later sync re-derives.
 
-The subtlety, and the reason this is spelled out: an **envelope error is
-small**. A cursor this adapter did not mint, a `window` page request, a
-`resource_id` named twice — each of those writes successfully. Asking "did
-the write succeed?" therefore answered *yes* while a completely different
-resource in the same batch had already earned a baseline for observations
-that error replaced. Carrying the commits inside the body they belong to is
-what makes that unrepresentable rather than guarded.
+There is no such write any more. A `history.read` records nothing at all,
+and the one thing a `balances.read` records is a cached figure, written as
+it is read and not gated on anything: if the reply is refused for size, the
+cache holds a figure that was genuinely observed and the next successful
+read overwrites it. Losing it, or writing it for a reply nobody received,
+costs at most one `unavailable` where a `stale` was possible.
 
 **A repeated `resource_id` is refused** with an envelope `invalid_request`,
 in all three batch ops. Every requested `resource_id` appears in `statuses`
 exactly once, so a repeat has no conforming answer. The offending id is
 deliberately **not** in `err.detail` (`spec/wire.md` §8).
-
-**What the baseline forgets is what was EMITTED, not what was fetched.** A
-tombstone that `spec/observation.md` §6 step 2 omitted for size was never
-reported, so its txid stays in the baseline and the next crawl probes it
-again. Forgetting it would leave the txid in nobody's baseline, and nothing
-probes a txid no baseline holds — the retraction would be suppressed
-permanently, with the host told only `degraded {}`. Bounding `--source`
-makes that unreachable in production; the subtraction is what keeps it that
-way when a field is next added to an observation.
 
 ### Outcomes — exactly five
 
@@ -339,7 +356,7 @@ way when a field is next added to an observation.
 | `fetched { page_empty }` | the read succeeded |
 | `rate_limited { retry_after_ms }` | HTTP 429; `Retry-After` in seconds if present, else a 60s backoff. Every later resource in that batch gets `not_fetched`. |
 | `unavailable` | connect error, DNS, 5xx, an unreadable body, any other status |
-| `stale { as_of }` | a read failed **and** state holds a prior answer. A NORMAL outcome, not an error path. |
+| `stale { as_of }` | a **balance** read failed and the cache holds a prior answer. A NORMAL outcome, not an error path. |
 | `not_fetched` | a resource abandoned after an earlier rate limit, or a `resource_id` this adapter has no wallet for |
 
 `reauth_required`, `revoked`, `sca_required` and `gone` are **never
@@ -356,72 +373,54 @@ for a human (`spec/observation.md` §7). Nothing branches on it.
 whether the provider is reachable *now*, which is the only question that op
 asks.
 
-### Tombstones — positive evidence only
+**`history.read` never answers `stale` either**, for a different reason:
+nothing about a history is cached, so a failed history read has no prior
+answer to be stale about. It is `unavailable`, with no `page` — a read that
+did not happen claims no resume point.
+
+### State — a balance cache, and nothing else
 
 State lives in `<state-dir>/<resource_id>.json`, one file per resource:
 
 ```json
 {
-  "schema": 2,
-  "local_id_derivation": "btc-txid@1",
+  "schema": 3,
   "address_set_sha256": "…",
   "balances": {
     "as_of": "2026-01-01T00:00:00Z",
     "confirmed": "130000",
     "unconfirmed": "-5000"
-  },
-  "history": {
-    "as_of": "2026-01-02T00:00:00Z",
-    "txs": {
-      "<txid>": {"height": 800000, "delta": "150000"},
-      "<txid>": {"delta": "-20000"}
-    }
   }
 }
 ```
 
-**The two halves are stamped separately, and each read writes only its
-own.** A history read observes no balance, so it may not restamp one:
-`stale { as_of }` on a balance answer carries the instant those figures
-were actually observed. Schema 1 had a single `as_of` covering both, which
-made a failed balance read report yesterday's amounts under today's date —
-a false freshness claim about money. A schema-1 file is a first run.
+That is the whole file. It exists so a failed `balances.read` can answer
+`stale { as_of }` carrying the figures the last successful one observed,
+rather than `unavailable`. Nothing in it is unrecoverable: lose it, fail to
+write it, or write it for a reply that never went out, and the cost is one
+`unavailable` until the next successful balance read.
 
-An entry with no `height` was in the mempool. `delta` is what the
-transaction was worth to this wallet when last seen, so a tombstone carries
-the figure it retracts instead of a fabricated zero.
+- A missing, unreadable, unparseable, version-mismatched or hash-mismatched
+  file is a **FIRST RUN**: `unavailable` on a failed read. Never a partial
+  parse — a figure this adapter cannot stand behind, under a date it did
+  not observe, is worse than no figure.
+- The `address_set_sha256` is the wallet's address set. A different one
+  means those figures are a different wallet's balances.
+- Writes are temp-file + rename (atomic). There is **no lock**: two
+  processes racing this file can lose one section's update, and the loser is
+  re-derived by the next successful read.
+- **Schema 2 files are a first run.** A schema-2 file also carried a
+  transaction baseline — every txid the last completed crawl saw, with its
+  height and its net delta — which is what made a tombstone possible. That
+  section is gone; see the top of this file.
 
-- **A tombstone requires a direct `GET /tx/:txid` returning 404.** Absence
-  from a listing is **never** evidence. The reason — `reorged_out` vs
-  `dropped_from_mempool` — is decided by the recorded state, not guessed.
-- **Any fetch failure anywhere in a sync suppresses the diff ENTIRELY**:
-  zero observations, `stale { as_of }` or `unavailable`, and no `page`
-  either (a read that did not happen claims no resume point). There are no
-  partial diffs.
-- A missing, unreadable, unparseable, version-mismatched,
-  derivation-mismatched or hash-mismatched file is a **FIRST RUN**: zero
-  remembered transactions, zero tombstones. Never a partial parse — a
-  `history` section carrying an `as_of` but no `txs` is a first run too,
-  not a completed crawl that remembers nothing. (A section absent
-  *entirely* is legal and says nothing of that kind was ever recorded.)
-- Writes are temp-file + rename (atomic), and only once a sync has been
-  delivered **in full** (`next: null`).
-- **Concurrent writers merge; they never overwrite wholesale.** A write
-  keeps every txid already on disk that it did not itself prove gone, and
-  the read-modify-write runs under an advisory lock on
-  `<state-dir>/<resource_id>.lock` — held for a file read and a rename,
-  never across a network fetch, and released by the kernel if the process
-  dies, so there is no lock that can go stale. **A lock that cannot be
-  taken fails the write**: unlocked, two writers read the same baseline
-  and the second rename erases the first's additions, which is the same
-  permanent loss. Such a sync still reports every observation it read and
-  simply leaves the baseline for the next one. Wholesale overwrite was not
-  a *missed* tombstone: a transaction another process recorded after this
-  one's crawl began would end up in nobody's baseline, so nothing would
-  ever probe it and no tombstone would ever be emitted for it — a
-  permanent loss.
-- A tombstone is not terminal. A re-mined transaction comes back `active`
-  on the same `local_id` (`spec/observation.md` §4).
+> **What is not stored here any more, and what it cost.** The transaction
+> baseline was the one unrecoverable write in this adapter: a retraction
+> the host never received is never re-derived, because nothing probes a
+> txid no baseline holds. Keeping it correct required a delivery-gated
+> commit, an advisory `flock`, a merge that never overwrote wholesale, and
+> a startup probe that refused to run without a usable state directory.
+> All four are deleted along with the write they protected.
 
 ## The corpus layout
 
@@ -457,8 +456,8 @@ remaining `/` replaced by `_`. Two forms:
   HTTP status, and **everything after the first newline** is the body.
 
 A request with neither file is a corpus bug: the adapter reports
-`unavailable` (so it can never invent a tombstone out of a missing file)
-and names the two paths it looked for on stderr.
+`unavailable` (never a partial history out of a missing file) and names the
+two paths it looked for on stderr.
 
 | Request | Corpus file | Returns |
 |---|---|---|
@@ -466,7 +465,6 @@ and names the two paths it looked for on stderr.
 | `GET /address/{addr}/txs/chain` | `address_{addr}_txs_chain.json` | a JSON array of up to 25 confirmed transactions |
 | `GET /address/{addr}/txs/chain/{last_seen_txid}` | `address_{addr}_txs_chain_{last_seen_txid}.json` | the next page, same shape |
 | `GET /address/{addr}/txs/mempool` | `address_{addr}_txs_mempool.json` | a JSON array of unconfirmed transactions |
-| `GET /tx/{txid}` | `tx_{txid}.json` / `tx_{txid}.status` | the transaction, or `404` — **the tombstone probe** |
 
 Notes for corpus authors:
 
@@ -476,10 +474,8 @@ Notes for corpus authors:
   history therefore needs only `address_{addr}_txs_chain.json` with fewer
   than 25 transactions in it.
 - The mempool listing is not paged.
-- The adapter probes `GET /tx/{txid}` **only** for txids recorded in
-  `seen.json` that no longer appear in any listing. A first-run corpus
-  needs no `tx_*` files at all.
-- Only these five endpoints are ever requested.
+- **Only these four endpoints are ever requested.** `GET /tx/{txid}` was a
+  fifth — the tombstone probe — and a corpus never needs a `tx_*` file.
 - Fields the adapter reads: `txid`, `fee`, `status.{confirmed,
   block_height, block_hash, block_time}`, `vin[].prevout.{scriptpubkey_address,
   value}`, `vout[].{scriptpubkey_address, value}`, and
@@ -497,17 +493,12 @@ corpus/
     address_bc1qexample_txs_mempool.json   [ {…tx…} ]
   run1/
     now                                    "1767312000"
-    address_bc1qexample.json
-    address_bc1qexample_txs_chain.json     [ {…tx…} ]
-    address_bc1qexample_txs_mempool.json   []
-    tx_2222…2222.status                    "404\nTransaction not found"
+    address_bc1qexample.status             "503\nEsplora is unavailable"
 ```
 
-Run 0 records the mempool transaction; run 1 drops it from the listings
-**and** answers its probe with a 404, which is the only thing that makes it
-a `dropped_from_mempool` tombstone. A run 1 that dropped it from the
-listings without the `.status` file would produce **no** tombstone — that
-is the rule working, not a corpus that failed.
+Run 0 answers everything; run 1's provider has gone dark, which is the
+two-lifetime scenario `btc_fetch_fail` drives — run 0 records a balance,
+run 1 reports it as `stale { as_of }` and emits no history at all.
 
 ## Known limits
 
@@ -524,6 +515,18 @@ is the rule working, not a corpus that failed.
   per resource, dropped as soon as the crawl drains. A host that starts
   crawls and never finishes them grows the adapter's memory by one wallet
   history per resource, once.
+- **No disappearance is ever reported.** The headline limit, stated in full
+  at the top of this file. A transaction dropped from the mempool or reorged
+  out stays in the host's live set until PR 4 lands the capability against
+  the host's own persistence.
+- **A revision can be missed by a host that persists a cursor across
+  processes.** A transaction this adapter reported `pending` and a *later
+  crawl* sees confirmed at a height at or below that cursor is not
+  re-emitted: section 2 carries only what the provider says is unconfirmed
+  now, and section 1 suppresses anything at or below the cursor. A
+  `history.read` with no `page` re-emits it at its current state and repairs
+  the record. This is the same family as the limit below, and closes the
+  same way.
 - **Adding an address does not invalidate a host-held cursor.** The new
   address's history sits at heights at or below the cursor, which `exact`
   forbids re-emitting, and this adapter has no channel to tell the host.
@@ -532,15 +535,6 @@ is the rule working, not a corpus that failed.
   persistence must invalidate the stored cursor when the address-set hash
   changes**, or "adding an address is a revision" is false for history. See
   ADR 0004.
-- **A retraction can still be lost, in a window one `rename` wide.** The
-  host is told a transaction is active, this process dies (or the state
-  write fails) before the commit, and the transaction vanishes before the
-  next crawl: nothing probes it, so no tombstone is ever emitted. The
-  alternative — committing *before* the reply goes out — has a window the
-  size of the entire reply and fails in the direction that cannot be
-  recovered from. The startup probe narrows this one; ENOSPC, a quota
-  reached at write time and a `--state-dir` deleted mid-run go straight
-  through it. See ADR 0004 decision 6.
 - `window` page requests are not served (see above).
 - The mempool listing is capped by the provider at 50 transactions per
   address and is not paged.
@@ -552,22 +546,37 @@ cargo test -p sumer-bitcoin-adapter
 ```
 
 Unit tests pin the mapping (`map.rs` is pure — no I/O, no clock, no
-network), the cursor codec, the byte-cut pager, the state file's first-run
-degradation, and the full appear → confirm → 404 → revive lifecycle. Three
-end-to-end tests drive the adapter over a temporary corpus, including the
-one that matters most: a failed fetch produces zero tombstones,
-`stale { as_of }`, and the preserved balances.
+network), the cursor codec, the byte-cut pager and the state file's
+first-run degradation. End-to-end tests drive the adapter over a temporary
+corpus.
 
-`tests/commit_boundary.rs` is the commit boundary, driven as request
-*sequences* — every pair of eight resource kinds, each run to exhaustion by
-following the cursors the adapter minted, with one injection at page k:
-none, an oversized reply, stdout dying mid-frame, death between the write
-and the commit, a failed state write, an unavailable lock. **Its oracle
-reads bytes on stdout and bytes on disk, and never names an internal
-type**: rules stated over the mechanism get rewritten alongside it and
-prove nothing. Two of its six rules are liveness rules, so an adapter that
-answers nothing fails rather than passes — delete the tombstone probe and
-exactly one rule goes red.
+**The checks with teeth are the liveness ones** — an adapter that answered
+nothing would pass every safety rule in this crate, and that failure species
+is the one this project keeps finding:
+
+- `later_pages_of_a_crawl_are_served_from_the_snapshot` drains a
+  1,200-transaction crawl across page boundaries with the corpus deleted
+  after page one and asserts the **exact id sequence**, in order, with no
+  duplicate and no gap.
+- `two_resources_share_one_frames_budget` asserts every transaction of
+  **both** wallets arrives exactly once out of one shared byte budget: a
+  budget that starves a resource fails here.
+- `a_failed_fetch_suppresses_the_diff_entirely` asserts positive content
+  before it asserts the failure — the id, the amount, the drained page —
+  and then that the failed lifetime emits nothing and reports the recorded
+  balance as `stale`.
+- `conformance/cases/bitcoin/btc_basic.json` compares 44 hand-derived
+  observations against the adapter's replies as a **sequence**, and its
+  amounts reconcile arithmetically against the provider's own counters
+  (`adapters/bitcoin/corpus/basic/RECORDED.md`).
+
+`tests/commit_boundary.rs` is gone with the boundary it existed for. It
+proved six rules over request sequences; four of them (nothing commits for
+an undelivered reply, nothing leaves a baseline unretracted, a 404 baseline
+txid must be retracted, a drained crawl commits a history write) are claims
+this adapter no longer makes at all, and the two that remain — every frame
+fits `MAX_FRAME_BYTES`, every requested id appears in `statuses` exactly
+once — are held by the frame-limit tests above and by conformance A7.
 
 The live invariant check (`SUMER_LIVE=1`, `#[ignore]`, nightly only, never
 required CI) and the replay conformance cases live in `conformance/`.

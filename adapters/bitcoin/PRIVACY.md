@@ -18,8 +18,15 @@ addresses in the URL path:
 GET /address/bc1q…            balances
 GET /address/bc1q…/txs/chain  history
 GET /address/bc1q…/txs/mempool
-GET /tx/<txid>                the tombstone probe
 ```
+
+Four endpoints, and that is all of them. A fifth, `GET /tx/<txid>`, was the
+tombstone probe: it asked the provider about transactions this adapter had
+seen before and no longer saw, which restated your wallet's own history back
+at the server one txid at a time. **This adapter no longer reports
+disappearances and no longer makes that request** — see "Tombstones" in
+`README.md`. When the capability returns in PR 4 the probe returns with it,
+and this file will say so before it ships.
 
 The operator of the Esplora instance therefore learns, for every sync:
 
@@ -28,9 +35,7 @@ The operator of the Esplora instance therefore learns, for every sync:
   the blockchain is public, but *interest* in a particular address is not;
 - **your IP address**, and with it a coarse location and network;
 - **when you sync, and how often** — a timing pattern that reveals when you
-  are awake, when you are away, and when something prompted you to check;
-- **the txids you probe**, which are transactions you previously saw and no
-  longer do — that is, your wallet's own history, restated.
+  are awake, when you are away, and when something prompted you to check.
 
 Their reverse proxy, their CDN, their hosting provider, and anyone with
 access to their logs learn the same. So does any network observer able to
@@ -156,7 +161,8 @@ Stated plainly rather than reassuringly:
 - **No protection from the host.** The Sumer host runs this adapter as the
   same uid, on the same filesystem, with inherited file descriptors
   (`spec/wire.md` §9). Your `wallets.json` and `--state-dir` are readable
-  by anything else running as you.
+  by anything else running as you. `--state-dir` now holds only cached
+  balance figures per resource; it no longer holds your transaction ids.
 - **`--record` writes provider responses to disk in the clear**, including
   your full transaction history. It exists for building test corpora.
   Recorded corpora that are committed anywhere public must use addresses

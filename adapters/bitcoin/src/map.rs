@@ -200,8 +200,7 @@ impl Stats {
 /// every observation chain by `(adapter_id, local_id)` and NOT by resource
 /// (`spec/observation.md` 3). Two of your own wallets paying each other --
 /// entirely routine -- share a txid, so a bare-txid `local_id` would merge
-/// their chains, and a tombstone one wallet emitted would delete the
-/// other wallet's transaction.
+/// their chains, so one wallet's records would revise the other wallet's.
 #[must_use]
 pub fn local_id(resource_id: &str, txid: &str) -> String {
     format!("{resource_id}:{txid}")
@@ -540,87 +539,21 @@ pub fn active(ctx: &Ctx, tx: &Tx, owned: &BTreeSet<String>) -> Result<Observatio
     })
 }
 
-/// One `tombstoned` observation.
-///
-/// Reached only on POSITIVE EVIDENCE -- a direct `GET /tx/:txid` that
-/// answered 404. Absence from a listing is never evidence and never
-/// reaches this function. `was_height` decides the reason: a transaction
-/// last seen in a block that no longer exists was reorged out; one last
-/// seen in the mempool was dropped from it.
-///
-/// The amount is the delta recorded when the transaction was last seen, so
-/// the retraction carries the figure it retracts rather than a fabricated
-/// zero.
-pub fn tombstone(
-    ctx: &Ctx,
-    txid: &str,
-    was_height: Option<u64>,
-    last_delta: i128,
-) -> Result<ObservationWire, MapError> {
-    let reason = if was_height.is_some() {
-        "reorged_out"
-    } else {
-        "dropped_from_mempool"
-    };
-    let mut extra = serde_json::Map::new();
-    extra.insert("probe".to_owned(), "tx_not_found".into());
-    if let Some(h) = was_height {
-        extra.insert("last_seen_block_height".to_owned(), h.into());
-    }
-
-    Ok(ObservationWire {
-        resource_id: ctx.resource_id.clone(),
-        local_id: local_id(&ctx.resource_id, txid),
-        provider_id: Some(txid.to_owned()),
-        supersedes_provider_id: None,
-        state: ObservationState::Tombstoned,
-        tombstone_reason: Some(reason.to_owned()),
-        surface: SURFACE_TX.to_owned(),
-        // The transaction is gone; whether it will ever post again is
-        // genuinely unknown, and a tombstone is not terminal
-        // (spec/observation.md 4 -- a reorged-out transaction can be
-        // re-mined and come back active).
-        posting: Posting::Unknown,
-        amount: sats(last_delta)?,
-        fees: None,
-        raw_sign: raw_sign(last_delta),
-        description: if was_height.is_some() {
-            "reorged out of the best chain".to_owned()
-        } else {
-            "dropped from the mempool".to_owned()
-        },
-        provider_extra: extra,
-        provenance: ctx.provenance(SURFACE_TX, None),
-    })
-}
-
 // ---------------------------------------------------------------------
 // Planning a sync
 // ---------------------------------------------------------------------
 
-/// What `seen.json` remembers about one transaction: where it was, and
-/// what it was worth to this wallet.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct SeenTx {
-    /// `None` == it was in the mempool.
-    pub height: Option<u64>,
-    pub delta: i128,
-}
-
-/// `txid -> ` [`SeenTx`], the state the previous completed sync left behind.
-pub type SeenTxs = BTreeMap<String, SeenTx>;
-
 /// Everything one sync established about the chain, already fetched.
+///
+/// This is the whole of what a page is planned from: what the provider
+/// says NOW. There is no "what it said last time" here, and that is the
+/// point -- see ADR 0004 decision 7.
 pub struct Chain<'a> {
     /// Every transaction currently known for this wallet: the confirmed
-    /// listings, the mempool listings, and any transaction a tombstone
-    /// probe found alive.
+    /// listings and the mempool listings.
     pub txs: &'a BTreeMap<String, Tx>,
     /// Txids the provider currently reports as unconfirmed.
     pub mempool: &'a BTreeSet<String>,
-    /// Txids from `seen.json` that a direct `GET /tx/:txid` answered 404
-    /// for. THE ONLY source of tombstones.
-    pub gone: &'a BTreeSet<String>,
 }
 
 /// One sync's full emission list, in order, before it is cut into pages.
@@ -635,63 +568,39 @@ pub struct Plan {
 /// Two sections, in this order:
 ///
 /// 1. **Confirmed** -- every confirmed transaction strictly above the
-///    resume cursor's `(height, txid)`, ascending, *excluding* anything in
-///    section 2.
-/// 2. **By txid** -- the tracked mempool set (whatever `seen.json` recorded
-///    as unconfirmed), everything currently in the mempool, every
-///    tombstone, and every transaction whose recorded height no longer
-///    matches the chain's; ascending by txid, each at its CURRENT state.
+///    resume cursor's `(height, txid)`, ascending.
+/// 2. **By txid** -- everything the provider currently reports as
+///    unconfirmed, ascending by txid.
 ///
-/// Section 2 is re-emitted in full every sync regardless of height, and
-/// that is what turns "a pending transaction got mined into a block at or
-/// below the cursor" -- or "a reorg moved a confirmed transaction DOWN to
-/// one" -- into a revision of the same `local_id` instead of a record that
-/// stays pending, or wrong, forever. It is also why the "resuming at C
-/// returns no confirmed transaction at or below C" invariant exempts this
-/// section: re-emitting it is required behaviour, not a violation.
+/// Section 2 is re-emitted in full every sync regardless of height, which
+/// is what turns "this pending transaction was mined" into a revision of
+/// the same `local_id` rather than a record that stays pending forever --
+/// for as long as the crawl that saw it pending is the crawl that sees it
+/// confirmed. It is also why the "resuming at C returns no confirmed
+/// transaction at or below C" invariant exempts this section.
+///
+/// **Nothing here reads what a previous sync saw.** A transaction the
+/// provider no longer lists is simply not in the plan; this adapter does
+/// not announce disappearances (ADR 0004 decision 7).
 pub fn plan(
     ctx: &Ctx,
     chain: &Chain,
     owned: &BTreeSet<String>,
-    seen: &SeenTxs,
     from: Option<&Cursor>,
 ) -> Result<Plan, MapError> {
-    let mut by_txid: BTreeSet<&str> = BTreeSet::new();
-    for (txid, s) in seen {
-        // The tracked mempool set; any previously-confirmed transaction
-        // the probe just proved gone; and any transaction the chain now
-        // reports at a DIFFERENT height than the one recorded.
-        //
-        // That last clause is a reorg, and it is why the by-txid section
-        // exists at all. A transaction re-mined at a lower height stays in
-        // the listings, so no probe runs and no tombstone is emitted -- and
-        // the confirmed section would suppress it as "at or below the
-        // cursor". Section 2 is exempt from that rule, so it is the only
-        // place the revision can reach the host from.
-        let revised = chain
-            .txs
-            .get(txid)
-            .is_some_and(|tx| tx.height() != s.height);
-        if s.height.is_none() || chain.gone.contains(txid) || revised {
-            by_txid.insert(txid);
-        }
-    }
-    by_txid.extend(chain.mempool.iter().map(String::as_str));
-
     let floor = from.map_or_else(|| (0, String::new()), Cursor::confirmed_mark);
     let mut high_water = floor.clone();
     let mut items: Vec<(Key, ObservationWire)> = Vec::new();
 
     for tx in chain.txs.values() {
+        // An unconfirmed transaction has no height and belongs to section
+        // 2, which is what keeps it out of this one.
         let Some(height) = tx.height() else { continue };
         let key = (height, tx.txid.clone());
-        // Every confirmed transaction raises the mark, including one in
-        // section 2: section 2 emits it, so nothing at or below the mark
-        // is left unsent, and not raising it would re-emit it next sync.
         if key > high_water {
             high_water.clone_from(&key);
         }
-        if by_txid.contains(tx.txid.as_str()) || key <= floor {
+        if key <= floor {
             continue;
         }
         items.push((
@@ -705,59 +614,17 @@ pub fn plan(
     items.sort_by(|a, b| a.0.cmp(&b.0));
 
     let resume_after = from.and_then(|c| c.mempool.as_deref());
-    for txid in by_txid {
-        if resume_after.is_some_and(|z| txid <= z) {
+    for txid in chain.mempool {
+        if resume_after.is_some_and(|z| txid.as_str() <= z) {
             continue;
         }
-        let obs = if chain.gone.contains(txid) {
-            let was = seen.get(txid);
-            tombstone(
-                ctx,
-                txid,
-                was.and_then(|s| s.height),
-                was.map_or(0, |s| s.delta),
-            )?
-        } else if let Some(tx) = chain.txs.get(txid) {
-            active(ctx, tx, owned)?
-        } else {
-            // Tracked, not gone, not in any listing: the probe found it
-            // alive but this wallet's addresses no longer reference it.
-            // Nothing new to say, and nothing to invent.
+        let Some(tx) = chain.txs.get(txid) else {
             continue;
         };
-        items.push((
-            Key::Mempool {
-                txid: txid.to_owned(),
-            },
-            obs,
-        ));
+        items.push((Key::Mempool { txid: txid.clone() }, active(ctx, tx, owned)?));
     }
 
     Ok(Plan { items, high_water })
-}
-
-/// The state a completed sync should record for the next one.
-#[must_use]
-pub fn next_seen(chain: &Chain, owned: &BTreeSet<String>, previous: &SeenTxs) -> SeenTxs {
-    let mut out = SeenTxs::new();
-    for (txid, tx) in chain.txs {
-        out.insert(
-            txid.clone(),
-            SeenTx {
-                height: tx.height(),
-                delta: net_delta(tx, owned),
-            },
-        );
-    }
-    // A transaction that dropped out of the listings without the probe
-    // proving it gone stays tracked at the state we last knew: forgetting
-    // it would lose the evidence a future tombstone needs.
-    for (txid, s) in previous {
-        if !chain.gone.contains(txid) {
-            out.entry(txid.clone()).or_insert_with(|| s.clone());
-        }
-    }
-    out
 }
 
 /// The result of cutting a plan into one reply-sized page.
@@ -771,22 +638,6 @@ pub struct Page {
     /// `spec/observation.md` 6 step 2. Only the FIRST one, because
     /// `degraded` is one field on one status entry.
     pub degraded: Option<Degraded>,
-    /// The txids of every TOMBSTONE this page dropped at step 2 -- all of
-    /// them, not just the first.
-    ///
-    /// A tombstone that was omitted was not emitted, and a retraction the
-    /// host never received must not be recorded as reported: the txid must
-    /// stay in the baseline so the next crawl probes it again. `degraded`
-    /// cannot serve here, because it reports one omission and a page may
-    /// omit several.
-    ///
-    /// Every field of a tombstone is bounded by construction -- `local_id`
-    /// and `provider_id` by the txid and the `resource_id` bound, the
-    /// description and the reason by this module, `provider_id` in the
-    /// provenance by `main.rs`'s `--source` bound -- so this set is empty
-    /// in production. It is the reason that bound does not have to be
-    /// re-argued the next time a field is added to `ObservationWire`.
-    pub omitted: BTreeSet<String>,
     /// Serialized bytes of `observations`: what this page spent of the
     /// reply's budget, so the next resource in the same reply knows what
     /// is left.
@@ -817,7 +668,6 @@ pub fn cut_page(plan: Plan, from: Option<&Cursor>, budget: usize) -> Result<Page
     // withheld one: `exact` promises nothing at or below it is re-sent.
     let mut last_key: Option<Key> = None;
     let mut degraded: Option<Degraded> = None;
-    let mut omitted: BTreeSet<String> = BTreeSet::new();
     let mut used = 0usize;
     let mut cut = false;
 
@@ -851,13 +701,6 @@ pub fn cut_page(plan: Plan, from: Option<&Cursor>, budget: usize) -> Result<Page
                 local_id: Some(obs.local_id.clone()),
                 bytes: u64::try_from(size).unwrap_or(u64::MAX),
             });
-            // ...and if it was a RETRACTION, say which one. The caller
-            // records what it emitted, not what it fetched.
-            if obs.state == ObservationState::Tombstoned {
-                if let Some(txid) = obs.provider_id {
-                    omitted.insert(txid);
-                }
-            }
             continue;
         }
         // Plus the comma that joins it to the previous observation: a
@@ -892,7 +735,6 @@ pub fn cut_page(plan: Plan, from: Option<&Cursor>, budget: usize) -> Result<Page
         }),
         page_size_reduced_to: cut.then_some(emitted),
         degraded,
-        omitted,
         bytes: used,
     })
 }
@@ -1059,8 +901,6 @@ mod tests {
         for delta in [-5_i128, 0, 5] {
             validate_plain_text(&describe(delta)).unwrap();
         }
-        let t = tombstone(&ctx(), &txid(5), Some(1), -1).unwrap();
-        validate_plain_text(&t.description).unwrap();
     }
 
     // -----------------------------------------------------------------
@@ -1180,12 +1020,10 @@ mod tests {
     fn plan_for(
         txs: &BTreeMap<String, Tx>,
         mempool: &BTreeSet<String>,
-        gone: &BTreeSet<String>,
-        seen: &SeenTxs,
         from: Option<&Cursor>,
     ) -> Plan {
-        let chain = Chain { txs, mempool, gone };
-        plan(&ctx(), &chain, &owned(), seen, from).unwrap()
+        let chain = Chain { txs, mempool };
+        plan(&ctx(), &chain, &owned(), from).unwrap()
     }
 
     /// Four transactions, three of them in ONE block. A page must be
@@ -1220,21 +1058,14 @@ mod tests {
     #[test]
     fn a_page_cuts_in_the_middle_of_a_block() {
         let (txs, mempool) = split_block_fixture();
-        let gone = BTreeSet::new();
-        let seen = SeenTxs::new();
 
-        let full = plan_for(&txs, &mempool, &gone, &seen, None);
+        let full = plan_for(&txs, &mempool, None);
         assert_eq!(full.items.len(), 4);
         let one = serde_json::to_vec(&full.items[0].1).unwrap().len();
 
         // Room for two observations and no more: the cut lands between
         // txid(2) and txid(3), both of which are in block 800_000.
-        let page = cut_page(
-            plan_for(&txs, &mempool, &gone, &seen, None),
-            None,
-            one * 2 + 8,
-        )
-        .unwrap();
+        let page = cut_page(plan_for(&txs, &mempool, None), None, one * 2 + 8).unwrap();
         assert_eq!(page.observations.len(), 2);
         assert_eq!(page.page_size_reduced_to, Some(2));
         let next = page.next.unwrap();
@@ -1245,7 +1076,7 @@ mod tests {
         );
 
         let rest = cut_page(
-            plan_for(&txs, &mempool, &gone, &seen, Some(&next)),
+            plan_for(&txs, &mempool, Some(&next)),
             Some(&next),
             PAGE_BUDGET_BYTES,
         )
@@ -1287,10 +1118,8 @@ mod tests {
             tx(&txid(5), None, &[(THEM, 5_000)], &[(ME, 4_900)], 100),
             tx(&txid(6), None, &[(THEM, 6_000)], &[(ME, 5_900)], 100),
         ]);
-        let gone = BTreeSet::new();
-        let seen = SeenTxs::new();
 
-        let one = serde_json::to_vec(&plan_for(&txs, &mempool, &gone, &seen, None).items[0].1)
+        let one = serde_json::to_vec(&plan_for(&txs, &mempool, None).items[0].1)
             .unwrap()
             .len();
 
@@ -1299,7 +1128,7 @@ mod tests {
         let mut cursors: Vec<Cursor> = Vec::new();
         for _ in 0..10 {
             let page = cut_page(
-                plan_for(&txs, &mempool, &gone, &seen, from.as_ref()),
+                plan_for(&txs, &mempool, from.as_ref()),
                 from.as_ref(),
                 one + 8,
             )
@@ -1326,127 +1155,38 @@ mod tests {
         );
     }
 
+    /// Section 2 -- everything the provider currently reports as
+    /// unconfirmed -- is re-emitted regardless of the cursor, and that is
+    /// what exempts it from the no-confirmed-tx-at-or-below-C invariant.
+    /// A pending transaction whose crawl later sees it confirmed is a
+    /// revision of the same `local_id`; without section 2 it would stay
+    /// pending for the rest of that crawl.
     #[test]
-    fn the_tracked_mempool_set_is_reemitted_even_below_the_cursor() {
-        // txid(2) was pending last sync. It has now been mined into block
-        // 700_000 -- far BELOW the cursor. It must still come back, as a
-        // revision of the same local_id, or it stays pending forever.
+    fn the_mempool_section_is_emitted_regardless_of_the_cursor() {
         let pending = txid(2);
         let (txs, mempool) = chain_of(vec![tx(
             &pending,
-            Some(700_000),
+            None,
             &[(THEM, 2_000)],
             &[(ME, 1_900)],
             100,
         )]);
-        let seen: SeenTxs = [(
-            pending.clone(),
-            SeenTx {
-                height: None,
-                delta: 1_900,
-            },
-        )]
-        .into_iter()
-        .collect();
         let from = Cursor::parse(&format!("800000:{}", txid(1))).unwrap();
 
-        let plan = plan_for(&txs, &mempool, &BTreeSet::new(), &seen, Some(&from));
+        let plan = plan_for(&txs, &mempool, Some(&from));
         assert_eq!(plan.items.len(), 1);
         assert!(
             matches!(&plan.items[0].0, Key::Mempool { txid } if *txid == pending),
             "it rides in the by-txid section, which is what exempts it from \
              the no-confirmed-tx-at-or-below-C invariant"
         );
-        assert_eq!(plan.items[0].1.posting, Posting::Posted);
+        assert_eq!(plan.items[0].1.posting, Posting::Pending);
         assert_eq!(plan.items[0].1.amount.to_string(), "1900");
         assert_eq!(
             plan.items[0].0.cursor(&plan.high_water).encode(),
             format!("800000:{}:m:{}", txid(1), pending),
             "the confirmed high-water mark rides along, so a cursor persisted \
              mid-mempool still resumes confirmed reads"
-        );
-    }
-
-    /// A confirmed transaction RE-MINED BELOW THE CURSOR. It never left the
-    /// listings, so the probe never runs and there is no tombstone; the
-    /// confirmed section suppresses it because its new key is at or below
-    /// the cursor. Without the by-txid section, the reorg's revised block
-    /// metadata is lost permanently.
-    #[test]
-    fn a_reorg_that_moves_a_transaction_below_the_cursor_is_still_delivered() {
-        let moved = txid(2);
-        let (txs, mempool) = chain_of(vec![tx(
-            &moved,
-            Some(700_000),
-            &[(THEM, 2_000)],
-            &[(ME, 1_900)],
-            100,
-        )]);
-        // Last sync recorded it CONFIRMED, at a height above the cursor.
-        let seen: SeenTxs = [(
-            moved.clone(),
-            SeenTx {
-                height: Some(800_001),
-                delta: 1_900,
-            },
-        )]
-        .into_iter()
-        .collect();
-        let from = Cursor::parse(&format!("800000:{}", txid(1))).unwrap();
-
-        let plan = plan_for(&txs, &mempool, &BTreeSet::new(), &seen, Some(&from));
-        assert_eq!(
-            plan.items.len(),
-            1,
-            "the revision has to reach the host through SOME section, or a reorg \
-             downwards is a silent loss"
-        );
-        assert!(
-            matches!(&plan.items[0].0, Key::Mempool { txid } if *txid == moved),
-            "the by-txid section is the only one exempt from \
-             no-confirmed-tx-at-or-below-C, so it is where a revision below the \
-             cursor belongs"
-        );
-        assert_eq!(plan.items[0].1.provider_extra["block_height"], 700_000);
-    }
-
-    /// And once delivered, it stops being re-delivered: the next sync's
-    /// baseline records the new height, so the revision is emitted once
-    /// rather than on every sync forever.
-    #[test]
-    fn a_delivered_reorg_revision_is_not_reemitted_next_sync() {
-        let moved = txid(2);
-        let (txs, mempool) = chain_of(vec![tx(
-            &moved,
-            Some(700_000),
-            &[(THEM, 2_000)],
-            &[(ME, 1_900)],
-            100,
-        )]);
-        let gone = BTreeSet::new();
-        let chain = Chain {
-            txs: &txs,
-            mempool: &mempool,
-            gone: &gone,
-        };
-        let seen: SeenTxs = [(
-            moved.clone(),
-            SeenTx {
-                height: Some(800_001),
-                delta: 1_900,
-            },
-        )]
-        .into_iter()
-        .collect();
-        let from = Cursor::parse(&format!("800000:{}", txid(1))).unwrap();
-
-        let after = next_seen(&chain, &owned(), &seen);
-        assert_eq!(after.get(&moved).unwrap().height, Some(700_000));
-        let plan = plan_for(&txs, &mempool, &gone, &after, Some(&from));
-        assert!(
-            plan.items.is_empty(),
-            "nothing changed since the revision was delivered; re-emitting it \
-             every sync would be noise, not a revision"
         );
     }
 
@@ -1463,12 +1203,7 @@ mod tests {
         let mut big = tx(&txid(1), Some(800_000), &[(THEM, 1_000)], &[(ME, 900)], 100);
         big.status.block_hash = Some("f".repeat(100_000));
         let (txs, mempool) = chain_of(vec![big]);
-        let page = cut_page(
-            plan_for(&txs, &mempool, &BTreeSet::new(), &SeenTxs::new(), None),
-            None,
-            PAGE_BUDGET_BYTES,
-        )
-        .unwrap();
+        let page = cut_page(plan_for(&txs, &mempool, None), None, PAGE_BUDGET_BYTES).unwrap();
 
         assert_eq!(page.observations.len(), 1);
         let obs = &page.observations[0];
@@ -1573,12 +1308,7 @@ mod tests {
     #[test]
     fn a_page_never_spends_more_than_its_budget() {
         let (txs, mempool) = split_block_fixture();
-        let page = cut_page(
-            plan_for(&txs, &mempool, &BTreeSet::new(), &SeenTxs::new(), None),
-            None,
-            10,
-        )
-        .unwrap();
+        let page = cut_page(plan_for(&txs, &mempool, None), None, 10).unwrap();
         let spent: usize = page
             .observations
             .iter()
@@ -1600,13 +1330,7 @@ mod tests {
     fn a_confirmed_transaction_at_or_below_the_cursor_is_not_reemitted() {
         let (txs, mempool) = split_block_fixture();
         let from = Cursor::parse(&format!("800000:{}", txid(3))).unwrap();
-        let plan = plan_for(
-            &txs,
-            &mempool,
-            &BTreeSet::new(),
-            &SeenTxs::new(),
-            Some(&from),
-        );
+        let plan = plan_for(&txs, &mempool, Some(&from));
         let ids: Vec<&str> = plan
             .items
             .iter()
@@ -1622,13 +1346,7 @@ mod tests {
             tx(&txid(6), None, &[(THEM, 6_000)], &[(ME, 5_900)], 100),
         ]);
         let from = Cursor::parse(&format!("0::m:{}", txid(5))).unwrap();
-        let plan = plan_for(
-            &txs,
-            &mempool,
-            &BTreeSet::new(),
-            &SeenTxs::new(),
-            Some(&from),
-        );
+        let plan = plan_for(&txs, &mempool, Some(&from));
         let ids: Vec<&str> = plan
             .items
             .iter()
@@ -1640,57 +1358,8 @@ mod tests {
     #[test]
     fn local_id_is_namespaced_by_resource() {
         // Two of your own wallets in one transaction. Merged chains here
-        // would let one wallet's tombstone delete the other's record.
+        // would let one wallet's records revise the other's.
         assert_ne!(local_id("cold", &txid(1)), local_id("hot", &txid(1)));
         assert_eq!(local_id("cold", &txid(1)), format!("cold:{}", txid(1)));
-    }
-
-    #[test]
-    fn next_seen_records_state_and_forgets_only_what_was_proved_gone() {
-        let (txs, mempool) = chain_of(vec![
-            tx(&txid(1), Some(800_000), &[(THEM, 1_000)], &[(ME, 900)], 100),
-            tx(&txid(2), None, &[(THEM, 2_000)], &[(ME, 1_900)], 100),
-        ]);
-        let vanished = txid(7);
-        let unreachable = txid(8);
-        let previous: SeenTxs = [
-            (
-                vanished.clone(),
-                SeenTx {
-                    height: Some(1),
-                    delta: 1,
-                },
-            ),
-            (
-                unreachable.clone(),
-                SeenTx {
-                    height: Some(2),
-                    delta: 2,
-                },
-            ),
-        ]
-        .into_iter()
-        .collect();
-        let gone: BTreeSet<String> = [vanished.clone()].into_iter().collect();
-        let next = next_seen(
-            &Chain {
-                txs: &txs,
-                mempool: &mempool,
-                gone: &gone,
-            },
-            &owned(),
-            &previous,
-        );
-        assert_eq!(next.get(&txid(1)).unwrap().height, Some(800_000));
-        assert_eq!(next.get(&txid(2)).unwrap().height, None);
-        assert!(
-            !next.contains_key(&vanished),
-            "tombstoned, so no longer tracked"
-        );
-        assert!(
-            next.contains_key(&unreachable),
-            "absent from the listings but never proved gone: still tracked, so a \
-             future probe can still establish what happened to it"
-        );
     }
 }

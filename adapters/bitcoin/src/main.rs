@@ -49,12 +49,6 @@ const DEFAULT_SOURCE: &str = "https://blockstream.info/api";
 /// `provenance.provider_id` on every observation this adapter emits and
 /// every resource descriptor it lists; a truncated provider identity is a
 /// falsified provenance, which is a worse answer than refusing to start.
-///
-/// With this bound every field of a tombstone is bounded by construction,
-/// so `spec/observation.md` 6 step 2 cannot omit one -- which matters
-/// because an omitted tombstone that still cleared its txid from the
-/// baseline is a retraction suppressed permanently. `map::Page::omitted`
-/// is what makes that safe rather than merely unreachable.
 const MAX_SOURCE_BYTES: usize = 256;
 
 const USAGE: &str = "\
@@ -64,8 +58,8 @@ usage: sumer-bitcoin-adapter --wallets <file.json> [options]
   --source <target>    https://host/api  (an Esplora deployment), or
                        file:<dir>        (a recorded corpus)
                        default: https://blockstream.info/api
-  --state-dir <dir>    where seen.json lives. Without it every sync is a
-                       first run: no tombstones, and no `stale` answers.
+  --state-dir <dir>    where the balance cache lives. Without it a failed
+                       balance read answers `unavailable`, never `stale`.
   --record <dir>       write every HTTP response into <dir> as a replayable
                        corpus (HTTP source only)
 ";
@@ -85,17 +79,6 @@ fn main() -> std::process::ExitCode {
             return std::process::ExitCode::from(2);
         }
     };
-    // A --state-dir the operator DECLARED and this process cannot use is a
-    // failed configuration, not a degraded one: it would run for weeks
-    // reporting `unavailable`, emitting no tombstone, and saying so only in
-    // a stderr line per write. Omitting the flag stays an announced warning
-    // -- that is a different configuration, and it works.
-    if let Some(dir) = &options.state_dir {
-        if let Err(e) = probe_state_dir(dir) {
-            eprintln!("sumer-bitcoin-adapter: --state-dir {}: {e}", dir.display());
-            return std::process::ExitCode::from(2);
-        }
-    }
     let adapter = Adapter {
         wallets,
         source: options.source,
@@ -122,74 +105,14 @@ fn main() -> std::process::ExitCode {
         if frame.is_empty() {
             continue;
         }
-        if let Some((reply, commits)) = adapter.handle(frame) {
-            match write_reply(&mut out, &reply) {
-                // The state writes THIS reply earned are applied HERE, and
-                // only here: after the frame carrying them has gone out.
-                Ok(true) => {
-                    for commit in commits {
-                        commit.apply(&adapter.store);
-                    }
-                }
-                // What went out was not that reply, so it carried none of
-                // those observations and nothing in them may be recorded
-                // as reported. The next sync re-derives the diff.
-                Ok(false) => {
-                    for commit in &commits {
-                        eprintln!(
-                            "sumer-bitcoin-adapter: {} was not delivered, so its baseline is \
-                             left where it was; the next sync re-derives the diff",
-                            commit.resource_id()
-                        );
-                    }
-                }
-                Err(e) => {
-                    eprintln!("sumer-bitcoin-adapter: stdout: {e}");
-                    break;
-                }
+        if let Some(reply) = adapter.handle(frame) {
+            if let Err(e) = write_reply(&mut out, &reply) {
+                eprintln!("sumer-bitcoin-adapter: stdout: {e}");
+                break;
             }
         }
     }
     std::process::ExitCode::SUCCESS
-}
-
-/// The startup probe: `create_dir_all`, then a temp write and a rename --
-/// the two steps `seen.rs`'s atomic write is built out of -- and then a
-/// `try_lock` on `<dir>/.probe.lock`.
-///
-/// **`try_lock`, never `lock`, and `WouldBlock` counts as success.**
-/// Another adapter already holding it is proof the filesystem supports the
-/// lock at all, which is the only question being asked; blocking here
-/// would let a contended directory hang startup before the hello reply.
-///
-/// **This NARROWS the hole, it does not close it.** ENOSPC, a quota
-/// reached at write time and a directory deleted mid-run all survive it
-/// verbatim -- see ADR 0004 on the residual window.
-///
-/// ponytail: no watchdog. A wedged network mount can still block inside
-/// `open` itself; a timeout around this probe is the upgrade path if that
-/// is ever observed in the field.
-fn probe_state_dir(dir: &Path) -> io::Result<()> {
-    let at = |step: &'static str| {
-        move |e: io::Error| io::Error::new(e.kind(), format!("cannot {step} it ({e})"))
-    };
-    std::fs::create_dir_all(dir).map_err(at("create"))?;
-    let tmp = dir.join(format!(".probe.tmp.{}", std::process::id()));
-    let moved = dir.join(format!(".probe.{}", std::process::id()));
-    std::fs::write(&tmp, b"").map_err(at("write to"))?;
-    std::fs::rename(&tmp, &moved).map_err(at("rename within"))?;
-    let _ = std::fs::remove_file(&moved);
-    let lock = dir.join(".probe.lock");
-    let file = std::fs::OpenOptions::new()
-        .create(true)
-        .truncate(false)
-        .write(true)
-        .open(&lock)
-        .map_err(at("open a lock file in"))?;
-    match file.try_lock() {
-        Ok(()) | Err(std::fs::TryLockError::WouldBlock) => Ok(()),
-        Err(std::fs::TryLockError::Error(e)) => Err(at("lock a file in")(e)),
-    }
 }
 
 /// The only place this process writes to stdout, and the only place the
@@ -208,14 +131,9 @@ fn probe_state_dir(dir: &Path) -> io::Result<()> {
 /// `resource_id` appears in `statuses` exactly once). Fewer resources per
 /// request is the answer, and the error says so.
 ///
-/// Returns whether the reply ITSELF was written. `false` means the host
-/// received the `err` instead, and so received none of the observations
-/// the reply carried -- which is why [`Adapter::settle`] takes this answer
-/// before it records anything as reported.
-fn write_reply(out: &mut impl Write, reply: &Reply<serde_json::Value>) -> io::Result<bool> {
+fn write_reply(out: &mut impl Write, reply: &Reply<serde_json::Value>) -> io::Result<()> {
     let mut line = serde_json::to_string(reply)?;
-    let delivered = line.len() <= MAX_FRAME_BYTES;
-    if !delivered {
+    if line.len() > MAX_FRAME_BYTES {
         let (Reply::Ok { id, .. } | Reply::Err { id, .. }) = reply;
         eprintln!(
             "sumer-bitcoin-adapter: a {}-byte reply does not fit MAX_FRAME_BYTES \
@@ -234,8 +152,7 @@ fn write_reply(out: &mut impl Write, reply: &Reply<serde_json::Value>) -> io::Re
     }
     out.write_all(line.as_bytes())?;
     out.write_all(b"\n")?;
-    out.flush()?;
-    Ok(delivered)
+    out.flush()
 }
 
 // ---------------------------------------------------------------------
@@ -410,103 +327,6 @@ struct Adapter {
     crawls: RefCell<HashMap<String, Crawl>>,
 }
 
-/// One op's answer: the reply body, and the state writes THAT BODY earned.
-///
-/// **One value, not two.** The commits are a field of the body that
-/// carried the observations they record, so there is no way to apply a
-/// commit against a frame that carried something else. An op that fails
-/// returns `Err(ErrorBody)` and `?` drops the `Ok` half holding the
-/// commits, which is what makes the defect below unrepresentable rather
-/// than guarded: an envelope error is small, it FITS a frame, so
-/// "was the reply written?" answered yes -- and a *different* resource's
-/// queued commit was applied for a reply that never went out.
-struct Outcome {
-    body: serde_json::Value,
-    commits: Vec<Commit>,
-}
-
-/// The three ops that observe nothing and therefore commit nothing.
-impl From<serde_json::Value> for Outcome {
-    fn from(body: serde_json::Value) -> Outcome {
-        Outcome {
-            body,
-            commits: Vec::new(),
-        }
-    }
-}
-
-/// A state write a reply has EARNED but not yet paid for.
-///
-/// **Nothing is marked reported until it has been sent.** The baseline
-/// used to move while the reply was still being built, so a reply
-/// [`write_reply`] refused for size left behind a baseline claiming the
-/// tombstones it carried had already been reported -- and a tombstone the
-/// host never received is one no later sync re-derives, because the very
-/// state that says "already reported" is what stops it. That loss is
-/// permanent, which is the one thing the positive-evidence rule cannot
-/// absorb.
-enum Commit {
-    Balances {
-        resource_id: String,
-        address_hash: String,
-        as_of: Rfc3339,
-        confirmed: Option<i128>,
-        unconfirmed: Option<i128>,
-    },
-    History {
-        resource_id: String,
-        address_hash: String,
-        as_of: Rfc3339,
-        /// The whole baseline is delivery-gated, because `map::plan` reads
-        /// recorded heights: updating a height, or recording `Some` for a
-        /// txid that was tracked as mempool, removes it from the by-txid
-        /// re-emit set exactly as a removal does.
-        txs: map::SeenTxs,
-        /// **The unrecoverable half.** A lost `txs` update is re-derived
-        /// from the provider on the next crawl; a lost `retracted` entry
-        /// never is, because nothing probes a txid no baseline holds.
-        ///
-        /// It is what this crawl EMITTED a tombstone for, not what it
-        /// found gone -- see [`map::Page::omitted`].
-        retracted: BTreeSet<String>,
-    },
-}
-
-impl Commit {
-    fn resource_id(&self) -> &str {
-        let (Commit::Balances { resource_id, .. } | Commit::History { resource_id, .. }) = self;
-        resource_id
-    }
-
-    /// A state write that fails is logged and survived: the next sync
-    /// simply sees an older baseline, which under positive evidence costs
-    /// a delayed tombstone and never an invented one.
-    fn apply(self, store: &seen::Store) {
-        let written = match &self {
-            Commit::Balances {
-                resource_id,
-                address_hash,
-                as_of,
-                confirmed,
-                unconfirmed,
-            } => store.save_balances(resource_id, address_hash, as_of, *confirmed, *unconfirmed),
-            Commit::History {
-                resource_id,
-                address_hash,
-                as_of,
-                txs,
-                retracted,
-            } => store.save_history(resource_id, address_hash, as_of, txs, retracted),
-        };
-        if let Err(e) = written {
-            eprintln!(
-                "sumer-bitcoin-adapter: could not record state for {}: {e}",
-                self.resource_id()
-            );
-        }
-    }
-}
-
 /// One crawl's snapshot: everything a page of it is planned from.
 struct Crawl {
     /// The instant the crawl was taken. Every page of it reports this as
@@ -514,18 +334,6 @@ struct Crawl {
     /// pages two and three did not observe anything.
     observed_at: Rfc3339,
     chain: wallet::ChainData,
-    /// What `seen.json` remembered when the crawl began. Frozen with the
-    /// rest of it: the by-txid section's membership must not shift between
-    /// pages either.
-    seen_txs: map::SeenTxs,
-    /// Every tombstone of this crawl that a page dropped for size, across
-    /// all of its pages. `chain.gone` MINUS this is what the crawl
-    /// actually retracted, and therefore what its baseline may forget.
-    ///
-    /// It needs no delivery gate of its own: whether an observation is
-    /// omitted depends on `MAX_OBSERVATION_BYTES` and the observation, not
-    /// on the page budget, so re-cutting the same page omits the same set.
-    omitted: BTreeSet<String>,
 }
 
 fn invalid(e: impl Display) -> ErrorBody {
@@ -608,7 +416,7 @@ fn no_repeats<'a>(resource_ids: impl Iterator<Item = &'a str>) -> Result<(), Err
 }
 
 impl Adapter {
-    fn handle(&self, frame: &str) -> Option<(Reply<serde_json::Value>, Vec<Commit>)> {
+    fn handle(&self, frame: &str) -> Option<Reply<serde_json::Value>> {
         let value: serde_json::Value = match serde_json::from_str(frame) {
             Ok(v) => v,
             Err(e) => {
@@ -621,10 +429,7 @@ impl Adapter {
         let id = value.get("id").and_then(serde_json::Value::as_u64);
         let request: Request = match serde_json::from_value(value) {
             Ok(r) => r,
-            Err(e) => {
-                let id = RequestId(id?);
-                return Some((Reply::err(id, invalid(e)), Vec::new()));
-            }
+            Err(e) => return Some(Reply::err(RequestId(id?), invalid(e))),
         };
         let id = request.id;
         let params = if request.params.is_null() {
@@ -645,10 +450,8 @@ impl Adapter {
             .with_detail(serde_json::json!({"op": other}))),
         };
         Some(match result {
-            Ok(Outcome { body, commits }) => (Reply::ok(id, body), commits),
-            // The commits an op earned before it failed went with the
-            // `Outcome` that `?` dropped. There is nothing here to settle.
-            Err(err) => (Reply::err(id, err), Vec::new()),
+            Ok(body) => Reply::ok(id, body),
+            Err(err) => Reply::err(id, err),
         })
     }
 
@@ -669,7 +472,7 @@ impl Adapter {
         map::rfc3339_utc(self.source.now()).map_err(|e| internal(format!("clock: byte {}", e.at)))
     }
 
-    fn resources_list(&self, params: &serde_json::Value) -> Result<Outcome, ErrorBody> {
+    fn resources_list(&self, params: &serde_json::Value) -> Result<serde_json::Value, ErrorBody> {
         let _: ResourcesListParams = serde_json::from_value(params.clone()).map_err(invalid)?;
         let resources = self
             .wallets
@@ -693,18 +496,15 @@ impl Adapter {
                 }
             })
             .collect();
-        serde_json::to_value(ResourcesListReply { resources })
-            .map(Outcome::from)
-            .map_err(internal)
+        serde_json::to_value(ResourcesListReply { resources }).map_err(internal)
     }
 
-    fn balances_read(&self, params: &serde_json::Value) -> Result<Outcome, ErrorBody> {
+    fn balances_read(&self, params: &serde_json::Value) -> Result<serde_json::Value, ErrorBody> {
         let params: BalancesReadParams = serde_json::from_value(params.clone()).map_err(invalid)?;
         no_repeats(params.resource_ids.iter().map(String::as_str))?;
         let observed_at = self.observed_at()?;
         let mut observations = Vec::new();
         let mut statuses = Vec::new();
-        let mut commits = Vec::new();
         let mut abandoned = false;
 
         for resource_id in &params.resource_ids {
@@ -724,13 +524,26 @@ impl Adapter {
                     Ok((c, u)) => {
                         confirmed = Some(c);
                         unconfirmed = Some(u);
-                        commits.push(Commit::Balances {
-                            resource_id: w.resource_id.clone(),
-                            address_hash: w.address_hash.clone(),
-                            as_of: observed_at.clone(),
+                        // The cache is written HERE, as the figures are
+                        // read, and is not gated on the reply going out:
+                        // everything it holds is re-derived by the next
+                        // successful read, so a write for a reply the host
+                        // never received costs nothing (ADR 0004 7). A
+                        // failure is logged and survived -- the next failed
+                        // read then answers `unavailable` instead of
+                        // `stale`.
+                        if let Err(e) = self.store.save_balances(
+                            &w.resource_id,
+                            &w.address_hash,
+                            &observed_at,
                             confirmed,
                             unconfirmed,
-                        });
+                        ) {
+                            eprintln!(
+                                "sumer-bitcoin-adapter: could not cache {}'s balances: {e}",
+                                w.resource_id
+                            );
+                        }
                         status(resource_id, ReadOutcome::Fetched { page_empty: false })
                     }
                     Err(FetchError::RateLimited {
@@ -775,16 +588,14 @@ impl Adapter {
             observations,
             statuses,
         })
-        .map(|body| Outcome { body, commits })
         .map_err(internal)
     }
 
-    fn history_read(&self, params: &serde_json::Value) -> Result<Outcome, ErrorBody> {
+    fn history_read(&self, params: &serde_json::Value) -> Result<serde_json::Value, ErrorBody> {
         let params: HistoryReadParams = serde_json::from_value(params.clone()).map_err(invalid)?;
         no_repeats(params.resources.iter().map(|q| q.resource_id.as_str()))?;
         let mut observations = Vec::new();
         let mut statuses = Vec::new();
-        let mut commits = Vec::new();
         let mut abandoned = false;
         // ONE budget for the whole reply, not one per resource -- and
         // every resource's mandatory status entry is reserved out of it
@@ -830,18 +641,11 @@ impl Adapter {
             let start_a_crawl = from.is_none() || !self.crawls.borrow().contains_key(resource_id);
             if start_a_crawl {
                 let observed_at = self.observed_at()?;
-                let recorded = self.store.load(&w.resource_id, &w.address_hash);
-                match wallet::sync(&self.source, w, &recorded.txs) {
+                match wallet::sync(&self.source, w) {
                     Ok(chain) => {
-                        self.crawls.borrow_mut().insert(
-                            resource_id.clone(),
-                            Crawl {
-                                observed_at,
-                                chain,
-                                seen_txs: recorded.txs,
-                                omitted: BTreeSet::new(),
-                            },
-                        );
+                        self.crawls
+                            .borrow_mut()
+                            .insert(resource_id.clone(), Crawl { observed_at, chain });
                     }
                     // ANY fetch failure suppresses the diff ENTIRELY: no
                     // observations, and no `page` either -- claiming a
@@ -858,12 +662,14 @@ impl Adapter {
                         )));
                         continue;
                     }
+                    // `unavailable`, never `stale`: nothing is cached
+                    // about a history, so there is no prior answer to be
+                    // stale about. The diff is suppressed entirely and no
+                    // `page` is claimed -- a read that did not happen names
+                    // no resume point.
                     Err(FetchError::Unavailable { detail }) => {
                         statuses.push(budget.charge(with_detail(
-                            match recorded.history_as_of {
-                                Some(as_of) => status(resource_id, ReadOutcome::Stale { as_of }),
-                                None => status(resource_id, ReadOutcome::Unavailable),
-                            },
+                            status(resource_id, ReadOutcome::Unavailable),
                             &detail,
                         )));
                         continue;
@@ -885,63 +691,25 @@ impl Adapter {
             // a transaction arriving mid-pagination shift every later
             // page, duplicating, skipping or reordering observations while
             // the cursor advanced over a dataset that moved underneath it.
-            let (page, snapshot_at, drained) = {
-                let mut crawls = self.crawls.borrow_mut();
-                let Some(crawl) = crawls.get_mut(resource_id) else {
+            let page = {
+                let crawls = self.crawls.borrow();
+                let Some(crawl) = crawls.get(resource_id) else {
                     return Err(internal("the crawl snapshot vanished before it was read"));
                 };
-                let (page, next_txs) = {
-                    let chain = map::Chain {
-                        txs: &crawl.chain.txs,
-                        mempool: &crawl.chain.mempool,
-                        gone: &crawl.chain.gone,
-                    };
-                    let ctx = self.ctx(w, &crawl.observed_at);
-                    let plan = map::plan(&ctx, &chain, &w.owned, &crawl.seen_txs, from.as_ref())
-                        .map_err(internal)?;
-                    let page =
-                        map::cut_page(plan, from.as_ref(), budget.page()).map_err(internal)?;
-                    let next_txs = page
-                        .next
-                        .is_none()
-                        .then(|| map::next_seen(&chain, &w.owned, &crawl.seen_txs));
-                    (page, next_txs)
+                let chain = map::Chain {
+                    txs: &crawl.chain.txs,
+                    mempool: &crawl.chain.mempool,
                 };
-                // What the crawl RETRACTED is what its pages emitted a
-                // tombstone for -- `gone` minus everything the degrade
-                // dropped for size, accumulated across every page. A
-                // tombstone that was omitted was never reported, and
-                // forgetting its txid would leave it in no baseline at
-                // all: nothing would ever probe it again and the
-                // retraction would be suppressed forever, with the host
-                // told only `degraded {}`.
-                crawl.omitted.extend(page.omitted.iter().cloned());
-                let drained = next_txs.map(|txs| {
-                    let retracted = crawl
-                        .chain
-                        .gone
-                        .difference(&crawl.omitted)
-                        .cloned()
-                        .collect();
-                    (txs, retracted)
-                });
-                (page, crawl.observed_at.clone(), drained)
+                let ctx = self.ctx(w, &crawl.observed_at);
+                let plan = map::plan(&ctx, &chain, &w.owned, from.as_ref()).map_err(internal)?;
+                map::cut_page(plan, from.as_ref(), budget.page()).map_err(internal)?
             };
             budget.spend(page.bytes);
 
-            // The baseline moves only once the crawl has been delivered in
-            // full, and the spent snapshot is dropped. A crawl the host
-            // abandons mid-page leaves the old baseline in place, so the
-            // next sync re-derives it rather than trusting a
-            // half-delivered diff.
-            if let Some((txs, retracted)) = drained {
-                commits.push(Commit::History {
-                    resource_id: w.resource_id.clone(),
-                    address_hash: w.address_hash.clone(),
-                    as_of: snapshot_at,
-                    txs,
-                    retracted,
-                });
+            // A drained crawl is a spent snapshot, and nothing else: this
+            // adapter writes no history state, so there is nothing here to
+            // commit and nothing to gate on delivery.
+            if page.next.is_none() {
                 self.crawls.borrow_mut().remove(resource_id);
             }
 
@@ -964,14 +732,13 @@ impl Adapter {
             observations,
             statuses,
         })
-        .map(|body| Outcome { body, commits })
         .map_err(internal)
     }
 
     /// Reachability, one address per wallet. No `stale` here: a cached
     /// answer says nothing about whether the provider is reachable NOW,
     /// which is the only question this op asks.
-    fn status_read(&self, params: &serde_json::Value) -> Result<Outcome, ErrorBody> {
+    fn status_read(&self, params: &serde_json::Value) -> Result<serde_json::Value, ErrorBody> {
         let params: StatusReadParams = serde_json::from_value(params.clone()).map_err(invalid)?;
         no_repeats(params.resource_ids.iter().map(String::as_str))?;
         let mut statuses = Vec::new();
@@ -1008,13 +775,11 @@ impl Adapter {
                 }
             });
         }
-        serde_json::to_value(StatusReadReply { statuses })
-            .map(Outcome::from)
-            .map_err(internal)
+        serde_json::to_value(StatusReadReply { statuses }).map_err(internal)
     }
 }
 
-fn hello(params: &serde_json::Value) -> Result<Outcome, ErrorBody> {
+fn hello(params: &serde_json::Value) -> Result<serde_json::Value, ErrorBody> {
     let params: HelloParams = serde_json::from_value(params.clone()).map_err(invalid)?;
     if !params.protocol.iter().any(|v| v == PROTOCOL) {
         return Err(ErrorBody::new(
@@ -1037,17 +802,8 @@ fn hello(params: &serde_json::Value) -> Result<Outcome, ErrorBody> {
         // Serial by design: one blocking HTTP sync at a time.
         max_in_flight: 1,
     })
-    .map(Outcome::from)
     .map_err(internal)
 }
-
-/// The commit boundary's own harness. It lives under `tests/` because that
-/// is what it is, and is compiled INTO this binary because its injections
-/// need the adapter in this process -- see this crate's `Cargo.toml`.
-#[cfg(test)]
-#[allow(clippy::unwrap_used, clippy::expect_used)]
-#[path = "../tests/commit_boundary.rs"]
-mod commit_boundary;
 
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
@@ -1056,7 +812,7 @@ mod tests {
 
     #[test]
     fn hello_declares_the_four_read_capabilities_and_the_derivation() {
-        let ok = hello(&serde_json::json!({"protocol": ["1"]})).unwrap().body;
+        let ok = hello(&serde_json::json!({"protocol": ["1"]})).unwrap();
         assert_eq!(ok["protocol"], "1");
         assert_eq!(ok["adapter_id"], ADAPTER_ID);
         assert_eq!(ok["local_id_derivation"], "btc-txid@1");
@@ -1091,23 +847,15 @@ mod tests {
     }
 
     impl Adapter {
-        /// The WHOLE path a reply takes in `main`: build it, write it,
-        /// and apply the state writes it earned iff that reply is what
-        /// went out. Tests go through this rather than [`Adapter::handle`]
-        /// alone, because "did this commit state?" is a question about
-        /// the whole path and not about any one step of it.
+        /// The WHOLE path a reply takes in `main`: build it and write it.
         ///
         /// Returns what the HOST receives -- which for a reply too large
         /// for a frame is the `err` [`write_reply`] substituted, not the
         /// reply it refused.
-        pub(crate) fn deliver(&self, frame: &str) -> Option<Reply<serde_json::Value>> {
-            let (reply, commits) = self.handle(frame)?;
+        fn deliver(&self, frame: &str) -> Option<Reply<serde_json::Value>> {
+            let reply = self.handle(frame)?;
             let mut out: Vec<u8> = Vec::new();
-            if write_reply(&mut out, &reply).unwrap() {
-                for commit in commits {
-                    commit.apply(&self.store);
-                }
-            }
+            write_reply(&mut out, &reply).unwrap();
             let written = out.strip_suffix(b"\n").expect("one line, LF-terminated");
             Some(serde_json::from_slice(written).expect("a reply frame is a reply"))
         }
@@ -1179,9 +927,11 @@ mod tests {
         }
     }
 
-    /// The case the whole positive-evidence rule stands or falls on: a
-    /// read that failed must produce ZERO tombstones, `stale { as_of }`,
-    /// and the balances the last good read established.
+    /// A read that failed produces ZERO observations -- there is no
+    /// partial diff -- and the balances the last good read established,
+    /// carried by `stale { as_of }`. The history half is `unavailable`:
+    /// nothing about a history is cached, so there is no prior answer for
+    /// it to be stale about.
     #[test]
     fn a_failed_fetch_suppresses_the_diff_entirely() {
         let txid = "a".repeat(64);
@@ -1234,12 +984,13 @@ mod tests {
         assert_eq!(
             history["observations"].as_array().unwrap().len(),
             0,
-            "no partial diff, and above all no invented tombstone"
+            "no partial diff: a half-read chain is not a history"
         );
         let status = &history["statuses"][0];
         assert_eq!(
-            status["outcome"]["stale"]["as_of"], "2026-01-01T00:00:00Z",
-            "stale is a NORMAL outcome, dated by the last good read"
+            status["outcome"], "unavailable",
+            "a history read caches nothing, so a failed one has no prior \
+             answer to report as stale"
         );
         assert!(
             status["page"].is_null(),
@@ -1268,9 +1019,10 @@ mod tests {
             "the last good balance is preserved and reported as stale"
         );
 
-        // Phase 3: run 0 again, with the phase-1 state still on disk. The
-        // transaction is back in the listing, nothing vanished, and the
-        // sync is quiet.
+        // Phase 3: run 0 again, with the phase-1 cache still on disk. The
+        // transaction is back in the listing and reported active. This
+        // adapter emits no tombstone under any circumstances (ADR 0004 7),
+        // and the assertion below is the standing check on that.
         let phase3 = adapter_over(&root, 0, &state);
         let history = ok_of(
             phase3
@@ -1422,21 +1174,19 @@ mod tests {
             "every transaction, exactly once, in order, across the page boundary"
         );
 
-        // The drained crawl wrote its baseline and dropped its snapshot.
-        let state: serde_json::Value =
-            serde_json::from_str(&std::fs::read_to_string(root.join("state/w.json")).unwrap())
-                .unwrap();
-        assert_eq!(state["history"]["txs"].as_object().unwrap().len(), COUNT);
-        assert_eq!(state["history"]["as_of"], "2026-01-01T00:00:00Z");
-
         // A new `page: None` starts a NEW crawl -- which, with the corpus
-        // deleted, cannot be taken. That is the proof the snapshot was
-        // spent rather than reused as a cache.
+        // deleted, cannot be taken. That is the proof the drained crawl's
+        // snapshot was spent rather than kept as a cache.
         let fresh = page_of(serde_json::Value::Null);
         assert_eq!(fresh["observations"].as_array().unwrap().len(), 0);
         assert_eq!(
-            fresh["statuses"][0]["outcome"]["stale"]["as_of"], "2026-01-01T00:00:00Z",
-            "a fresh crawl against a dead provider is stale, not silently cached"
+            fresh["statuses"][0]["outcome"], "unavailable",
+            "a fresh crawl against a dead provider says so, rather than \
+             silently re-serving the spent snapshot"
+        );
+        assert!(
+            fresh["statuses"][0]["page"].is_null(),
+            "a read that did not happen claims no resume point"
         );
 
         std::fs::remove_dir_all(&root).unwrap();
@@ -1712,12 +1462,6 @@ mod tests {
     /// The ceiling itself, at the only place bytes reach stdout. A frame
     /// over `MAX_FRAME_BYTES` is a fatal kill with no resync, so it is
     /// never written -- the host gets an `err` on the same id instead.
-    ///
-    /// And a refused reply is a reply the host never received, so nothing
-    /// it carried may be recorded as reported. The second half of this
-    /// test is that half of the guarantee: the refusal used to happen
-    /// AFTER the baseline had already moved, so a tombstone riding in a
-    /// reply nobody got was marked delivered and never re-derived.
     #[test]
     fn a_reply_too_large_for_a_frame_is_answered_with_an_err() {
         let huge: Reply<serde_json::Value> = Reply::ok(
@@ -1725,11 +1469,7 @@ mod tests {
             serde_json::json!({"pad": "y".repeat(MAX_FRAME_BYTES)}),
         );
         let mut out: Vec<u8> = Vec::new();
-        assert!(
-            !write_reply(&mut out, &huge).unwrap(),
-            "an oversized reply is refused, and must SAY it was refused: what \
-             went out carried none of its observations"
-        );
+        write_reply(&mut out, &huge).unwrap();
         assert!(
             out.len() <= MAX_FRAME_BYTES + 1,
             "{} bytes written, and the trailing LF is the only byte allowed \
@@ -1741,91 +1481,6 @@ mod tests {
         assert_eq!(back["id"], 7, "the same id: this is an answer, not a drop");
         assert_eq!(back["err"]["code"], "internal");
         assert!(back.get("ok").is_none());
-
-        // And now the same refusal on a real reply that had earned a
-        // baseline. `w` drains its crawl in full; the wallets behind it
-        // each answer 503 with a 4 KiB body, which is evidence and rides
-        // verbatim in `provider_detail` -- the one part of a status entry
-        // no reservation can size in advance. Together they overflow the
-        // frame, so the reply is refused.
-        let root = tmp_root("frame-refused-commits-nothing");
-        let txid = "a".repeat(64);
-        write_at(&root, "corpus/run0/now", "1767225600");
-        write_at(
-            &root,
-            &format!("corpus/run0/address_{ADDR}_txs_chain.json"),
-            &serde_json::json!([{
-                "txid": txid,
-                "fee": 100,
-                "status": {
-                    "confirmed": true, "block_height": 800_000,
-                    "block_hash": "0".repeat(64), "block_time": 1_600_000_000i64
-                },
-                "vin": [{"prevout": {"scriptpubkey_address": "bc1qthem0000", "value": 1_000}}],
-                "vout": [{"scriptpubkey_address": ADDR, "value": 900}],
-            }])
-            .to_string(),
-        );
-        write_at(
-            &root,
-            &format!("corpus/run0/address_{ADDR}_txs_mempool.json"),
-            "[]",
-        );
-        const BROKEN: usize = 300;
-        let mut wallets = vec![serde_json::json!({"resource_id": "w", "addresses": [ADDR]})];
-        for n in 0..BROKEN {
-            let address = format!("bc1qbroken{n:04}");
-            write_at(
-                &root,
-                &format!("corpus/run0/address_{address}_txs_chain.status"),
-                &format!("503\n{}", "x".repeat(4_096)),
-            );
-            wallets.push(serde_json::json!({
-                "resource_id": format!("b{n:04}"), "addresses": [address]
-            }));
-        }
-        let config = wallets_json(&root, serde_json::Value::Array(wallets));
-        let state = root.join("state");
-        let adapter = adapter_with(&config, &root.join("corpus"), 0, &state);
-
-        let mut resources = vec![serde_json::json!({"resource_id": "w"})];
-        resources
-            .extend((0..BROKEN).map(|n| serde_json::json!({"resource_id": format!("b{n:04}")})));
-        let reply = adapter
-            .deliver(&request(
-                OP_HISTORY_READ,
-                serde_json::json!({"resources": resources}),
-            ))
-            .unwrap();
-        match reply {
-            Reply::Err { err, .. } => assert_eq!(err.code, WireErrorCode::Internal),
-            Reply::Ok { .. } => panic!(
-                "this fixture must overflow the frame, or it proves nothing about \
-                 what a refusal does to the baseline"
-            ),
-        }
-        assert!(
-            !state.join("w.json").exists(),
-            "the crawl's baseline was committed for a reply the host never \
-             received: the next sync will read it, believe the diff was \
-             delivered, and never re-derive it"
-        );
-
-        // ...and the same crawl, asked for on its own, delivers and DOES
-        // commit. The absence above is the refusal, not a broken write.
-        let ok = ok_of(
-            adapter
-                .deliver(&request(
-                    OP_HISTORY_READ,
-                    serde_json::json!({"resources": [{"resource_id": "w"}]}),
-                ))
-                .unwrap(),
-        );
-        assert_eq!(ok["observations"].as_array().unwrap().len(), 1);
-        let baseline: serde_json::Value =
-            serde_json::from_str(&std::fs::read_to_string(state.join("w.json")).unwrap()).unwrap();
-        assert!(baseline["history"]["txs"].get(&txid).is_some());
-        std::fs::remove_dir_all(&root).unwrap();
     }
 
     /// A provider error body is evidence and rides verbatim -- but verbatim
@@ -2084,33 +1739,6 @@ mod tests {
             .is_ok(),
             "the bound itself is legal"
         );
-    }
-
-    /// A --state-dir the operator declared and this process cannot use is
-    /// a failed configuration. `WouldBlock` is not one of those: another
-    /// adapter holding the lock proves the filesystem supports it.
-    #[test]
-    fn the_state_dir_probe_accepts_a_contended_dir_and_refuses_an_unusable_one() {
-        let root = tmp_root("state-probe");
-        let dir = root.join("nested/state");
-        probe_state_dir(&dir).unwrap();
-
-        // Held by "another adapter": try_lock answers WouldBlock, which is
-        // success. A blocking lock() here would hang startup instead.
-        let held = std::fs::OpenOptions::new()
-            .create(true)
-            .truncate(false)
-            .write(true)
-            .open(dir.join(".probe.lock"))
-            .unwrap();
-        held.lock().unwrap();
-        probe_state_dir(&dir).unwrap();
-        drop(held);
-
-        // A path that cannot be a directory at all.
-        std::fs::write(root.join("afile"), b"x").unwrap();
-        assert!(probe_state_dir(&root.join("afile")).is_err());
-        std::fs::remove_dir_all(&root).unwrap();
     }
 
     #[test]

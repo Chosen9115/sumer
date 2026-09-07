@@ -64,8 +64,8 @@ impl FetchError {
 }
 
 /// A 200 body, or the provider positively stating the resource is not
-/// there. `NotFound` on `GET /tx/:txid` is the ONLY evidence that ever
-/// produces a tombstone.
+/// there. A 404 where a body was required is reported as `unavailable`
+/// with an `http_404` detail, never guessed at -- see [`Source::get_json`].
 pub enum Fetched {
     Body(String),
     NotFound,
@@ -92,8 +92,8 @@ impl Source {
             .user_agent(USER_AGENT)
             .timeout_global(Some(std::time::Duration::from_secs(REQUEST_TIMEOUT_SECS)))
             // A 404 and a 429 are answers this adapter reads, not errors
-            // it aborts on: one is tombstone evidence, the other carries a
-            // retry budget.
+            // it aborts on: one is a resource that is not there, the other
+            // carries a retry budget.
             .http_status_as_error(false)
             .build();
         Source::Http {
@@ -238,18 +238,6 @@ impl Source {
             last_seen = Some(last);
         }
     }
-
-    /// `GET /tx/:txid` -- THE tombstone probe.
-    ///
-    /// `Ok(false)` means the provider positively answered 404: this
-    /// transaction is not there. That, and only that, is evidence a
-    /// transaction vanished. Absence from a listing is not.
-    pub fn tx_exists(&self, txid: &str) -> Result<bool, FetchError> {
-        match self.get(&format!("/tx/{txid}"))? {
-            Fetched::NotFound => Ok(false),
-            Fetched::Body(_) => Ok(true),
-        }
-    }
 }
 
 // ---------------------------------------------------------------------
@@ -377,7 +365,8 @@ fn replay_get(dir: &Path, path: &str) -> Result<Fetched, FetchError> {
     }
     // A corpus that does not answer a request the adapter made is a
     // corpus bug. Reporting it as unavailable suppresses the sync (never
-    // inventing a tombstone) and the message names the file to add.
+    // a partial history out of a missing file) and the message names the
+    // file to add.
     Err(FetchError::unavailable(
         "corpus_missing",
         format!(
@@ -447,25 +436,25 @@ mod tests {
     #[test]
     fn a_404_is_not_found_and_a_429_is_rate_limited() {
         assert!(matches!(
-            classify(404, String::new(), None, "/tx/x"),
+            classify(404, String::new(), None, "/address/x"),
             Ok(Fetched::NotFound)
         ));
         assert!(matches!(
-            classify(429, String::new(), Some(2_000), "/tx/x"),
+            classify(429, String::new(), Some(2_000), "/address/x"),
             Err(FetchError::RateLimited {
                 retry_after_ms: 2_000,
                 ..
             })
         ));
         assert!(matches!(
-            classify(429, String::new(), None, "/tx/x"),
+            classify(429, String::new(), None, "/address/x"),
             Err(FetchError::RateLimited {
                 retry_after_ms: DEFAULT_RETRY_AFTER_MS,
                 ..
             })
         ));
         assert!(matches!(
-            classify(503, "down".to_owned(), None, "/tx/x"),
+            classify(503, "down".to_owned(), None, "/address/x"),
             Err(FetchError::Unavailable { .. })
         ));
     }

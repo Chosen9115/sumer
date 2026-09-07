@@ -248,17 +248,16 @@ const COVERS_VIA: &[(&str, &str)] = &[("A8", "A2"), ("A3", "A1"), ("A10", "A2")]
 /// ids could be kept green by one fixture while every other one quietly
 /// stopped asserting anything.
 const COVERAGE: &[(&str, &[&str])] = &[
-    // The three Bitcoin fixtures are driven against the real
+    // The two Bitcoin fixtures are driven against the real
     // `sumer-bitcoin-adapter` over a recorded corpus, so their mutants are
     // wrappers that rewrite its stdout rather than script patches. What
-    // that proves is that these three cases have TEETH -- it mutates
+    // that proves is that these two cases have TEETH -- it mutates
     // nothing inside the adapter, and a wrong mapping baked identically
     // into `map.rs` and into the hand-written `expect` blocks survives
     // every one of them. That exposure is closed by reading the expects
     // against the checksummed provider JSON, by hand, and by nothing here.
     ("bitcoin/btc_basic", &["A2"]),
     ("bitcoin/btc_fetch_fail", &["A1", "A3", "A7"]),
-    ("bitcoin/btc_reorg", &["A2"]),
     ("duplicate_events", &["A2", "A9"]),
     ("fdx_lossless", &["A1"]),
     ("interrupted_pagination", &["A1", "A5", "A10"]),
@@ -770,7 +769,7 @@ fn the_coverage_table_is_backed_by_mutants() {
     //    mutant names a fixture that exists.
     let cases_dir = repo_root().join("conformance/cases");
     // One level of subdirectory is part of a fixture's name
-    // (`bitcoin/btc_reorg`): the Bitcoin fixtures are grouped because they
+    // (`bitcoin/btc_basic`): the Bitcoin fixtures are grouped because they
     // are driven against a different adapter, and a fixture the mutation
     // battery cannot see is one nothing here proves anything about.
     let fixtures: BTreeSet<String> = std::fs::read_dir(&cases_dir)

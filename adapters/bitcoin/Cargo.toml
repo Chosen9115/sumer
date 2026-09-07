@@ -1,12 +1,5 @@
 [package]
 name = "sumer-bitcoin-adapter"
-# `tests/commit_boundary.rs` is compiled INTO this binary's test build (see
-# the `#[path]` module in main.rs), not as an integration target: its oracle
-# has to hold the adapter, call `write_reply` itself and then drop the
-# result on the floor, which is what death between a write and a commit
-# means. A separate integration target could only spawn the process and
-# race it.
-autotests = false
 version = "0.1.0"
 edition.workspace = true
 license.workspace = true
