@@ -75,6 +75,7 @@ fn main() -> std::process::ExitCode {
         source: options.source,
         store: seen::Store::new(options.state_dir),
         crawls: RefCell::new(HashMap::new()),
+        pending: RefCell::new(Vec::new()),
     };
 
     let stdin = io::stdin();
@@ -97,9 +98,14 @@ fn main() -> std::process::ExitCode {
             continue;
         }
         if let Some(reply) = adapter.handle(frame) {
-            if let Err(e) = write_reply(&mut out, &reply) {
-                eprintln!("sumer-bitcoin-adapter: stdout: {e}");
-                break;
+            match write_reply(&mut out, &reply) {
+                // The state writes this reply earned are applied HERE,
+                // and only here: after the frame carrying it has gone out.
+                Ok(delivered) => adapter.settle(delivered),
+                Err(e) => {
+                    eprintln!("sumer-bitcoin-adapter: stdout: {e}");
+                    break;
+                }
             }
         }
     }
@@ -121,9 +127,15 @@ fn main() -> std::process::ExitCode {
 /// paging mechanism in this protocol can shed (every requested
 /// `resource_id` appears in `statuses` exactly once). Fewer resources per
 /// request is the answer, and the error says so.
-fn write_reply(out: &mut impl Write, reply: &Reply<serde_json::Value>) -> io::Result<()> {
+///
+/// Returns whether the reply ITSELF was written. `false` means the host
+/// received the `err` instead, and so received none of the observations
+/// the reply carried -- which is why [`Adapter::settle`] takes this answer
+/// before it records anything as reported.
+fn write_reply(out: &mut impl Write, reply: &Reply<serde_json::Value>) -> io::Result<bool> {
     let mut line = serde_json::to_string(reply)?;
-    if line.len() > MAX_FRAME_BYTES {
+    let delivered = line.len() <= MAX_FRAME_BYTES;
+    if !delivered {
         let (Reply::Ok { id, .. } | Reply::Err { id, .. }) = reply;
         eprintln!(
             "sumer-bitcoin-adapter: a {}-byte reply does not fit MAX_FRAME_BYTES \
@@ -142,7 +154,8 @@ fn write_reply(out: &mut impl Write, reply: &Reply<serde_json::Value>) -> io::Re
     }
     out.write_all(line.as_bytes())?;
     out.write_all(b"\n")?;
-    out.flush()
+    out.flush()?;
+    Ok(delivered)
 }
 
 // ---------------------------------------------------------------------
@@ -174,17 +187,49 @@ const PAGE_REPLY_BYTES: usize = 320;
 /// across the whole reply.
 struct Budget(usize);
 
+/// What one status entry costs before any provider evidence is attached to
+/// it: the entry as it will be serialized, plus the `page` object it does
+/// not carry yet.
+fn status_bytes(resource_id: &str) -> usize {
+    serde_json::to_vec(&status(
+        resource_id,
+        ReadOutcome::Fetched { page_empty: true },
+    ))
+    .map_or(0, |v| v.len())
+    .saturating_add(PAGE_REPLY_BYTES)
+}
+
 impl Budget {
     fn new() -> Budget {
         Budget(MAX_FRAME_BYTES.saturating_sub(ENVELOPE_BYTES))
     }
 
-    /// Charges what a status entry costs the reply, and hands it back.
-    /// Every status entry goes through here -- an entry is mandatory for
-    /// every requested resource, so it is charged before any observation.
+    /// Reserves the mandatory status entry of EVERY requested resource,
+    /// before a single observation is admitted.
+    ///
+    /// An entry per requested `resource_id` is mandatory and appears
+    /// exactly once (`spec/observation.md` 6), so what the statuses cost
+    /// is knowable before paging begins. Charging
+    /// each one only when its turn came was the bug: the resources at the
+    /// front of a batch spent the bytes the resources behind them were
+    /// always going to need, and one real wallet followed by 6,100
+    /// unknown resources put 1,061,875 bytes on the wire.
+    fn reserve<'a>(&mut self, resource_ids: impl Iterator<Item = &'a str>) {
+        for resource_id in resource_ids {
+            self.0 = self.0.saturating_sub(status_bytes(resource_id));
+        }
+    }
+
+    /// Charges what an entry costs BEYOND its reservation, and hands it
+    /// back. The excess is `provider_detail` evidence -- a provider's
+    /// error body, which no reservation can predict the size of -- and an
+    /// entry carrying one never carries a `page`, so the reservation's
+    /// [`PAGE_REPLY_BYTES`] pays for the first 320 bytes of it.
     fn charge(&mut self, entry: ResourceStatus) -> ResourceStatus {
         let cost = serde_json::to_vec(&entry).map_or(0, |v| v.len());
-        self.0 = self.0.saturating_sub(cost.saturating_add(PAGE_REPLY_BYTES));
+        self.0 = self
+            .0
+            .saturating_sub(cost.saturating_sub(status_bytes(&entry.resource_id)));
         entry
     }
 
@@ -277,7 +322,30 @@ struct Adapter {
     /// pages of one crawl is work already done inside one connection,
     /// not state carried across them.
     crawls: RefCell<HashMap<String, Crawl>>,
+    /// State writes the reply under construction has earned. Applied by
+    /// [`Adapter::settle`] once that reply has actually been written, and
+    /// dropped unapplied if it was not.
+    pending: RefCell<Vec<Commit>>,
 }
+
+/// A state write a reply has EARNED but not yet paid for.
+///
+/// **Nothing is marked reported until it has been sent.** The baseline
+/// used to move while the reply was still being built, so a reply
+/// [`write_reply`] refused for size left behind a baseline claiming the
+/// tombstones it carried had already been reported -- and a tombstone the
+/// host never received is one no later sync re-derives, because the very
+/// state that says "already reported" is what stops it. That loss is
+/// permanent, which is the one thing the positive-evidence rule cannot
+/// absorb.
+struct Commit {
+    resource_id: String,
+    write: StateWrite,
+}
+
+/// The state write itself, deferred: everything it needs is captured, so
+/// what is left is one call against the store.
+type StateWrite = Box<dyn Fn(&seen::Store) -> io::Result<()>>;
 
 /// One crawl's snapshot: everything a page of it is planned from.
 struct Crawl {
@@ -509,8 +577,11 @@ impl Adapter {
         let mut observations = Vec::new();
         let mut statuses = Vec::new();
         let mut abandoned = false;
-        // ONE budget for the whole reply, not one per resource.
+        // ONE budget for the whole reply, not one per resource -- and
+        // every resource's mandatory status entry is reserved out of it
+        // before any of them is allowed to spend a byte on observations.
         let mut budget = Budget::new();
+        budget.reserve(params.resources.iter().map(|q| q.resource_id.as_str()));
 
         for query in &params.resources {
             let resource_id = &query.resource_id;
@@ -702,9 +773,8 @@ impl Adapter {
         serde_json::to_value(StatusReadReply { statuses }).map_err(internal)
     }
 
-    /// A state write that fails is logged and survived: the next sync
-    /// simply sees an older baseline, which under positive evidence costs
-    /// a delayed tombstone and never an invented one.
+    /// QUEUES the balances a balance read observed. See [`Commit`]: it is
+    /// written once the reply carrying them has been.
     fn record_balances(
         &self,
         w: &Wallet,
@@ -712,18 +782,13 @@ impl Adapter {
         confirmed: Option<i128>,
         unconfirmed: Option<i128>,
     ) {
-        self.recorded(
-            w,
-            self.store.save_balances(
-                &w.resource_id,
-                &w.address_hash,
-                as_of,
-                confirmed,
-                unconfirmed,
-            ),
-        );
+        let (id, hash, as_of) = (w.resource_id.clone(), w.address_hash.clone(), as_of.clone());
+        self.queue(w, move |store| {
+            store.save_balances(&id, &hash, &as_of, confirmed, unconfirmed)
+        });
     }
 
+    /// QUEUES the transaction baseline a completed crawl established.
     /// `tombstoned` is what this crawl PROVED gone; everything else already
     /// on disk survives the write. See `seen.rs` rule 3.
     fn record_history(
@@ -733,19 +798,45 @@ impl Adapter {
         txs: &map::SeenTxs,
         tombstoned: &std::collections::BTreeSet<String>,
     ) {
-        self.recorded(
-            w,
-            self.store
-                .save_history(&w.resource_id, &w.address_hash, as_of, txs, tombstoned),
-        );
+        let (id, hash, as_of) = (w.resource_id.clone(), w.address_hash.clone(), as_of.clone());
+        let (txs, tombstoned) = (txs.clone(), tombstoned.clone());
+        self.queue(w, move |store| {
+            store.save_history(&id, &hash, &as_of, &txs, &tombstoned)
+        });
     }
 
-    fn recorded(&self, w: &Wallet, outcome: io::Result<()>) {
-        if let Err(e) = outcome {
-            eprintln!(
-                "sumer-bitcoin-adapter: could not record state for {}: {e}",
-                w.resource_id
-            );
+    fn queue(&self, w: &Wallet, write: impl Fn(&seen::Store) -> io::Result<()> + 'static) {
+        self.pending.borrow_mut().push(Commit {
+            resource_id: w.resource_id.clone(),
+            write: Box::new(write),
+        });
+    }
+
+    /// Applies the state writes the reply just written earned -- or drops
+    /// them, if what went out was not that reply.
+    ///
+    /// A state write that fails is logged and survived: the next sync
+    /// simply sees an older baseline, which under positive evidence costs
+    /// a delayed tombstone and never an invented one. A reply the host
+    /// never received costs the same thing, and for the same reason it
+    /// must: `delivered` false means those observations went nowhere, so
+    /// nothing in them may be recorded as reported.
+    fn settle(&self, delivered: bool) {
+        for commit in self.pending.borrow_mut().drain(..) {
+            if !delivered {
+                eprintln!(
+                    "sumer-bitcoin-adapter: {} was not delivered, so its baseline is \
+                     left where it was; the next sync re-derives the diff",
+                    commit.resource_id
+                );
+                continue;
+            }
+            if let Err(e) = (commit.write)(&self.store) {
+                eprintln!(
+                    "sumer-bitcoin-adapter: could not record state for {}: {e}",
+                    commit.resource_id
+                );
+            }
         }
     }
 }
@@ -815,6 +906,26 @@ mod tests {
         serde_json::json!({"id": 1, "op": op, "params": params}).to_string()
     }
 
+    impl Adapter {
+        /// The WHOLE path a reply takes in `main`: build it, write it,
+        /// and settle the state writes it earned against what actually
+        /// went out. Tests go through this rather than [`Adapter::handle`]
+        /// alone, because "did this commit state?" is a question about
+        /// the whole path and not about any one step of it.
+        ///
+        /// Returns what the HOST receives -- which for a reply too large
+        /// for a frame is the `err` [`write_reply`] substituted, not the
+        /// reply it refused.
+        fn deliver(&self, frame: &str) -> Option<Reply<serde_json::Value>> {
+            let reply = self.handle(frame)?;
+            let mut out: Vec<u8> = Vec::new();
+            let delivered = write_reply(&mut out, &reply).unwrap();
+            self.settle(delivered);
+            let written = out.strip_suffix(b"\n").expect("one line, LF-terminated");
+            Some(serde_json::from_slice(written).expect("a reply frame is a reply"))
+        }
+    }
+
     /// A two-run corpus: run 0 answers everything, run 1 fails the chain
     /// listing with a 500 and has no address stats at all.
     fn fetch_fail_corpus(txid: &str) -> PathBuf {
@@ -878,6 +989,7 @@ mod tests {
             source: Source::replay(root, run),
             store: seen::Store::new(Some(state.to_path_buf())),
             crawls: RefCell::new(HashMap::new()),
+            pending: RefCell::new(Vec::new()),
         }
     }
 
@@ -894,7 +1006,7 @@ mod tests {
         let phase1 = adapter_over(&root, 0, &state);
         let balances = ok_of(
             phase1
-                .handle(&request(
+                .deliver(&request(
                     OP_BALANCES_READ,
                     serde_json::json!({"resource_ids": ["w"]}),
                 ))
@@ -909,7 +1021,7 @@ mod tests {
 
         let history = ok_of(
             phase1
-                .handle(&request(
+                .deliver(&request(
                     OP_HISTORY_READ,
                     serde_json::json!({"resources": [{"resource_id": "w"}]}),
                 ))
@@ -927,7 +1039,7 @@ mod tests {
         let phase2 = adapter_over(&root, 1, &state);
         let history = ok_of(
             phase2
-                .handle(&request(
+                .deliver(&request(
                     OP_HISTORY_READ,
                     serde_json::json!({"resources": [{"resource_id": "w"}]}),
                 ))
@@ -955,7 +1067,7 @@ mod tests {
 
         let balances = ok_of(
             phase2
-                .handle(&request(
+                .deliver(&request(
                     OP_BALANCES_READ,
                     serde_json::json!({"resource_ids": ["w"]}),
                 ))
@@ -976,7 +1088,7 @@ mod tests {
         let phase3 = adapter_over(&root, 0, &state);
         let history = ok_of(
             phase3
-                .handle(&request(
+                .deliver(&request(
                     OP_HISTORY_READ,
                     serde_json::json!({"resources": [{"resource_id": "w"}]}),
                 ))
@@ -1053,18 +1165,11 @@ mod tests {
         std::fs::create_dir_all(&corpus).unwrap();
         std::fs::write(corpus.join("now"), "1767225600").unwrap();
         paged_corpus(&corpus, ADDR, COUNT);
-        let config = root.join("wallets.json");
-        std::fs::write(
-            &config,
-            serde_json::json!({"wallets": [{"resource_id": "w", "addresses": [ADDR]}]}).to_string(),
-        )
-        .unwrap();
-        let adapter = Adapter {
-            wallets: wallet::load(&config).unwrap(),
-            source: Source::replay(&root.join("corpus"), 0),
-            store: seen::Store::new(Some(root.join("state"))),
-            crawls: RefCell::new(HashMap::new()),
-        };
+        let config = wallets_json(
+            &root,
+            serde_json::json!([{"resource_id": "w", "addresses": [ADDR]}]),
+        );
+        let adapter = adapter_with(&config, &root.join("corpus"), 0, &root.join("state"));
 
         let page_of = |page: serde_json::Value| -> serde_json::Value {
             let resource = match page {
@@ -1073,7 +1178,7 @@ mod tests {
             };
             ok_of(
                 adapter
-                    .handle(&request(
+                    .deliver(&request(
                         OP_HISTORY_READ,
                         serde_json::json!({"resources": [resource]}),
                     ))
@@ -1158,7 +1263,7 @@ mod tests {
         let adapter = adapter_over(&root, 0, &root.join("state2"));
         let reply = ok_of(
             adapter
-                .handle(&request(
+                .deliver(&request(
                     OP_BALANCES_READ,
                     serde_json::json!({"resource_ids": ["nope"]}),
                 ))
@@ -1175,7 +1280,7 @@ mod tests {
         let root = fetch_fail_corpus(&"c".repeat(64));
         let adapter = adapter_over(&root, 0, &root.join("state3"));
         let reply = adapter
-            .handle(&request("execute", serde_json::json!({})))
+            .deliver(&request("execute", serde_json::json!({})))
             .unwrap();
         match reply {
             Reply::Err { err, .. } => assert_eq!(err.code, WireErrorCode::Unsupported),
@@ -1183,7 +1288,7 @@ mod tests {
         }
         // ...and the very next request is answered normally.
         assert!(adapter
-            .handle(&request(OP_RESOURCES_LIST, serde_json::json!({})))
+            .deliver(&request(OP_RESOURCES_LIST, serde_json::json!({})))
             .is_some());
         std::fs::remove_dir_all(&root).unwrap();
     }
@@ -1193,7 +1298,7 @@ mod tests {
         let root = fetch_fail_corpus(&"d".repeat(64));
         let adapter = adapter_over(&root, 0, &root.join("state4"));
         let reply = adapter
-            .handle(&request(
+            .deliver(&request(
                 OP_HISTORY_READ,
                 serde_json::json!({"resources": [{"resource_id": "w", "page": {
                     "kind": "window",
@@ -1255,6 +1360,7 @@ mod tests {
             source: Source::replay(corpus, run),
             store: seen::Store::new(Some(state.to_path_buf())),
             crawls: RefCell::new(HashMap::new()),
+            pending: RefCell::new(Vec::new()),
         }
     }
 
@@ -1279,7 +1385,7 @@ mod tests {
         let adapter = adapter_with(&config, &root.join("corpus"), 0, &root.join("state"));
 
         let reply = adapter
-            .handle(&request(
+            .deliver(&request(
                 OP_HISTORY_READ,
                 serde_json::json!({"resources": [
                     {"resource_id": "w0"}, {"resource_id": "w1"}
@@ -1329,7 +1435,7 @@ mod tests {
             }
             assert!(round < 39, "not draining");
             reply = adapter
-                .handle(&request(
+                .deliver(&request(
                     OP_HISTORY_READ,
                     serde_json::json!({"resources": resources}),
                 ))
@@ -1349,9 +1455,84 @@ mod tests {
         std::fs::remove_dir_all(&root).unwrap();
     }
 
+    /// A status entry is mandatory for EVERY requested resource and
+    /// appears exactly once (`spec/observation.md` 6), so its cost is
+    /// knowable before paging begins
+    /// and must be reserved before a single observation is admitted.
+    /// Charging each entry only when its turn came let the resources at
+    /// the front of a batch spend bytes the resources behind them were
+    /// always going to need: one real wallet followed by 6,100 unknown
+    /// resources put 1,061,875 bytes on the wire, and an oversized frame
+    /// is a fatal kill with no resync (`spec/wire.md` 2).
+    #[test]
+    fn every_status_entry_is_reserved_before_any_observation() {
+        const UNKNOWN: usize = 6_100;
+        let root = tmp_root("frame-status-reservation");
+        let corpus = root.join("corpus/run0");
+        std::fs::create_dir_all(&corpus).unwrap();
+        std::fs::write(corpus.join("now"), "1767225600").unwrap();
+        paged_corpus(&corpus, ADDR, 1_200);
+        let config = wallets_json(
+            &root,
+            serde_json::json!([{"resource_id": "w", "addresses": [ADDR]}]),
+        );
+        let adapter = adapter_with(&config, &root.join("corpus"), 0, &root.join("state"));
+
+        // The real wallet FIRST: it is the one whose observations get to
+        // spend the budget, and the 6,100 statuses behind it are the ones
+        // that were charged too late to stop it.
+        let mut resources = vec![serde_json::json!({"resource_id": "w"})];
+        resources
+            .extend((0..UNKNOWN).map(|n| serde_json::json!({"resource_id": format!("u{n:04}")})));
+        let reply = adapter
+            .deliver(&request(
+                OP_HISTORY_READ,
+                serde_json::json!({"resources": resources}),
+            ))
+            .unwrap();
+        let bytes = frame_bytes(&reply);
+        assert!(
+            bytes <= sumer_wire::MAX_FRAME_BYTES,
+            "{bytes} bytes on the wire, over MAX_FRAME_BYTES ({}): the mandatory \
+             statuses were charged after the observations that had already spent \
+             their bytes",
+            sumer_wire::MAX_FRAME_BYTES
+        );
+
+        let ok = ok_of(reply);
+        assert_eq!(
+            ok["statuses"].as_array().unwrap().len(),
+            UNKNOWN + 1,
+            "every requested resource_id appears in statuses exactly once"
+        );
+        assert_eq!(
+            ok["observations"].as_array().unwrap().len(),
+            0,
+            "the statuses alone exhaust the frame, so nothing is left to admit \
+             an observation with"
+        );
+        // ...and the wallet is told where to resume rather than that it
+        // drained: a page with no room is not an empty history.
+        let wallet = &ok["statuses"][0];
+        assert_eq!(wallet["resource_id"], "w");
+        assert_eq!(wallet["outcome"]["fetched"]["page_empty"], true);
+        assert!(
+            !wallet["page"]["next"].is_null(),
+            "a page that could not afford one observation must still name a \
+             resume point: {wallet}"
+        );
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
     /// The ceiling itself, at the only place bytes reach stdout. A frame
     /// over `MAX_FRAME_BYTES` is a fatal kill with no resync, so it is
     /// never written -- the host gets an `err` on the same id instead.
+    ///
+    /// And a refused reply is a reply the host never received, so nothing
+    /// it carried may be recorded as reported. The second half of this
+    /// test is that half of the guarantee: the refusal used to happen
+    /// AFTER the baseline had already moved, so a tombstone riding in a
+    /// reply nobody got was marked delivered and never re-derived.
     #[test]
     fn a_reply_too_large_for_a_frame_is_answered_with_an_err() {
         let huge: Reply<serde_json::Value> = Reply::ok(
@@ -1359,7 +1540,11 @@ mod tests {
             serde_json::json!({"pad": "y".repeat(MAX_FRAME_BYTES)}),
         );
         let mut out: Vec<u8> = Vec::new();
-        write_reply(&mut out, &huge).unwrap();
+        assert!(
+            !write_reply(&mut out, &huge).unwrap(),
+            "an oversized reply is refused, and must SAY it was refused: what \
+             went out carried none of its observations"
+        );
         assert!(
             out.len() <= MAX_FRAME_BYTES + 1,
             "{} bytes written, and the trailing LF is the only byte allowed \
@@ -1371,6 +1556,91 @@ mod tests {
         assert_eq!(back["id"], 7, "the same id: this is an answer, not a drop");
         assert_eq!(back["err"]["code"], "internal");
         assert!(back.get("ok").is_none());
+
+        // And now the same refusal on a real reply that had earned a
+        // baseline. `w` drains its crawl in full; the wallets behind it
+        // each answer 503 with a 4 KiB body, which is evidence and rides
+        // verbatim in `provider_detail` -- the one part of a status entry
+        // no reservation can size in advance. Together they overflow the
+        // frame, so the reply is refused.
+        let root = tmp_root("frame-refused-commits-nothing");
+        let txid = "a".repeat(64);
+        write_at(&root, "corpus/run0/now", "1767225600");
+        write_at(
+            &root,
+            &format!("corpus/run0/address_{ADDR}_txs_chain.json"),
+            &serde_json::json!([{
+                "txid": txid,
+                "fee": 100,
+                "status": {
+                    "confirmed": true, "block_height": 800_000,
+                    "block_hash": "0".repeat(64), "block_time": 1_600_000_000i64
+                },
+                "vin": [{"prevout": {"scriptpubkey_address": "bc1qthem0000", "value": 1_000}}],
+                "vout": [{"scriptpubkey_address": ADDR, "value": 900}],
+            }])
+            .to_string(),
+        );
+        write_at(
+            &root,
+            &format!("corpus/run0/address_{ADDR}_txs_mempool.json"),
+            "[]",
+        );
+        const BROKEN: usize = 300;
+        let mut wallets = vec![serde_json::json!({"resource_id": "w", "addresses": [ADDR]})];
+        for n in 0..BROKEN {
+            let address = format!("bc1qbroken{n:04}");
+            write_at(
+                &root,
+                &format!("corpus/run0/address_{address}_txs_chain.status"),
+                &format!("503\n{}", "x".repeat(4_096)),
+            );
+            wallets.push(serde_json::json!({
+                "resource_id": format!("b{n:04}"), "addresses": [address]
+            }));
+        }
+        let config = wallets_json(&root, serde_json::Value::Array(wallets));
+        let state = root.join("state");
+        let adapter = adapter_with(&config, &root.join("corpus"), 0, &state);
+
+        let mut resources = vec![serde_json::json!({"resource_id": "w"})];
+        resources
+            .extend((0..BROKEN).map(|n| serde_json::json!({"resource_id": format!("b{n:04}")})));
+        let reply = adapter
+            .deliver(&request(
+                OP_HISTORY_READ,
+                serde_json::json!({"resources": resources}),
+            ))
+            .unwrap();
+        match reply {
+            Reply::Err { err, .. } => assert_eq!(err.code, WireErrorCode::Internal),
+            Reply::Ok { .. } => panic!(
+                "this fixture must overflow the frame, or it proves nothing about \
+                 what a refusal does to the baseline"
+            ),
+        }
+        assert!(
+            !state.join("w.json").exists(),
+            "the crawl's baseline was committed for a reply the host never \
+             received: the next sync will read it, believe the diff was \
+             delivered, and never re-derive it"
+        );
+
+        // ...and the same crawl, asked for on its own, delivers and DOES
+        // commit. The absence above is the refusal, not a broken write.
+        let ok = ok_of(
+            adapter
+                .deliver(&request(
+                    OP_HISTORY_READ,
+                    serde_json::json!({"resources": [{"resource_id": "w"}]}),
+                ))
+                .unwrap(),
+        );
+        assert_eq!(ok["observations"].as_array().unwrap().len(), 1);
+        let baseline: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(state.join("w.json")).unwrap()).unwrap();
+        assert!(baseline["history"]["txs"].get(&txid).is_some());
+        std::fs::remove_dir_all(&root).unwrap();
     }
 
     /// A provider error body is evidence and rides verbatim -- but verbatim
@@ -1392,7 +1662,7 @@ mod tests {
         let adapter = adapter_with(&config, &root.join("corpus"), 0, &root.join("state"));
 
         let reply = adapter
-            .handle(&request(
+            .deliver(&request(
                 OP_BALANCES_READ,
                 serde_json::json!({"resource_ids": ["w"]}),
             ))
@@ -1451,7 +1721,7 @@ mod tests {
         let adapter = adapter_with(&config, &root.join("corpus"), 0, &root.join("state"));
 
         let reply = adapter
-            .handle(&request(
+            .deliver(&request(
                 OP_HISTORY_READ,
                 serde_json::json!({"resources": [{"resource_id": "w"}]}),
             ))
@@ -1527,7 +1797,7 @@ mod tests {
 
         let day1 = ok_of(
             adapter_with(&config, &corpus, 0, &state)
-                .handle(&request(
+                .deliver(&request(
                     OP_BALANCES_READ,
                     serde_json::json!({"resource_ids": ["w"]}),
                 ))
@@ -1537,7 +1807,7 @@ mod tests {
 
         let day2 = ok_of(
             adapter_with(&config, &corpus, 1, &state)
-                .handle(&request(
+                .deliver(&request(
                     OP_HISTORY_READ,
                     serde_json::json!({"resources": [{"resource_id": "w"}]}),
                 ))
@@ -1547,7 +1817,7 @@ mod tests {
 
         let day3 = ok_of(
             adapter_with(&config, &corpus, 2, &state)
-                .handle(&request(
+                .deliver(&request(
                     OP_BALANCES_READ,
                     serde_json::json!({"resource_ids": ["w"]}),
                 ))

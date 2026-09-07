@@ -9,10 +9,17 @@
 //!
 //! 1. **A missing, unreadable, unparseable, version-mismatched or
 //!    hash-mismatched file is a FIRST RUN.** Never a partial parse, never
-//!    a best-effort salvage. A partially-recovered state file would let
-//!    the adapter conclude that transactions it simply failed to read are
-//!    gone -- writing fiction into an append-only chain that never forgets
-//!    it. Zero remembered transactions means zero tombstones, which is
+//!    a best-effort salvage -- and *partial* includes a syntactically
+//!    valid file with a section half there: a dated `history` with no
+//!    `txs` is a first run, not a completed crawl that remembers nothing.
+//!    A section absent ENTIRELY is a different thing and stays legal --
+//!    it says nothing of that kind was ever recorded, which is a first
+//!    run for that half by construction.
+//!
+//!    A partially-recovered state file would let the adapter conclude
+//!    that transactions it simply failed to read are gone -- writing
+//!    fiction into an append-only chain that never forgets it. Zero
+//!    remembered transactions means zero tombstones, which is
 //!    always safe: the worst case is that a real vanish is noticed one
 //!    sync later.
 //! 2. **Writes are atomic** (temp file + rename). A torn file would be
@@ -30,7 +37,12 @@
 //!    itself prove gone, and the read-modify-write runs under an advisory
 //!    lock on `<resource_id>.lock` -- held for a file read and a rename,
 //!    never across a network fetch, and released by the kernel if the
-//!    process dies, so there is no lock to go stale.
+//!    process dies, so there is no lock to go stale. A lock that cannot
+//!    be taken FAILS THE WRITE. Proceeding unlocked would put both
+//!    writers back on the same baseline and let the second rename erase
+//!    the first's additions, which is the permanent silence this rule
+//!    exists to prevent; the sync still reports every observation it
+//!    read, and the next one retries the baseline.
 //! 4. **Balances and history are stamped separately.** A history read
 //!    observes no balance, so it may not restamp one: a `stale { as_of }`
 //!    answer carries the instant the figure it is reporting was actually
@@ -90,6 +102,9 @@ struct SeenFile {
 struct BalancesFile {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     as_of: Option<String>,
+    /// `null` is a recorded UNKNOWN, which is exactly what an absent one
+    /// degrades to -- so unlike `history.txs` below, there is no shape
+    /// here that reads as more knowledge than the file holds.
     #[serde(default)]
     confirmed: Option<String>,
     #[serde(default)]
@@ -100,7 +115,10 @@ struct BalancesFile {
 struct HistoryFile {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     as_of: Option<String>,
-    #[serde(default)]
+    /// Required, not defaulted: `{"as_of": ...}` with no `txs` would
+    /// otherwise load as a completed crawl that remembers no
+    /// transactions, and every one it forgot would be a tombstone nobody
+    /// ever emits.
     txs: BTreeMap<String, SeenTxFile>,
 }
 
@@ -231,7 +249,7 @@ impl Store {
             return Ok(());
         };
         std::fs::create_dir_all(dir)?;
-        let _guard = lock(&dir.join(format!("{resource_id}.lock")));
+        let _guard = lock(&dir.join(format!("{resource_id}.lock")))?;
         let mut file = read_file(&path, address_hash).unwrap_or_else(|| SeenFile {
             schema: SCHEMA,
             local_id_derivation: crate::map::LOCAL_ID_DERIVATION.to_owned(),
@@ -250,29 +268,37 @@ impl Store {
 /// rather than a lock file with a pid in it: there is no stale lock that
 /// can wedge a wallet.
 ///
-/// A filesystem that cannot take it (some network mounts) gets one line on
-/// stderr and an UNLOCKED read-modify-write. That is deliberate: the merge
-/// is what makes the guarantee, and the lock only narrows the window
-/// between the merge's read and its rename. Refusing to write state at all
-/// would trade a narrow race for no tombstones ever.
-fn lock(path: &Path) -> Option<std::fs::File> {
-    let taken = std::fs::OpenOptions::new()
+/// A filesystem that cannot take it (some network mounts) FAILS THE
+/// WRITE. The fallback used to be an unlocked read-modify-write, on the
+/// grounds that the merge is what makes the guarantee and the lock only
+/// narrows the window -- which is wrong: without the lock both writers
+/// read the same baseline, each merges its own additions into it, and the
+/// second rename erases the first's. That is the permanent silence the
+/// merge exists to prevent, restored in full. Atomicity here is necessary,
+/// not merely a narrower window.
+///
+/// The cost is bounded and the right way round: a sync that cannot take
+/// the lock still reports every observation it read, and only declines to
+/// move the baseline, so the next sync re-derives it. A lost update is
+/// acceptable; a silently lost retraction is not.
+fn lock(path: &Path) -> io::Result<std::fs::File> {
+    std::fs::OpenOptions::new()
         .create(true)
         .truncate(false)
         .write(true)
         .open(path)
-        .and_then(|file| file.lock().map(|()| file));
-    match taken {
-        Ok(file) => Some(file),
-        Err(e) => {
-            eprintln!(
-                "sumer-bitcoin-adapter: {}: could not lock ({e}); merging state \
-                 without it",
-                path.display()
-            );
-            None
-        }
-    }
+        .and_then(|file| file.lock().map(|()| file))
+        .map_err(|e| {
+            io::Error::new(
+                e.kind(),
+                format!(
+                    "{}: could not take the state lock ({e}); refusing to update the \
+                     baseline unlocked, because a second writer would erase this \
+                     one's additions",
+                    path.display()
+                ),
+            )
+        })
 }
 
 /// Reads the file at `path` if it is a state file for THIS wallet, and
@@ -670,6 +696,18 @@ mod tests {
                 "balances": {"as_of": "the day before yesterday", "confirmed": "1"}
             })
             .to_string(),
+            // A section that is present but INCOMPLETE. Atomic rename does
+            // not produce these, but rule 1 is a claim about every file
+            // this adapter will ever read, not only the ones it wrote: a
+            // dated history with no `txs` would otherwise load as a
+            // baseline that remembers nothing, which is a partial parse
+            // wearing a completed crawl's timestamp.
+            serde_json::json!({
+                "schema": 2, "local_id_derivation": "btc-txid@1",
+                "address_set_sha256": "h",
+                "history": {"as_of": "2026-01-01T00:00:00Z"}
+            })
+            .to_string(),
         ] {
             std::fs::write(&path, &bad).unwrap();
             let seen = store.load("w", "h");
@@ -763,6 +801,51 @@ mod tests {
              future sync will ever probe it: that is a permanent loss, not a \
              missed tombstone"
         );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A state update that cannot take its lock writes NOTHING. The
+    /// fallback used to proceed unlocked, which puts two writers back on
+    /// the same baseline: each reads it, each adds its own txids, and the
+    /// second rename erases the first's additions -- exactly the permanent
+    /// silence the merge exists to prevent. Losing an update is
+    /// acceptable, silently losing a retraction is not.
+    #[test]
+    fn a_state_update_that_cannot_lock_writes_nothing() {
+        let dir = tmpdir("lockfail");
+        let store = Store::new(Some(dir.clone()));
+        // A directory where the lock file belongs: it cannot be opened for
+        // writing, so the exclusive lock cannot be taken.
+        std::fs::create_dir_all(dir.join("w.lock")).unwrap();
+        let as_of = Rfc3339::new("2026-09-07T00:00:00Z").unwrap();
+        let a = "e".repeat(64);
+        let txs: SeenTxs = [(
+            a,
+            SeenTx {
+                height: Some(1),
+                delta: 7,
+            },
+        )]
+        .into_iter()
+        .collect();
+
+        let err = store
+            .save_history("w", "h", &as_of, &txs, &BTreeSet::new())
+            .unwrap_err();
+        assert!(
+            format!("{err}").contains("lock"),
+            "the failure must name the lock it could not take: {err}"
+        );
+        assert!(
+            !dir.join("w.json").exists(),
+            "a sync that cannot take the lock commits no baseline"
+        );
+        assert!(store.load("w", "h").txs.is_empty());
+
+        store
+            .save_balances("w", "h", &as_of, Some(1), Some(2))
+            .unwrap_err();
+        assert!(!dir.join("w.json").exists());
         std::fs::remove_dir_all(&dir).unwrap();
     }
 

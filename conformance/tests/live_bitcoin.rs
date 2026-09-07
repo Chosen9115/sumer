@@ -30,16 +30,44 @@
 //! of the real adapter, so a break can be performed on the live check the
 //! same way it is performed on a fixture.
 //!
-//! ```text
-//! SUMER_LIVE=1 \
-//! SUMER_LIVE_WRAPPER=conformance/mutations/adapters/btc_resumed_pages_emptied.py \
-//!   cargo test -p sumer-conformance --test live_bitcoin -- --ignored --nocapture
-//! ```
-//!
 //! The nightly leaves it unset. It exists because a check nobody has ever
 //! seen go red for the right reason is a check nobody knows the shape of --
 //! and the resume bracket below was exactly that: it passed against an
 //! adapter whose every resumed page came back empty.
+//!
+//! **A wrapper's mere invocation proves nothing.** A wrapper passes errors
+//! through untouched, so any red run reads as a kill: a mutant that broke
+//! the handshake, or one that got blunt and now trips section 5 as well,
+//! looks exactly like a mutant killed by the section it claims. The
+//! offline battery answers this with EXACTNESS -- the ids a mutant
+//! provokes must EQUAL the ids it declares (`tests/mutations.rs`) -- and
+//! `SUMER_LIVE_EXPECT` is that rule here. It names the section the break
+//! must be caught by:
+//!
+//! ```text
+//! SUMER_LIVE=1 \
+//! SUMER_LIVE_WRAPPER=mutations/adapters/btc_resumed_pages_emptied.py \
+//! SUMER_LIVE_EXPECT='§9b' \
+//!   cargo test -p sumer-conformance --test live_bitcoin -- --ignored --nocapture
+//! ```
+//!
+//! The wrapper path is resolved by the adapter process, whose working
+//! directory cargo sets to this PACKAGE's root -- hence
+//! `mutations/adapters/...` and not `conformance/mutations/adapters/...`,
+//! which silently spawns nothing and reads as a kill at the handshake.
+//!
+//! With it set the test is INVERTED: it passes only when the check failed
+//! at that section, and fails when the mutant survived, when it was caught
+//! somewhere else first, or when the provider rate-limited the run into
+//! proving nothing.
+//!
+//! What that establishes, and what it does not: every assertion BEFORE the
+//! named one passed, because the run reached it. The assertions AFTER it
+//! were never evaluated -- an ordered check stops at its first failure, so
+//! "and nowhere else" is a claim about everything upstream of the kill and
+//! nothing downstream of it. The offline battery collects a whole run's
+//! failures and does not have this limit; this is the price of assertions
+//! that panic, and it is stated rather than implied to be covered.
 
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
@@ -162,6 +190,53 @@ async fn the_live_invariants_hold() {
         eprintln!("SUMER_LIVE is not 1 -- refusing to touch the network");
         return;
     }
+    // The invariants run in their own task so that `SUMER_LIVE_EXPECT` can
+    // read the failure instead of only inheriting it. See the module docs.
+    let outcome = tokio::spawn(check_the_invariants()).await;
+    match (std::env::var("SUMER_LIVE_EXPECT").ok(), outcome) {
+        (None, Ok(_)) => {}
+        (None, Err(e)) if e.is_panic() => std::panic::resume_unwind(e.into_panic()),
+        (None, Err(e)) => panic!("the live check did not run to a verdict: {e}"),
+        (Some(expected), Ok(true)) => panic!(
+            "SUMER_LIVE_EXPECT={expected}, and every invariant passed: whatever is \
+             in front of this adapter SURVIVED, so {expected} does not have the \
+             teeth it is claimed to have"
+        ),
+        (Some(expected), Ok(false)) => eprintln!(
+            "SKIP: the provider rate-limited this run, so nothing was proved about \
+             {expected} either way"
+        ),
+        (Some(expected), Err(e)) => {
+            let message = panic_message(e);
+            assert!(
+                message.contains(&expected),
+                "SUMER_LIVE_EXPECT={expected}, but the check was stopped somewhere \
+                 else first, so the break it names is unproved -- and every \
+                 assertion after the one below went unevaluated: {message}"
+            );
+            eprintln!("killed at {expected}, as declared:\n{message}");
+        }
+    }
+}
+
+/// The message a failed invariant carried, for `SUMER_LIVE_EXPECT` to
+/// match the declared section against.
+fn panic_message(error: tokio::task::JoinError) -> String {
+    if !error.is_panic() {
+        return format!("the live check did not run to a verdict: {error}");
+    }
+    let panic = error.into_panic();
+    panic
+        .downcast_ref::<String>()
+        .cloned()
+        .or_else(|| panic.downcast_ref::<&str>().map(|s| (*s).to_owned()))
+        .unwrap_or_else(|| "a panic carrying no message".to_owned())
+}
+
+/// Every invariant, in order. `true` once they have all been checked;
+/// `false` when the provider rate-limited the run, which proves nothing
+/// either way and is not a failure.
+async fn check_the_invariants() -> bool {
     let binary = adapter_binary();
     assert!(binary.is_file(), "{} is not built", binary.display());
 
@@ -238,7 +313,7 @@ async fn the_live_invariants_hold() {
     );
     if let ReadOutcome::RateLimited { retry_after_ms } = status.outcome {
         eprintln!("SKIP: {SOURCE} rate-limited us (retry after {retry_after_ms}ms)");
-        return;
+        return false;
     }
     assert!(
         matches!(status.outcome, ReadOutcome::Fetched { .. }),
@@ -247,18 +322,26 @@ async fn the_live_invariants_hold() {
         status.provider_detail
     );
 
+    // A LIST, sorted -- never a set. A set comparison silently tolerates a
+    // duplicate: append a second `unconfirmed` line carrying zero and set
+    // equality still holds, every line is still a well-formed integer
+    // number of satoshis, and the reconciliation in section 8 still
+    // balances because zero changes no sum. "Two balance lines" is a claim
+    // about COUNT, and a comparison that cannot see multiplicity is the
+    // same silent degradation the `fees` comparison shipped with.
     let sat = AssetId::new("sat").expect("sat is a legal asset id");
-    let categories: BTreeSet<String> = balances
+    let mut categories: Vec<String> = balances
         .observations
         .iter()
         .map(|b| b.category.clone())
         .collect();
+    categories.sort();
     assert_eq!(
         categories,
-        ["confirmed".to_owned(), "unconfirmed".to_owned()]
-            .into_iter()
-            .collect::<BTreeSet<_>>(),
-        "two balance lines, never summed, and no third category"
+        vec!["confirmed".to_owned(), "unconfirmed".to_owned()],
+        "§3: EXACTLY two balance lines, one per category -- never summed, no third \
+         category, and neither category twice. A host that adds up whatever lines \
+         arrive double-counts the wallet the moment one is emitted twice"
     );
     let mut reported = Amount::parse(sat.clone(), "0").expect("zero parses");
     for line in &balances.observations {
@@ -273,7 +356,7 @@ async fn the_live_invariants_hold() {
 
     // 4. History, paginated to exhaustion, on the same connection.
     let Some(first) = drain(&handle, None).await else {
-        return;
+        return false;
     };
     let (observations, cursors) = (first.observations, first.cursors);
 
@@ -414,7 +497,7 @@ async fn the_live_invariants_hold() {
     )
     .await
     else {
-        return;
+        return false;
     };
 
     // 9a. Nothing at or below the cursor, exemption aside.
@@ -454,7 +537,7 @@ async fn the_live_invariants_hold() {
     let missing: Vec<&String> = owed.difference(&delivered).collect();
     assert!(
         missing.is_empty(),
-        "resuming at ({height}, {txid}) dropped {} of the {} confirmed transactions the \
+        "§9b: resuming at ({height}, {txid}) dropped {} of the {} confirmed transactions the \
          uninterrupted read placed above it: {missing:?}. The resumed read drained to a terminal \
          page and reported success, so this is not a truncated answer -- it is history the host \
          asked for, was told it had received, and will never ask for again",
@@ -480,7 +563,7 @@ async fn the_live_invariants_hold() {
     assert!(!matches!(status.outcome, ReadOutcome::Stale { .. }));
     if let ReadOutcome::RateLimited { retry_after_ms } = status.outcome {
         eprintln!("SKIP: {SOURCE} rate-limited us (retry after {retry_after_ms}ms)");
-        return;
+        return false;
     }
     // The same bar the two reads above are held to. Without it every
     // assertion in this section is about a clock that is absent because
@@ -505,6 +588,7 @@ async fn the_live_invariants_hold() {
         "the connection ended in a protocol violation"
     );
     let _ = std::fs::remove_dir_all(&dir);
+    true
 }
 
 /// A cursor as an orderable key: `"<height>:<txid>"`, optionally

@@ -17,19 +17,27 @@ happened to carry cannot see the reply that carries none.
 resume of the real adapter). There is deliberately no `mutations/*.json`
 manifest for it: the battery requires one fixture per mutant under
 `conformance/cases/`, and inventing one would be a fixture that proves
-nothing. It is run by hand, and by whoever next doubts §9 has teeth:
-
-    SUMER_LIVE=1 \
-    SUMER_LIVE_WRAPPER=conformance/mutations/adapters/btc_resumed_pages_emptied.py \
-      cargo test -p sumer-conformance --test live_bitcoin -- --ignored --nocapture
-
-DECLARED, exactly: the live check must fail at §9b -- "resuming at (H, T)
+nothing. DECLARED, exactly: the live check must fail at §9b -- "resuming at (H, T)
 dropped N of the M confirmed transactions the uninterrupted read placed
 above it" -- and at nothing else. Everything before §9b must still pass:
 the handshake, discovery, balances, the floor, the ordering, the
 cross-endpoint reconciliation, and §9a, all of which this break leaves
 untouched. A failure anywhere else means this mutant got blunt and stopped
 proving what it claims.
+
+That declaration is CHECKED, not merely written down. This wrapper passes
+errors through untouched, so a red run on its own proves nothing: any
+failure at all, from a broken handshake to a rate limit, reads as a kill.
+`SUMER_LIVE_EXPECT` names the section that must do the killing, and the
+run then passes only when it did -- the same exactness rule the offline
+battery enforces on a mutant's declared assertion set:
+
+    SUMER_LIVE=1 \
+    SUMER_LIVE_WRAPPER=mutations/adapters/btc_resumed_pages_emptied.py \
+    SUMER_LIVE_EXPECT='§9b' \
+      cargo test -p sumer-conformance --test live_bitcoin -- --ignored --nocapture
+
+It is run by hand, and by whoever next doubts §9 has teeth.
 """
 import json
 import sys

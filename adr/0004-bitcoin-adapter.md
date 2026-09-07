@@ -1,13 +1,19 @@
 # ADR 0004 — The watch-only Bitcoin adapter: Esplora, wallet-shaped resources, byte-cut pages, positive-evidence tombstones
 
-- **Status:** accepted (revision 1)
+- **Status:** accepted (revision 2)
 - **Date:** 2026-09-07
 - **Decision by:** Linus, Milestone 1
 
 **Revision 1** corrects two things this document got wrong. Decision 3's
 page budget was per resource, which is not a frame limit; decision 5
-asserted a guarantee that concurrent writers did not provide. Both
-corrections are marked **Revised** in place, with the claim they replace
+asserted a guarantee that concurrent writers did not provide.
+
+**Revision 2** corrects the escape hatch revision 1 left in decision 5: an
+unlocked fallback when `flock` is unavailable, described there as
+acceptable. It is not — it reinstates the very overwrite the merge exists
+to prevent — and decision 5 now says what the code does.
+
+Corrections are marked **Revised** in place, with the claim they replace
 stated rather than deleted.
 
 ## Context
@@ -172,14 +178,26 @@ every txid already on disk that this crawl did not itself prove gone. The
 read-modify-write runs under an advisory `flock` on
 `<state-dir>/<resource_id>.lock`.
 
-**The merge is the fix; the lock only makes it atomic.** A lock alone would
-not close this: the racing window is the whole crawl — load the baseline,
-fetch for tens of seconds, write — and holding a lock across a network fetch
-is how one slow provider wedges every other process on that wallet, past the
-host's 30s deadline. The lock is held for a file read and a rename, and
-nothing else. The stale-lock failure this ADR previously feared belongs to a
-lock *file* with a pid in it; `flock` is released by the kernel when the
-process dies, so there is nothing to go stale.
+**The merge and the lock are both necessary.** A lock alone would not close
+this: the racing window is the whole crawl — load the baseline, fetch for
+tens of seconds, write — and holding a lock across a network fetch is how
+one slow provider wedges every other process on that wallet, past the host's
+30s deadline. The lock is held for a file read and a rename, and nothing
+else. The stale-lock failure this ADR previously feared belongs to a lock
+*file* with a pid in it; `flock` is released by the kernel when the process
+dies, so there is nothing to go stale.
+
+**A lock that cannot be taken fails the write.** This decision first read
+that a filesystem which cannot `flock` (some network mounts) gets an
+unlocked read-modify-write, on the grounds that the merge is what makes the
+guarantee and the lock only narrows the window. **That was wrong, and it
+undid the merge it was written to defend.** Unlocked, both writers read the
+same baseline, each merges its own additions into that copy, and the second
+rename erases the first's — the permanent silence above, restored in full.
+So a sync that cannot take the lock reports every observation it read and
+declines to move the baseline; the next sync retries. A lost update is
+acceptable — the baseline is re-derived from the provider — and a silently
+lost retraction is not.
 
 A duplicate tombstone is the price: a txid this process tombstoned can be
 re-added by a racing writer that still had it, and the next sync probes it
@@ -249,8 +267,11 @@ process boundary as any other.
 - **Locking `seen.json` across the whole crawl.** Rejected: the lock would
   be held across a network fetch, so one slow provider wedges every other
   process on that wallet past the host's 30s deadline. The lock decision 5
-  does take is held for a file read and a rename only, and the merge — not
-  the lock — is what makes the guarantee true.
+  does take is held for a file read and a rename only.
+- **Proceeding unlocked when `flock` is unavailable.** Rejected in revision
+  2: see decision 5. It reads as a narrower window and is in fact no window
+  at all — two unlocked writers overwrite each other's additions exactly as
+  last-writer-wins did.
 - **Last-writer-wins on `seen.json`.** Rejected in revision 1: see decision
   5. This ADR asserted it degraded to a missed tombstone, and it did not.
 

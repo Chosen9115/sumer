@@ -218,9 +218,14 @@ exists to prevent, arriving from the other side. What rides along and is
 therefore counted:
 
 - **Every observation**, plus the comma that joins it to the last one.
-- **Every status entry**, charged before that resource's observations,
-  because a status entry is mandatory for every requested `resource_id`
-  and an observation is not.
+- **Every status entry**, reserved for *every* requested `resource_id`
+  before *any* observation is admitted — not charged one at a time as
+  each resource's turn comes. A status entry is mandatory and an
+  observation is not, so what the statuses cost is knowable before paging
+  begins; charging them in turn let the resources at the front of a batch
+  spend bytes the ones behind them were always going to need, and one
+  wallet followed by 6,100 unknown resources put 1,061,875 bytes on the
+  wire.
 - **`provider_detail.raw.body`**, capped at 4 KiB with a
   `[truncated: N bytes]` marker. It is evidence and it goes verbatim
   (`spec/observation.md` §7) — but *verbatim* is not *unbounded*, and one
@@ -264,8 +269,12 @@ lives.** Nothing is written to disk, and `map.rs` stays pure.
   process has no memory of one — a fresh process resuming a cursor the host
   persisted — it takes a new crawl and serves the requested page from it.
 - A crawl that **drains** (`next: null`) writes its baseline to
-  `seen.json` and drops its snapshot. A crawl the host abandons mid-page
-  writes nothing and is held until the process exits.
+  `seen.json` and drops its snapshot — but only once the reply carrying
+  it has actually been written. A reply refused for size (below) is one
+  the host never received, so the baseline it earned is dropped unapplied
+  and the next sync re-derives the diff: nothing is marked reported until
+  it has been sent. A crawl the host abandons mid-page writes nothing and
+  is held until the process exits.
 - Every page of one crawl reports the same `observed_at`: the instant the
   crawl was taken. Pages two and three did not observe anything.
 
@@ -348,7 +357,10 @@ the figure it retracts instead of a fabricated zero.
   partial diffs.
 - A missing, unreadable, unparseable, version-mismatched,
   derivation-mismatched or hash-mismatched file is a **FIRST RUN**: zero
-  remembered transactions, zero tombstones. Never a partial parse.
+  remembered transactions, zero tombstones. Never a partial parse — a
+  `history` section carrying an `as_of` but no `txs` is a first run too,
+  not a completed crawl that remembers nothing. (A section absent
+  *entirely* is legal and says nothing of that kind was ever recorded.)
 - Writes are temp-file + rename (atomic), and only once a sync has been
   delivered **in full** (`next: null`).
 - **Concurrent writers merge; they never overwrite wholesale.** A write
@@ -356,7 +368,11 @@ the figure it retracts instead of a fabricated zero.
   the read-modify-write runs under an advisory lock on
   `<state-dir>/<resource_id>.lock` — held for a file read and a rename,
   never across a network fetch, and released by the kernel if the process
-  dies, so there is no lock that can go stale. Wholesale overwrite was not
+  dies, so there is no lock that can go stale. **A lock that cannot be
+  taken fails the write**: unlocked, two writers read the same baseline
+  and the second rename erases the first's additions, which is the same
+  permanent loss. Such a sync still reports every observation it read and
+  simply leaves the baseline for the next one. Wholesale overwrite was not
   a *missed* tombstone: a transaction another process recorded after this
   one's crawl began would end up in nobody's baseline, so nothing would
   ever probe it and no tombstone would ever be emitted for it — a
