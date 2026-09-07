@@ -239,6 +239,67 @@ async fn history_start_exempts_records_the_sweep_could_not_have_seen() {
     );
 }
 
+/// **A resource the `status.read` reply left out is not a resource that
+/// reported no bound.**
+///
+/// §6: every requested `resource_id` appears in `statuses` EXACTLY ONCE --
+/// never zero times. A reply that omits one is malformed, and the host used
+/// to read the omission as "this resource declared no `history_start`",
+/// which is the widest possible answer: the whole of history is in reach
+/// and every absence is evidence. So a malformed reply SILENTLY REMOVED the
+/// bound, and the record the previous test exempts got retracted instead.
+///
+/// The asymmetry decides the direction. A missing bound must never widen
+/// what an absence may be evidence of, so a reply that fails to cover a
+/// requested resource is refused outright rather than reconciled against.
+#[tokio::test]
+async fn a_status_reply_that_omits_a_requested_resource_grants_no_bound() {
+    if !support::python3_available() {
+        return;
+    }
+    let scratch = Scratch::new("status-omitted");
+    let fixture = fixture(
+        &scratch,
+        vec![
+            Run::new(vec![page(
+                None,
+                vec![
+                    obs_at("ancient", "10.00", "2026-01-01T00:00:00Z"),
+                    obs_at("recent", "20.00", "2026-06-01T00:00:00Z"),
+                ],
+                drained_status(None),
+            )]),
+            // The same sweep as the exemption case above -- `ancient` is
+            // gone from the page -- except that `status.read` covers
+            // nothing at all, so the host never learns where this
+            // resource's history begins.
+            Run::new(vec![page(
+                None,
+                vec![obs_at("recent", "20.00", "2026-06-01T00:00:00Z")],
+                drained_status(None),
+            )])
+            .statuses(json!([])),
+        ],
+    );
+    let mut store = store(&scratch);
+    refresh_run(&mut store, &fixture, 0, SweepOptions::default()).await;
+
+    let refused = support::refresh_run_result(&mut store, &fixture, 1).await;
+    let message = refused
+        .expect_err("a reply that covers no requested resource is malformed")
+        .to_string();
+    assert!(
+        message.contains(support::RESOURCE_ID) && message.contains("status.read"),
+        "the error names the op and the resource it failed to cover: {message}"
+    );
+    assert_eq!(
+        retractions(&store),
+        Vec::<(String, String)>::new(),
+        "a reply that never said where history begins licenses no absence"
+    );
+    assert!(live_ids(&store).contains(&"ancient".to_owned()));
+}
+
 /// A sweep from a different vantage retracts NOTHING, records the change,
 /// and adopts the new vantage -- and the sweep after it retracts normally.
 /// The rule terminates; it does not disable retraction for ever.

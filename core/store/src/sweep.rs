@@ -204,6 +204,13 @@ impl Gate {
 
 /// Everything about this resource that is fixed before the first page.
 pub struct SweepInput<'a> {
+    /// The adapter this sweep's rows are keyed by, **and** the identity
+    /// condition (8) judges provenance against. Those are the same string
+    /// because `refresh_adapter` refuses to run at all when the stored
+    /// record and the connection's HELLO disagree -- see the check there.
+    /// Judging (8) against the id the host REMEMBERED, while the
+    /// connection announced another, is precisely the two-notions-of-one-
+    /// chain confusion (8) exists to catch.
     pub adapter_id: &'a str,
     pub resource_id: &'a str,
     /// The hello `local_id_derivation` of the ONE connection serving this
@@ -370,6 +377,11 @@ pub async fn sweep_resource(
             .statuses
             .iter()
             .find(|s| s.resource_id == input.resource_id);
+        // `AdapterHandle::history_read` already refuses a reply that does
+        // not cover every requested resource exactly once, so this is
+        // unreachable over a real connection. It stays because the
+        // alternative is an `expect`, and nothing in this crate panics on
+        // an adapter reply.
         let Some(status) = status else {
             let reason = format!("page_{page_number}_reported_no_status_for_this_resource");
             store::finish_crawl(store.conn(), crawl_id, false, false, Some(&reason))?;
@@ -393,13 +405,24 @@ pub async fn sweep_resource(
         // `observed_ids`: a record the host refused must never count as
         // "this adapter reported that id" and suppress a legitimate
         // retraction.
+        //
+        // Provenance is judged BEFORE the resource filter. Condition (8)
+        // is "EVERY observation's `provenance.adapter_id` was the
+        // connection's own" -- every observation on the page, not just the
+        // ones addressed to the resource being swept. Filtering first let a
+        // page carry its own contradiction past the gate: the honest
+        // records for this resource completed the sweep while an
+        // observation naming another adapter under some other resource was
+        // dropped unexamined, and the retraction went through on a page
+        // that had already proved the host was holding two notions of one
+        // chain.
         let mut observations: Vec<Observation> = Vec::new();
         for observation in read.observations {
-            if observation.resource_id != input.resource_id {
-                continue;
-            }
             if observation.provenance.adapter_id != input.adapter_id {
                 gate.foreign_provenance = true;
+                continue;
+            }
+            if observation.resource_id != input.resource_id {
                 continue;
             }
             observed_ids.insert(observation.local_id.clone());

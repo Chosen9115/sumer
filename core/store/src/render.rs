@@ -70,18 +70,21 @@ pub fn balance_line(category: &str, history: &[&BalanceRow]) -> String {
         ),
         // Rule 2: the read failed. Show the last figure there ever was,
         // marked stale; only say `unavailable` when there is none.
-        (None, _) => match history.iter().rev().find_map(|row| {
-            row.amount
-                .as_ref()
-                .map(|amount| (amount, row.received_at.clone()))
-        }) {
-            Some((amount, as_of)) => format!(
+        (None, _) => match history
+            .iter()
+            .rev()
+            .find_map(|row| row.amount.as_ref().map(|amount| (amount, row)))
+        {
+            // The recovered figure is `row`'s, not `latest`'s: its
+            // provider, its own `as_of` (adapter `stale:` reason or
+            // receipt time), never the row that just failed to read.
+            Some((amount, row)) => format!(
                 "  {category:<14} {:>14} {}   stale (as of {}) · {} · {}",
                 amount.to_string(),
                 amount.asset().as_str(),
-                as_of,
-                latest.provider_id,
-                time_of_day(&latest.received_at)
+                row.as_of(),
+                row.provider_id,
+                time_of_day(&row.received_at)
             ),
             None => format!(
                 "  {category:<14} {:>14}     unavailable · {} · {}",

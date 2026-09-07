@@ -159,6 +159,19 @@ reporting `unavailable` with no amount, and those are two different claims:
 not read this" is a statement about the host. A consumer that cannot tell them
 apart cannot report either one honestly.
 
+**A refresh that did not read a resource must not leave its last figure
+reading `live`.** This binds every path that ends a refresh early, not only a
+`balances.read` that returned and disappointed: a process that would not
+spawn, a `resources.list` that failed, a `status.read` that failed, and a
+connection refused under §8.1's `hello` rule all end without reading a
+balance, and each must mark the figures they did not refresh. The resources to
+mark come from what the host has stored, not from this run's listing — the
+failure may be that no listing happened. The converse also holds and is easy
+to get backwards: a failure *after* a successful balances read must not
+downgrade a figure that genuinely was read live this run. `live` is a claim
+about this refresh, and a host that cannot say when it last looked should say
+so rather than let an old number keep asserting freshness it no longer has.
+
 A category with no stored line is left alone. There is no figure there to
 protect from looking falsely current, and writing a marker for it would be the
 host asserting the category exists on the strength of nothing.
@@ -594,6 +607,21 @@ observation is also **not** counted as one this adapter reported: it can never
 suppress a retraction, or a host would learn to hide a disappearance by
 mislabelling its provenance.
 
+**A connection that does not claim to be the adapter it replaced is refused
+whole.** Condition (8) compares an observation's `provenance.adapter_id`
+against *the connection's own*, and a host learns that from the connection's
+`hello`, never from the `adapter_id` it has stored for the argv it ran. If
+those two disagree, the host MUST abandon the whole refresh for that adapter
+before writing anything, rather than sweeping and refusing observations one at
+a time. The reason is that there is nowhere honest to put anything such a
+connection says: stored under the recorded `adapter_id` the host records as
+fact a provenance the connection denies, and stored under the announced one
+this adapter writes another's history (`spec/wire.md` §10). Refusing
+observation by observation still lets everything else it says land under a key
+it never claimed. A host that trusts the id it remembered over the id that
+just announced itself is holding exactly the two notions of one chain that
+condition (8) exists to catch.
+
 **Condition (8) outranks §6.** An observation whose `provenance.adapter_id` is
 not the connection's own is refused **whatever its size**. It is never
 measured against `MAX_OBSERVATION_BYTES`, never dropped for being oversized,
@@ -666,7 +694,16 @@ record that lies inside the provider's window on the wrong side of the bound
 and retract it. A host MUST parse both values and order the instants.
 
 **A timestamp that cannot be ordered exempts rather than retracts.** If either
-value fails to parse, the head is exempt. The two errors are not symmetric: a
+value cannot be placed on a line -- it fails to parse, it names a date the
+calendar does not have, or it carries precision finer than the host can order
+-- the head is exempt. Parsing is not the only way a timestamp can fail to be
+a point in time. `2026-02-30` is well-formed and is not a date; a host that
+normalizes it forward to March 2 has not read the adapter's timestamp, it has
+invented a different one, and moved the record across the bound while doing
+so. A fraction finer than the host's resolution is worse than imprecise: two
+distinct instants truncate to the same value and compare **equal**, which
+turns `at >= start` from false to true. Both are silent, and both retract.
+The two errors are not symmetric: a
 wrong exemption leaves a stale row that the next sweep can still retract, and
 a wrong retraction destroys a record of the user's money. Where the host
 cannot tell, it keeps the record.

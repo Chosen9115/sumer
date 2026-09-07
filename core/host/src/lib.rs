@@ -22,7 +22,7 @@ pub mod paging;
 mod process;
 pub mod time;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -400,13 +400,13 @@ impl AdapterHandle {
         &self,
         resource_ids: Vec<String>,
     ) -> Result<sumer_wire::StatusReadReply, HostError> {
-        let reply: sumer_wire::StatusReadReply = self
-            .call_typed(
-                OP_STATUS_READ,
-                sumer_wire::StatusReadParams { resource_ids },
-            )
-            .await?;
-        reject_duplicate_statuses(OP_STATUS_READ, &reply.statuses)?;
+        let params = sumer_wire::StatusReadParams { resource_ids };
+        let reply: sumer_wire::StatusReadReply = self.call_typed(OP_STATUS_READ, &params).await?;
+        check_status_coverage(
+            OP_STATUS_READ,
+            params.resource_ids.iter().map(String::as_str),
+            &reply.statuses,
+        )?;
         Ok(reply)
     }
 
@@ -417,13 +417,15 @@ impl AdapterHandle {
         &self,
         resource_ids: Vec<String>,
     ) -> Result<BalancesRead, HostError> {
+        let params = sumer_wire::BalancesReadParams { resource_ids };
         let (raw, received_at): (sumer_wire::BalancesReadReply, Rfc3339) = self
-            .call_typed_with_receipt(
-                OP_BALANCES_READ,
-                sumer_wire::BalancesReadParams { resource_ids },
-            )
+            .call_typed_with_receipt(OP_BALANCES_READ, &params)
             .await?;
-        reject_duplicate_statuses(OP_BALANCES_READ, &raw.statuses)?;
+        check_status_coverage(
+            OP_BALANCES_READ,
+            params.resource_ids.iter().map(String::as_str),
+            &raw.statuses,
+        )?;
         let staleness = staleness_by_resource(&raw.statuses);
         let mut statuses = raw.statuses;
         let observations = drop_oversized(
@@ -452,10 +454,15 @@ impl AdapterHandle {
         &self,
         resources: Vec<ResourceQuery>,
     ) -> Result<HistoryRead, HostError> {
+        let params = sumer_wire::HistoryReadParams { resources };
         let (raw, received_at): (sumer_wire::HistoryReadReply, Rfc3339) = self
-            .call_typed_with_receipt(OP_HISTORY_READ, sumer_wire::HistoryReadParams { resources })
+            .call_typed_with_receipt(OP_HISTORY_READ, &params)
             .await?;
-        reject_duplicate_statuses(OP_HISTORY_READ, &raw.statuses)?;
+        check_status_coverage(
+            OP_HISTORY_READ,
+            params.resources.iter().map(|r| r.resource_id.as_str()),
+            &raw.statuses,
+        )?;
         let staleness = staleness_by_resource(&raw.statuses);
         let mut statuses = raw.statuses;
         // An observation naming ANOTHER adapter is not measured and not
@@ -632,29 +639,61 @@ fn staleness_for(by_resource: &HashMap<String, Staleness>, resource_id: &str) ->
 }
 
 /// **Every requested `resource_id` appears in `statuses` exactly once**
-/// (spec/observation.md §6). A reply that names one twice is malformed, and
-/// it is refused here rather than defended against downstream.
+/// (spec/observation.md §6) -- never more than once, and never zero times.
+/// A reply that breaks either half is malformed, and it is refused here
+/// rather than defended against downstream.
 ///
 /// This is not tidiness. Every consumer of a `statuses` array reaches for
 /// one entry per resource and takes the first match -- staleness stamping
 /// above, the retraction gate in `sumer-store`, the balance outcome label.
-/// An adapter answering twice for one resource, first cleanly and then with
-/// `stale` and an anonymous `degraded`, gets judged on the clean entry: the
-/// sweep reads a complete, undegraded page, concludes the records it did
-/// not carry are gone, and retracts them. Contradictory evidence must never
-/// be judged complete, and the honest place to say so is here, once, where
-/// the reply is decoded -- not in every reader, each of which would have to
-/// remember.
-fn reject_duplicate_statuses(op: &str, statuses: &[ResourceStatus]) -> Result<(), HostError> {
-    let mut seen: HashMap<&str, ()> = HashMap::new();
+///
+/// **Twice** is contradictory evidence. An adapter answering for one
+/// resource first cleanly and then with `stale` and an anonymous `degraded`
+/// gets judged on the clean entry: the sweep reads a complete, undegraded
+/// page, concludes the records it did not carry are gone, and retracts
+/// them.
+///
+/// **Not at all** is worse, because every one of those readers spells the
+/// absence as a permissive default. `history_start` is the sharp one: it is
+/// an `Option`, so a resource that supplied no status entry at all is
+/// indistinguishable from one that reported no lower bound on its history
+/// -- which is the WIDEST possible answer. The whole of history becomes
+/// reachable and every absence becomes evidence, so a reply that never said
+/// where a resource's history begins silently licenses the retraction of
+/// records that predate it. The asymmetry decides the direction: a missing
+/// bound must never widen what an absence may be evidence of. Staleness
+/// defaults `Live` the same way, and the balance outcome label defaults to
+/// `unknown`.
+///
+/// The honest place to say all of that is here, once, where the reply is
+/// decoded -- not in every reader, each of which would have to remember.
+fn check_status_coverage<'a>(
+    op: &str,
+    requested: impl IntoIterator<Item = &'a str>,
+    statuses: &[ResourceStatus],
+) -> Result<(), HostError> {
+    let malformed = |detail: String| {
+        HostError::Wire(ErrorBody::new(
+            WireErrorCode::InvalidRequest,
+            format!(
+                "malformed {op} reply: {detail}; every requested resource_id appears in \
+                 `statuses` exactly once"
+            ),
+        ))
+    };
+    let mut seen: HashSet<&str> = HashSet::new();
     for status in statuses {
-        if seen.insert(status.resource_id.as_str(), ()).is_some() {
-            return Err(HostError::Wire(ErrorBody::new(
-                WireErrorCode::InvalidRequest,
-                format!(
-                    "malformed {op} reply: resource {:?} appears in `statuses` more than once;                      every requested resource_id appears exactly once",
-                    status.resource_id
-                ),
+        if !seen.insert(status.resource_id.as_str()) {
+            return Err(malformed(format!(
+                "resource {:?} appears in `statuses` more than once",
+                status.resource_id
+            )));
+        }
+    }
+    for resource_id in requested {
+        if !seen.contains(resource_id) {
+            return Err(malformed(format!(
+                "resource {resource_id:?} was requested and does not appear in `statuses` at all"
             )));
         }
     }

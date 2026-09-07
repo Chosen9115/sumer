@@ -149,6 +149,12 @@ pub fn drained_status(next: Option<Value>) -> Value {
 /// One element of `script.runs`.
 pub struct Run {
     pub derivation: String,
+    /// The `adapter_id` this run's HELLO announces. Defaults to
+    /// [`ADAPTER_ID`], the id the store has on file; a run that announces
+    /// anything else is a connection that is not the adapter we recorded.
+    pub hello_adapter_id: String,
+    /// Answer `status.read` with an `err` envelope instead of a reply.
+    pub status_err: bool,
     pub history: Vec<Value>,
     pub statuses: Value,
     pub balances: Vec<Value>,
@@ -161,6 +167,8 @@ impl Run {
     pub fn new(history: Vec<Value>) -> Run {
         Run {
             derivation: DERIVATION.to_owned(),
+            hello_adapter_id: ADAPTER_ID.to_owned(),
+            status_err: false,
             history,
             statuses: json!([{"resource_id": RESOURCE_ID}]),
             balances: Vec::new(),
@@ -180,6 +188,20 @@ impl Run {
     /// The VANTAGE this run reads from -- `ResourceDescriptor.provider_id`.
     pub fn provider_id(mut self, provider_id: &str) -> Run {
         self.provider_id = provider_id.to_owned();
+        self
+    }
+
+    /// What this run's HELLO calls itself.
+    pub fn announces(mut self, adapter_id: &str) -> Run {
+        self.hello_adapter_id = adapter_id.to_owned();
+        self
+    }
+
+    /// `status.read` fails outright -- the read that happens before
+    /// `balances.read` and can therefore return before any balance is
+    /// recorded.
+    pub fn status_read_err(mut self) -> Run {
+        self.status_err = true;
         self
     }
 
@@ -210,7 +232,7 @@ impl Run {
             "label": "store test",
             "hello": {
                 "protocol": "1",
-                "adapter_id": ADAPTER_ID,
+                "adapter_id": self.hello_adapter_id,
                 "adapter_version": "0.1.0",
                 "capabilities": ["resources.list", "balances.read", "history.read", "status.read"],
                 "local_id_derivation": self.derivation,
@@ -225,7 +247,11 @@ impl Run {
                     "label": "Checking",
                     "provider_extra": self.resource_extra
                 }]}}]}],
-                "status.read": [{"do": [{"op": "reply_ok", "body": {"statuses": self.statuses}}]}],
+                "status.read": [{"do": [if self.status_err {
+                    json!({"op": "reply_err", "code": "unavailable", "message": "status.read is down"})
+                } else {
+                    json!({"op": "reply_ok", "body": {"statuses": self.statuses}})
+                }]}],
                 "balances.read": [{"do": [{"op": "reply_ok", "body": {
                     "observations": self.balances,
                     "statuses": self.balance_statuses
@@ -296,6 +322,21 @@ pub async fn refresh_run(
     let transcript = handle.transcript();
     let _ = handle.close().await;
     (reports, transcript)
+}
+
+/// One full refresh over one run of a fixture, returning whatever it
+/// returned -- for the refreshes that are supposed to FAIL.
+pub async fn refresh_run_result(
+    store: &mut Store,
+    fixture: &Path,
+    run: usize,
+) -> sumer_store::error::Result<()> {
+    let handle = connect(fixture, run).await;
+    let result =
+        sumer_store::refresh::refresh_adapter(store, &handle, ADAPTER_ID, SweepOptions::default())
+            .await;
+    let _ = handle.close().await;
+    result.map(|_| ())
 }
 
 /// The one sweep report a single-resource fixture produces.

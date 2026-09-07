@@ -494,6 +494,132 @@ async fn an_observation_claiming_another_adapter_disqualifies_and_is_refused() {
     );
 }
 
+/// **Condition (8) is about the CONNECTION'S id, not the stored one.**
+///
+/// Connect adapter `A`; later, the process behind `A`'s stored argv
+/// announces HELLO `B` and hands back an observation whose provenance says
+/// `A`. Comparing that provenance against the id we REMEMBERED accepts it,
+/// counts `keep` as reported, and retracts `drop` -- on the testimony of a
+/// connection that never claimed to be this adapter at all. Condition (8)
+/// exists precisely so a host holding two notions of one chain cannot
+/// conclude an absence; validating against the identity we remembered
+/// rather than the one that just announced itself IS the confusion it was
+/// written to catch.
+///
+/// The refusal is the whole refresh, not one observation at a time: a
+/// connection whose HELLO disagrees with the record we opened it for is
+/// not that adapter, and nothing it says can be attributed to a record it
+/// does not claim.
+#[tokio::test]
+async fn a_connection_announcing_another_adapter_fails_the_whole_refresh() {
+    if !support::python3_available() {
+        return;
+    }
+    let scratch = Scratch::new("impostor");
+    let fixture = fixture(
+        &scratch,
+        vec![
+            plant(),
+            // Announces `impostor`, and every observation on the page
+            // carries the STORED id `fake-adapter` in its provenance.
+            Run::new(vec![page(
+                None,
+                vec![obs("keep", "11.00")],
+                drained_status(None),
+            )])
+            .announces("impostor"),
+        ],
+    );
+    let mut store = store(&scratch);
+    let planted = only(
+        refresh_run(&mut store, &fixture, 0, SweepOptions::default())
+            .await
+            .0,
+    );
+    assert!(planted.complete);
+
+    let failed = support::refresh_run_result(&mut store, &fixture, 1).await;
+    let message = failed
+        .expect_err("a connection that is not this adapter is refused")
+        .to_string();
+    assert!(
+        message.contains("impostor") && message.contains(support::ADAPTER_ID),
+        "the error names both identities the host was holding: {message}"
+    );
+    assert_eq!(
+        retractions(&store),
+        Vec::<(String, String)>::new(),
+        "nothing a connection we cannot identify says may retract anything"
+    );
+    assert!(live_ids(&store).contains(&"drop".to_owned()));
+    assert_eq!(
+        chain_len(&store, "keep"),
+        1,
+        "and nothing it said was stored under the id it did not announce"
+    );
+}
+
+/// **Condition (8) is judged before the resource filter, not after.**
+///
+/// §8.1 (8) is "EVERY observation's `provenance.adapter_id` was the
+/// connection's own" -- every observation on the page, not merely the ones
+/// addressed to the resource being swept. Filtering by `resource_id` first
+/// let a page carry contrary evidence past the gate: the honest `keep`
+/// completed the sweep, the foreign record under some other resource was
+/// `continue`d before anyone looked at its provenance, and `drop` was
+/// retracted by a host that had just been handed proof it was holding two
+/// notions of one chain.
+#[tokio::test]
+async fn a_foreign_observation_under_another_resource_still_disqualifies() {
+    if !support::python3_available() {
+        return;
+    }
+    let scratch = Scratch::new("foreign-other-resource");
+    let mut intruder = obs("intruder", "99.00");
+    intruder["resource_id"] = json!("other");
+    intruder["provenance"] = json!({"adapter_id": "some-other-adapter"});
+    let fixture = fixture(
+        &scratch,
+        vec![
+            plant(),
+            Run::new(vec![page(
+                None,
+                vec![obs("keep", "11.00"), intruder],
+                drained_status(None),
+            )]),
+        ],
+    );
+    let mut store = store(&scratch);
+    let planted = only(
+        refresh_run(&mut store, &fixture, 0, SweepOptions::default())
+            .await
+            .0,
+    );
+    assert!(planted.complete);
+
+    let report = only(
+        refresh_run(&mut store, &fixture, 1, SweepOptions::default())
+            .await
+            .0,
+    );
+    assert_eq!(
+        report.disqualified_reason.as_deref(),
+        Some("an observation's provenance named another adapter"),
+        "the resource an intruder addresses does not change what it is"
+    );
+    assert_eq!(
+        retractions(&store),
+        Vec::<(String, String)>::new(),
+        "a page carrying contrary evidence is never judged complete"
+    );
+    assert!(live_ids(&store).contains(&"drop".to_owned()));
+    assert_eq!(
+        chain_len(&store, "intruder"),
+        0,
+        "and the intruder is still refused, not stored"
+    );
+}
+
 // ---------------------------------------------------------------------
 // (1) A cursor-started sweep -- which is also L5
 // ---------------------------------------------------------------------

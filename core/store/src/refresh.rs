@@ -68,6 +68,13 @@ pub async fn refresh(store: &mut Store, options: &RefreshOptions) -> Result<Refr
         let handle = match AdapterHandle::spawn(adapter.argv.clone(), []).await {
             Ok(handle) => handle,
             Err(e) => {
+                // Nothing was read from this adapter, so nothing it last
+                // reported may go on rendering `live`.
+                mark_adapter_unread(
+                    store.conn(),
+                    &adapter.adapter_id,
+                    &format!("spawn failed: {e}"),
+                )?;
                 report
                     .adapter_errors
                     .push((adapter.adapter_id.clone(), e.to_string()));
@@ -115,8 +122,44 @@ pub async fn refresh_adapter(
     options: SweepOptions,
 ) -> Result<AdapterRefresh> {
     let mut errors = Vec::new();
-    let hello_derivation = handle.hello().local_id_derivation.clone();
-    let listed = handle.resources_list().await?;
+    let hello = handle.hello();
+    // **The connection must be the adapter we opened it for.**
+    //
+    // Everything below keys rows, chains and gate condition (8) by
+    // `adapter_id` -- the id read out of SQLite. The connection announces
+    // its own in HELLO. When those disagree the host is holding two notions
+    // of one chain before a single observation has arrived, which is the
+    // exact condition (8) exists to refuse; judging observations against
+    // the id we REMEMBERED would let the impostor's page look native and
+    // retract records it never spoke for.
+    //
+    // Refused as a whole rather than observation by observation: this is
+    // not a bad record inside a good connection, it is a connection that
+    // never claimed to be this adapter. There is nowhere honest to put
+    // anything it says -- under the stored id the host would be recording a
+    // provenance the connection denies, and under the announced id one
+    // adapter would be writing another's history (`spec/wire.md` §10).
+    if hello.adapter_id != adapter_id {
+        return early_failure(
+            store.conn(),
+            adapter_id,
+            format!(
+                "hello announced adapter_id {:?} on the connection opened for {adapter_id:?}",
+                hello.adapter_id
+            ),
+        );
+    }
+    let hello_derivation = hello.local_id_derivation.clone();
+    let listed = match handle.resources_list().await {
+        Ok(listed) => listed,
+        Err(e) => {
+            return early_failure(
+                store.conn(),
+                adapter_id,
+                format!("resources.list failed: {e}"),
+            )
+        }
+    };
     let resource_ids: Vec<String> = listed
         .resources
         .iter()
@@ -135,7 +178,12 @@ pub async fn refresh_adapter(
     // `status.read` is what the history_start exemption reads. It is also
     // where `needs_reauth` comes from -- a credential the user must renew
     // is not a discrepancy, it is a fact about the connection.
-    let statuses = handle.status_read(resource_ids.clone()).await?.statuses;
+    let statuses = match handle.status_read(resource_ids.clone()).await {
+        Ok(reply) => reply.statuses,
+        Err(e) => {
+            return early_failure(store.conn(), adapter_id, format!("status.read failed: {e}"))
+        }
+    };
     let needs_reauth = statuses.iter().any(|s| {
         matches!(
             s.outcome,
@@ -223,6 +271,41 @@ pub async fn refresh_adapter(
         sweeps: reports,
         errors,
     })
+}
+
+/// Leaves a refresh that never reached `balances.read`, marking every
+/// figure it did not read.
+///
+/// `mark_unread` used to be reachable only from inside the `balances.read`
+/// arm, so every path that returned before it -- a spawn failure, a
+/// `resources.list` failure, a `status.read` failure, a connection that is
+/// not this adapter -- left the LAST SUCCESSFUL read's rows on top of the
+/// stream, still stamped `live`. One good read followed by a permanent
+/// failure printed a `live` figure from a read that happened days ago,
+/// indefinitely. The refresh error IS reported, but the error and the
+/// figure arrive in two different places and only one of them is the number
+/// the user acts on.
+///
+/// The resources come from the STORE, not from this run's
+/// `resources.list`: the failure may well be that no listing happened.
+fn early_failure<T>(conn: &rusqlite::Connection, adapter_id: &str, reason: String) -> Result<T> {
+    mark_adapter_unread(conn, adapter_id, &reason)?;
+    Err(StoreError::Host(reason))
+}
+
+/// [`mark_unread`] over every resource this adapter has on file, for the
+/// case where nothing at all was read.
+fn mark_adapter_unread(conn: &rusqlite::Connection, adapter_id: &str, reason: &str) -> Result<()> {
+    for resource in store::resources(conn, Some(adapter_id))? {
+        mark_unread(
+            conn,
+            adapter_id,
+            &resource.resource_id,
+            reason,
+            &HashSet::new(),
+        )?;
+    }
+    Ok(())
 }
 
 /// A `balances.read` that produced nothing for a category of

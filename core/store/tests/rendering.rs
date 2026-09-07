@@ -12,14 +12,115 @@ mod support;
 use serde_json::{json, Value};
 use support::{balance, drained_status, fixture, obs, page, refresh_run, store, Run, Scratch};
 
+use sumer_money::{Amount, AssetId};
 use sumer_store::render::balance_line;
 use sumer_store::store::{balance_history, BalanceRow};
 use sumer_store::sweep::SweepOptions;
+use sumer_wire::Staleness;
 
 fn line(store: &sumer_store::Store, category: &str) -> String {
     let history = balance_history(store.conn(), support::ADAPTER_ID, support::RESOURCE_ID).unwrap();
     let rows: Vec<&BalanceRow> = history.iter().filter(|r| r.category == category).collect();
     balance_line(category, &rows)
+}
+
+/// A hand-built row, for the two `balance_line` tests below that check
+/// which row's fields end up on the recovered line -- no adapter, no
+/// fixture, just the shape `balance_history` would hand back.
+fn row(
+    provider_id: &str,
+    amount: Option<&str>,
+    received_at: &str,
+    staleness: Staleness,
+    outcome: &str,
+) -> BalanceRow {
+    BalanceRow {
+        balance_id: 0,
+        adapter_id: support::ADAPTER_ID.to_owned(),
+        resource_id: support::RESOURCE_ID.to_owned(),
+        category: "available".to_owned(),
+        canonical_hint: None,
+        amount: amount.map(|a| Amount::parse(AssetId::new("usd").unwrap(), a).unwrap()),
+        provider_id: provider_id.to_owned(),
+        received_at: received_at.to_owned(),
+        staleness,
+        outcome: outcome.to_owned(),
+    }
+}
+
+/// **The bug**: a null balance from a DIFFERENT provider than the one that
+/// last reported a figure must not steal that figure's identity. Provider
+/// "a" reported `42.00`, cached as of 2026-01-01, received 2026-01-10.
+/// Provider "b" later reports nothing at all. The recovered `42.00` is
+/// still A's: A's provider, A's own as-of date, not the date B's failed
+/// read was received.
+#[test]
+fn a_null_balance_from_a_different_provider_keeps_the_original_providers_identity() {
+    let cached = row(
+        "provider-a",
+        Some("42.00"),
+        "2026-01-10T00:00:00Z",
+        Staleness::Cached,
+        "stale:2026-01-01T00:00:00Z",
+    );
+    let failed = row(
+        "provider-b",
+        None,
+        "2026-01-20T00:00:00Z",
+        Staleness::Unavailable,
+        "unavailable",
+    );
+    let line = balance_line("available", &[&cached, &failed]);
+
+    assert!(
+        line.contains("provider-a"),
+        "the figure is A's, so A must be the credited provider: {line}"
+    );
+    assert!(
+        !line.contains("provider-b"),
+        "B reported nothing -- it must not be attributed A's number: {line}"
+    );
+    assert!(
+        line.contains("2026-01-01"),
+        "the freshness date is the adapter's own as-of, not a receipt time: {line}"
+    );
+    assert!(
+        !line.contains("2026-01-10") && !line.contains("2026-01-20"),
+        "neither row's receipt time belongs in the as-of slot: {line}"
+    );
+}
+
+/// **The same bug, the `unread:` marker shape**: a host-authored marker
+/// (§ref `mark_unread`) copies the adapter's own provider forward, so
+/// provider attribution is never wrong here -- but its `received_at` is
+/// host-stamped at the moment the marker was written, which must not
+/// replace the adapter's own claimed as-of date on the recovered line.
+#[test]
+fn an_unread_marker_after_a_cached_balance_keeps_the_adapters_own_as_of_date() {
+    let cached = row(
+        "provider-a",
+        Some("42.00"),
+        "2026-01-10T00:00:00Z",
+        Staleness::Cached,
+        "stale:2026-01-01T00:00:00Z",
+    );
+    let marker = row(
+        "provider-a",
+        None,
+        "2026-01-20T00:00:00Z",
+        Staleness::Unavailable,
+        "unread:refresh_failed",
+    );
+    let line = balance_line("available", &[&cached, &marker]);
+
+    assert!(
+        line.contains("2026-01-01"),
+        "the adapter's own as-of survives past the marker: {line}"
+    );
+    assert!(
+        !line.contains("2026-01-20"),
+        "the marker's receipt time must not masquerade as the as-of date: {line}"
+    );
 }
 
 /// **L6**: the adapter's amount text, byte for byte. `"42.00"` is not

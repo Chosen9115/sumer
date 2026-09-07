@@ -59,7 +59,15 @@ pub fn now_rfc3339() -> Rfc3339 {
 /// `None` when the text is not a timestamp this can order. Callers deciding
 /// whether to retract a record MUST treat that as "cannot order, so do not
 /// retract": a wrong exemption costs a stale row, a wrong retraction hides
-/// a financial record.
+/// a financial record. Two of those cases are values `sumer_wire`'s
+/// validator accepts and this cannot place on a line: a date the calendar
+/// does not have (`2026-02-30`, admitted because the validator checks
+/// `day <= 31` without the month), and a fraction finer than a nanosecond
+/// (`.0000000001`, admitted because the validator does not bound the
+/// fraction's length). Both would otherwise be answered with a *plausible
+/// wrong instant* -- a rolled-forward date, or a truncation that makes two
+/// different instants equal -- and a plausible wrong instant is what
+/// retracts a record that was never inside the window.
 #[must_use]
 pub fn instant(ts: &Rfc3339) -> Option<(i64, u32)> {
     let b = ts.as_str().as_bytes();
@@ -82,6 +90,20 @@ pub fn instant(ts: &Rfc3339) -> Option<(i64, u32)> {
             i += 1;
         }
         if i == start {
+            return None;
+        }
+        // Finer than a nanosecond: `(i64, u32)` has no value that is the
+        // right answer, and truncating to nine digits makes two different
+        // instants compare EQUAL. That is not a rounding error at the
+        // gate, it is a sign flip: with the record at `.0000000001` and
+        // `history_start` at `.0000000002` the record strictly precedes
+        // the bound, but truncation makes `at >= start` hold and the
+        // record retraction-eligible. Unorderable, so the caller exempts.
+        // Trailing zeros are not precision -- `.5000000000` is exactly
+        // 500ms -- so only a non-zero digit past the ninth disqualifies.
+        if b.get(start + 9..i)
+            .is_some_and(|beyond_nanos| beyond_nanos.iter().any(|d| *d != b'0'))
+        {
             return None;
         }
         // Nine digits of resolution, zero-padded on the right: a shorter
@@ -115,8 +137,20 @@ pub fn instant(ts: &Rfc3339) -> Option<(i64, u32)> {
         _ => return None,
     };
 
-    let secs = days_from_civil(year, month, day) * 86_400 + hour * 3600 + minute * 60 + second
-        - offset_secs;
+    // `Rfc3339` admits `day <= 31` without consulting the month, and
+    // `days_from_civil` answers for a day number the calendar does not
+    // have by rolling forward -- `2026-02-30` comes back as March 2. An
+    // impossible date is not a date, and normalising it into a *different,
+    // valid* one moves the record across `history_start` in whichever
+    // direction the arithmetic happens to go. `civil_from_days` only ever
+    // returns real dates, so the round trip is the check: it holds exactly
+    // when the input was a date.
+    let days = days_from_civil(year, month, day);
+    if civil_from_days(days) != (year, month, day) {
+        return None;
+    }
+
+    let secs = days * 86_400 + hour * 3600 + minute * 60 + second - offset_secs;
     Some((secs, nanos))
 }
 
@@ -151,9 +185,10 @@ fn civil_from_days(days: i64) -> (i64, i64, i64) {
 
 /// The exact inverse: day count since the Unix epoch from a civil date.
 /// Hinnant's `days_from_civil`, which stays monotonic on a day number the
-/// calendar does not have (`2026-02-31`) rather than rejecting it --
-/// [`sumer_wire::Rfc3339`] admits `day <= 31` without consulting the
-/// month, so this must have an answer for one.
+/// calendar does not have (`2026-02-31`) rather than rejecting it. That
+/// answer is not a date and callers must not use it as one: [`instant`]
+/// round-trips through [`civil_from_days`] to reject those, which works
+/// precisely because `civil_from_days` only ever emits real dates.
 fn days_from_civil(year: i64, month: i64, day: i64) -> i64 {
     let y = year - i64::from(month <= 2);
     let era = y.div_euclid(400);
