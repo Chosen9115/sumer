@@ -161,6 +161,11 @@ pub struct Run {
     pub resource_extra: Value,
     pub provider_id: String,
     pub balance_statuses: Option<Value>,
+    /// What this run's `resources.list` reports. Defaults to the one test
+    /// resource; `lists` can OMIT it, which is the shape every test here
+    /// used to be structurally unable to express -- and the shape a
+    /// resource that quietly stops being listed arrives in.
+    pub resource_ids: Vec<String>,
 }
 
 impl Run {
@@ -175,7 +180,15 @@ impl Run {
             resource_extra: json!({}),
             provider_id: "p1".to_owned(),
             balance_statuses: None,
+            resource_ids: vec![RESOURCE_ID.to_owned()],
         }
+    }
+
+    /// The resources this run's `resources.list` reports -- an empty list
+    /// for an adapter that has stopped listing the one it used to.
+    pub fn lists(mut self, resource_ids: &[&str]) -> Run {
+        self.resource_ids = resource_ids.iter().map(|id| (*id).to_owned()).collect();
+        self
     }
 
     /// The `statuses` of the `balances.read` reply -- what the host derives
@@ -240,13 +253,15 @@ impl Run {
             },
             "provenance": provenance_defaults(),
             "on": {
-                "resources.list": [{"do": [{"op": "reply_ok", "body": {"resources": [{
-                    "resource_id": RESOURCE_ID,
-                    "provider_id": self.provider_id,
-                    "kind": "bank_checking",
-                    "label": "Checking",
-                    "provider_extra": self.resource_extra
-                }]}}]}],
+                "resources.list": [{"do": [{"op": "reply_ok", "body": {
+                    "resources": self.resource_ids.iter().map(|resource_id| json!({
+                        "resource_id": resource_id,
+                        "provider_id": self.provider_id,
+                        "kind": "bank_checking",
+                        "label": "Checking",
+                        "provider_extra": self.resource_extra
+                    })).collect::<Vec<_>>()
+                }}]}],
                 "status.read": [{"do": [if self.status_err {
                     json!({"op": "reply_err", "code": "unavailable", "message": "status.read is down"})
                 } else {

@@ -38,7 +38,15 @@ use rusqlite::Connection;
 /// holding two derivations of one column under one name is the quiet
 /// inconsistency `user_version` exists to refuse. Nothing is released, so
 /// the cost is a `sumer` profile no one has yet.
-pub const USER_VERSION: i64 = 2;
+///
+/// **3**: balance freshness is DERIVED rather than marked. `adapter` gained
+/// `balance_read` and `balance` gained `read_id` (see the tables below);
+/// the host-authored `unread:` marker rows that used to answer the same
+/// question are gone. A pre-3 database holds balance rows with no read to
+/// attribute them to, which is exactly the "figure from a read nobody can
+/// name" this version exists to make impossible -- so it is refused, not
+/// guessed at.
+pub const USER_VERSION: i64 = 3;
 
 const DDL: &str = r"
 CREATE TABLE adapter (
@@ -48,7 +56,16 @@ CREATE TABLE adapter (
     -- retraction gate never reads it (frozen contract: condition (7) gates
     -- on the per-sweep hello value only).
     local_id_derivation TEXT,
-    needs_reauth        INTEGER NOT NULL DEFAULT 0
+    needs_reauth        INTEGER NOT NULL DEFAULT 0,
+    -- The READ that is current for this adapter: bumped once, before
+    -- anything that can fail, every time a refresh of this adapter begins.
+    -- A balance line is fresh iff its `read_id` is this value, so a read
+    -- that failed -- anywhere, for any reason, including reasons nobody
+    -- enumerated -- writes no row carrying it and every figure it did not
+    -- refresh stops reading `live` by construction. `0` is the value no
+    -- balance row can ever carry (`open_balance_read` returns 1 first), so
+    -- an adapter that has never been refreshed has nothing fresh.
+    balance_read        INTEGER NOT NULL DEFAULT 0
 ) STRICT;
 
 CREATE TABLE resource (
@@ -131,6 +148,10 @@ CREATE INDEX observation_by_resource ON observation (adapter_id, resource_id, ob
 CREATE TABLE balance (
     balance_id       INTEGER PRIMARY KEY,
     adapter_id       TEXT NOT NULL,
+    -- Which read produced this line (`adapter.balance_read` at the time).
+    -- This is the whole of freshness: the row is `live` iff this still
+    -- equals its adapter's current read.
+    read_id          INTEGER NOT NULL,
     resource_id      TEXT NOT NULL,
     category         TEXT NOT NULL,
     canonical_hint   TEXT,
@@ -153,10 +174,10 @@ CREATE TABLE retraction (
     retraction_id INTEGER PRIMARY KEY,
     adapter_id    TEXT NOT NULL,
     local_id      TEXT NOT NULL,
-    -- The chain-head revision this retracts. A record is live iff its
-    -- chain head's revision EXCEEDS every retraction revision for its key,
-    -- so a later sweep appending revision N+1 revives it with no special
-    -- case anywhere.
+    -- The chain's highest revision this retracts. A record is live iff its
+    -- chain's highest revision EXCEEDS every retraction revision for its
+    -- key, so a later sweep appending revision N+1 revives it with no
+    -- special case anywhere.
     revision      INTEGER NOT NULL,
     reason        TEXT NOT NULL,
     crawl_id      INTEGER NOT NULL REFERENCES crawl(crawl_id),

@@ -400,6 +400,41 @@ async fn host_stamps_received_at_and_computes_live_staleness() {
     assert!(provenance.received_at.as_str().ends_with('Z'));
 }
 
+/// **A balance naming another adapter is refused where it is detectable.**
+///
+/// The connection announced `a` in its hello and then handed over a figure
+/// whose `provenance.adapter_id` is `b`. One layer down the store has only
+/// the connection's own id to file it under, so the contradiction would be
+/// discarded and `b`'s money recorded as `a`'s. `history.read` refuses this
+/// shape at the retraction gate (spec/observation.md §8.1 condition 8); a
+/// balance passes no gate at all, so the check belongs here, at the decode,
+/// where the hello is still in reach.
+///
+/// The whole reply goes, not the one line: everything after this decodes
+/// into rows nobody re-examines, so dropping the single balance would leave
+/// the rest to be stored as if the connection had never contradicted
+/// itself.
+#[tokio::test]
+async fn a_balance_naming_another_adapter_is_refused() {
+    let script = format!(
+        "{PRELUDE}\nhello_ok(read(), capabilities=['balances.read'])\nreq = read()\nsend({{'id': req['id'], 'ok': {{\n    'observations': [{{\n        'resource_id': 'acct1', 'category': 'available',\n        'amount': {{'asset': 'usd', 'amount': '2000.00'}},\n        'provenance': {{'adapter_id': 'b', 'provider_id': 'p', 'surface': 's',\n                       'observed_at': '2026-01-01T00:00:00Z',\n                       'completeness': 'complete'}}\n    }}],\n    'statuses': [{{'resource_id': 'acct1', 'outcome': {{'fetched': {{'page_empty': False}}}}}}]\n}}}})\n"
+    );
+    let handle = spawn(&script, Duration::from_secs(2))
+        .await
+        .expect("handshake");
+    match handle.balances_read(vec!["acct1".to_owned()]).await {
+        Err(HostError::Wire(err)) => {
+            assert_eq!(err.code, sumer_wire::WireErrorCode::InvalidRequest);
+            assert!(
+                err.message.contains("adapter_id") && err.message.contains("\"b\""),
+                "the refusal names the contradiction: {}",
+                err.message
+            );
+        }
+        other => panic!("a balance attributed to another adapter must be refused: {other:?}"),
+    }
+}
+
 // ---------------------------------------------------------------------
 // Backpressure: the deadline bounds the write too, not just the wait
 // ---------------------------------------------------------------------

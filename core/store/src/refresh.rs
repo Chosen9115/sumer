@@ -4,8 +4,21 @@
 //! One connection per adapter per refresh -- condition (7) is about a
 //! connection, and every resource of one adapter is swept over the same
 //! one.
-
-use std::collections::{BTreeSet, HashSet};
+//!
+//! **Freshness is derived, not marked.** A balance line is `live` iff the
+//! read that wrote it is still its adapter's current one. The read is
+//! opened once per adapter per refresh, before the spawn -- before
+//! anything that can fail -- so a resource that was not read has no new
+//! row and is stale *by construction*: a `balances.read` that failed, a
+//! reply that left a category out, a resource the adapter stopped listing,
+//! a `status.read` that never returned, a process that would not start,
+//! and every failure nobody has thought of yet all produce the same
+//! nothing, and nothing is exactly the right answer.
+//!
+//! This replaces a marker row written on each failing path. Four
+//! adversarial rounds found four such paths that had been missed, which is
+//! what a rule that has to be re-applied by hand at every exit looks like.
+//! There is now no code to omit.
 
 use sumer_host::AdapterHandle;
 use sumer_wire::ReadOutcome;
@@ -65,16 +78,15 @@ pub async fn refresh(store: &mut Store, options: &RefreshOptions) -> Result<Refr
         {
             continue;
         }
+        // The read opens BEFORE the spawn, because the spawn is one of the
+        // things that can fail. Nothing else in this function has to know
+        // that: a refresh that never reaches an adapter writes no balance
+        // row carrying this read, and every figure it did not refresh is
+        // stale by construction rather than by remembering.
+        store::open_balance_read(store.conn(), &adapter.adapter_id)?;
         let handle = match AdapterHandle::spawn(adapter.argv.clone(), []).await {
             Ok(handle) => handle,
             Err(e) => {
-                // Nothing was read from this adapter, so nothing it last
-                // reported may go on rendering `live`.
-                mark_adapter_unread(
-                    store.conn(),
-                    &adapter.adapter_id,
-                    &format!("spawn failed: {e}"),
-                )?;
                 report
                     .adapter_errors
                     .push((adapter.adapter_id.clone(), e.to_string()));
@@ -122,6 +134,12 @@ pub async fn refresh_adapter(
     options: SweepOptions,
 ) -> Result<AdapterRefresh> {
     let mut errors = Vec::new();
+    // Same reason as in `refresh`, for the same cost: one line, on the one
+    // path that always runs. Opening a second read for a refresh that
+    // already opened one changes nothing -- only the current value is ever
+    // compared against -- so this is not a duplicate rule, it is the rule
+    // holding for the callers that spawn their own connection.
+    let read_id = store::open_balance_read(store.conn(), adapter_id)?;
     let hello = handle.hello();
     // **The connection must be the adapter we opened it for.**
     //
@@ -140,25 +158,15 @@ pub async fn refresh_adapter(
     // provenance the connection denies, and under the announced id one
     // adapter would be writing another's history (`spec/wire.md` §10).
     if hello.adapter_id != adapter_id {
-        return early_failure(
-            store.conn(),
-            adapter_id,
-            format!(
-                "hello announced adapter_id {:?} on the connection opened for {adapter_id:?}",
-                hello.adapter_id
-            ),
-        );
+        return Err(StoreError::Host(format!(
+            "hello announced adapter_id {:?} on the connection opened for {adapter_id:?}",
+            hello.adapter_id
+        )));
     }
     let hello_derivation = hello.local_id_derivation.clone();
     let listed = match handle.resources_list().await {
         Ok(listed) => listed,
-        Err(e) => {
-            return early_failure(
-                store.conn(),
-                adapter_id,
-                format!("resources.list failed: {e}"),
-            )
-        }
+        Err(e) => return Err(StoreError::Host(format!("resources.list failed: {e}"))),
     };
     let resource_ids: Vec<String> = listed
         .resources
@@ -180,9 +188,7 @@ pub async fn refresh_adapter(
     // is not a discrepancy, it is a fact about the connection.
     let statuses = match handle.status_read(resource_ids.clone()).await {
         Ok(reply) => reply.statuses,
-        Err(e) => {
-            return early_failure(store.conn(), adapter_id, format!("status.read failed: {e}"))
-        }
+        Err(e) => return Err(StoreError::Host(format!("status.read failed: {e}"))),
     };
     let needs_reauth = statuses.iter().any(|s| {
         matches!(
@@ -196,61 +202,16 @@ pub async fn refresh_adapter(
     // the adapter's exact amount string, or NULL for "looked, don't know".
     match handle.balances_read(resource_ids.clone()).await {
         Ok(read) => {
-            // Coverage is keyed per (resource, CATEGORY). Per resource is
-            // one level too coarse: `spec/observation.md` §2 documents
-            // Teller as guaranteeing only that *at least one* of two
-            // categories appears in any given response, so a wholly
-            // successful read routinely drops a category the last one
-            // carried -- and that category's last row goes on reading
-            // `live` forever if the resource merely being mentioned counts
-            // as covering it.
-            let mut covered = HashSet::new();
             for balance in &read.observations {
-                covered.insert((balance.resource_id.as_str(), balance.category.as_str()));
                 let outcome = read
                     .statuses
                     .iter()
                     .find(|s| s.resource_id == balance.resource_id)
                     .map_or_else(|| "unknown".to_owned(), |s| outcome_label(&s.outcome));
-                store::append_balance(store.conn(), adapter_id, balance, &outcome)?;
-            }
-            // Every category this reply said nothing about -- because the
-            // resource carried an `unavailable`/`gone`/etc. status with
-            // nothing attached, or because the reply simply left that one
-            // category out. Whatever it last reported must not go on
-            // reading `live` forever just because nothing rewrote it.
-            for resource_id in &resource_ids {
-                let reason = read
-                    .statuses
-                    .iter()
-                    .find(|s| s.resource_id == *resource_id)
-                    .map_or_else(
-                        || "no_observation".to_owned(),
-                        |s| outcome_label(&s.outcome),
-                    );
-                mark_unread(store.conn(), adapter_id, resource_id, &reason, &covered)?;
+                store::append_balance(store.conn(), adapter_id, read_id, balance, &outcome)?;
             }
         }
-        Err(e) => {
-            // A failed balances read never erases the last figure: every
-            // category the resource has ever reported gets a fresh row
-            // with the amount withheld and staleness downgraded, so
-            // rendering's fallback (render.rs's rule 2) finds a non-live
-            // row on top and shows the last observed figure marked stale
-            // instead of replaying whatever staleness the last SUCCESSFUL
-            // read happened to leave behind. It is still a failed read, so
-            // it is reported and the process exits 1.
-            for resource_id in &resource_ids {
-                mark_unread(
-                    store.conn(),
-                    adapter_id,
-                    resource_id,
-                    &format!("balances.read failed: {e}"),
-                    &HashSet::new(),
-                )?;
-            }
-            errors.push(format!("balances.read failed: {e}"));
-        }
+        Err(e) => errors.push(format!("balances.read failed: {e}")),
     }
 
     let mut reports = Vec::new();
@@ -271,123 +232,6 @@ pub async fn refresh_adapter(
         sweeps: reports,
         errors,
     })
-}
-
-/// Leaves a refresh that never reached `balances.read`, marking every
-/// figure it did not read.
-///
-/// `mark_unread` used to be reachable only from inside the `balances.read`
-/// arm, so every path that returned before it -- a spawn failure, a
-/// `resources.list` failure, a `status.read` failure, a connection that is
-/// not this adapter -- left the LAST SUCCESSFUL read's rows on top of the
-/// stream, still stamped `live`. One good read followed by a permanent
-/// failure printed a `live` figure from a read that happened days ago,
-/// indefinitely. The refresh error IS reported, but the error and the
-/// figure arrive in two different places and only one of them is the number
-/// the user acts on.
-///
-/// The resources come from the STORE, not from this run's
-/// `resources.list`: the failure may well be that no listing happened.
-fn early_failure<T>(conn: &rusqlite::Connection, adapter_id: &str, reason: String) -> Result<T> {
-    mark_adapter_unread(conn, adapter_id, &reason)?;
-    Err(StoreError::Host(reason))
-}
-
-/// [`mark_unread`] over every resource this adapter has on file, for the
-/// case where nothing at all was read.
-fn mark_adapter_unread(conn: &rusqlite::Connection, adapter_id: &str, reason: &str) -> Result<()> {
-    for resource in store::resources(conn, Some(adapter_id))? {
-        mark_unread(
-            conn,
-            adapter_id,
-            &resource.resource_id,
-            reason,
-            &HashSet::new(),
-        )?;
-    }
-    Ok(())
-}
-
-/// A `balances.read` that produced nothing for a category of
-/// `resource_id` -- the call failed outright, this reply had no
-/// observation for the resource, or it named the resource and left this
-/// one category out -- must not leave the LAST successful read's
-/// staleness sitting there looking current. This re-records every
-/// category `covered` does not name, figure withheld (never a zero, never
-/// a guess), so the next render finds a non-live row on top and falls back
-/// to the last known amount marked stale (or `unavailable`, if there never
-/// was one) instead of reprinting a `live` line for a read that did not
-/// happen this time.
-///
-/// **The row invents nothing.** It is written as a COPY of the row it
-/// marks unread, so every adapter-authored column -- `canonical_hint`,
-/// `provider_id`, `surface`, `observed_at`, `effective_at` -- carries the
-/// adapter's own last value rather than something the host made up. That
-/// is structural here, not a promise: a host that fills in provenance on
-/// its own behalf is fabricating provider evidence, which is the failure
-/// §8.4 gave retractions their own table to avoid, and this stream has no
-/// separate table to move to.
-///
-/// The four columns that are NOT copied are the host's own: `amount` is
-/// NULL because nothing was read, `received_at` is host-stamped by
-/// definition (§1), `staleness` is host-computed and never on the wire
-/// (§1), and `completeness` is set to the enum's explicit "no claim"
-/// variant -- carrying a `complete` forward onto a read that never
-/// happened would be the fabrication this function is avoiding.
-///
-/// A consumer tells a marker from an adapter row by `outcome`, the one
-/// column the host authors even on the success path: a marker's always
-/// begins `unread:`, and no adapter row's ever does.
-///
-/// A category with no balance history is left alone: there is no figure to
-/// protect from looking falsely current.
-fn mark_unread(
-    conn: &rusqlite::Connection,
-    adapter_id: &str,
-    resource_id: &str,
-    reason: &str,
-    covered: &HashSet<(&str, &str)>,
-) -> Result<()> {
-    let history = store::balance_history(conn, adapter_id, resource_id)?;
-    let categories: BTreeSet<&str> = history
-        .iter()
-        .map(|row| row.category.as_str())
-        .filter(|category| !covered.contains(&(resource_id, *category)))
-        .collect();
-    let received_at = crate::now_rfc3339();
-    for category in categories {
-        // `'unknown'` and `'unavailable'` are the serde spellings of
-        // `Completeness::Unknown` and `Staleness::Unavailable`; a rename
-        // shows up at once as `from_spelling` refusing the row on its way
-        // back out.
-        //
-        // The SQL lives here rather than in `store` because the copy is
-        // the whole point: naming the adapter-authored columns in a
-        // `SELECT` is what makes it impossible for this write to author
-        // one. Round-tripping them through a `Balance` would mean the host
-        // re-typing every value it must not choose.
-        conn.execute(
-            "INSERT INTO balance (
-                adapter_id, resource_id, category, canonical_hint, amount_asset, amount,
-                prov_provider_id, prov_surface, observed_at, effective_at, completeness,
-                received_at, staleness, outcome
-             )
-             SELECT adapter_id, resource_id, category, canonical_hint, NULL, NULL,
-                    prov_provider_id, prov_surface, observed_at, effective_at, 'unknown',
-                    ?4, 'unavailable', ?5
-             FROM balance
-             WHERE adapter_id = ?1 AND resource_id = ?2 AND category = ?3
-             ORDER BY balance_id DESC LIMIT 1",
-            rusqlite::params![
-                adapter_id,
-                resource_id,
-                category,
-                received_at.as_str(),
-                format!("unread:{reason}"),
-            ],
-        )?;
-    }
-    Ok(())
 }
 
 /// The wire name of an outcome, stored beside a balance line so rendering

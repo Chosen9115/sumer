@@ -426,6 +426,39 @@ impl AdapterHandle {
             params.resource_ids.iter().map(String::as_str),
             &raw.statuses,
         )?;
+        // **A balance must come from the adapter on the other end of this
+        // connection.** `provenance.adapter_id` is the adapter's own claim
+        // about who observed the figure; the hello is its claim about who
+        // it is. When those disagree the connection has contradicted
+        // itself, and the contradiction is detectable HERE, one layer above
+        // the store -- where the caller's `adapter_id` is all that is left
+        // and the figure would simply be filed under it, silently
+        // reattributing another provider's money.
+        //
+        // The whole reply is refused, not the one line. Unlike a history
+        // page -- which is judged downstream by a gate that can disqualify a
+        // sweep and still keep what was honest (`spec/observation.md` §8.1
+        // condition 8) -- a balances reply has no such judge: everything
+        // after this decodes into rows nobody re-examines. Dropping the one
+        // line would leave the rest to be stored as if the connection had
+        // never lied, and nothing downstream could tell. Refusing it is
+        // also SAFE by construction now that freshness is derived: a
+        // refused read writes no row, so every figure it did not refresh
+        // reads stale rather than wrong.
+        if let Some(foreign) = raw
+            .observations
+            .iter()
+            .find(|b| b.provenance.adapter_id != self.hello.adapter_id)
+        {
+            return Err(HostError::Wire(ErrorBody::new(
+                WireErrorCode::InvalidRequest,
+                format!(
+                    "malformed {OP_BALANCES_READ} reply: a balance for resource {:?} names \
+                     adapter_id {:?} on the connection that announced {:?}",
+                    foreign.resource_id, foreign.provenance.adapter_id, self.hello.adapter_id
+                ),
+            )));
+        }
         let staleness = staleness_by_resource(&raw.statuses);
         let mut statuses = raw.statuses;
         let observations = drop_oversized(

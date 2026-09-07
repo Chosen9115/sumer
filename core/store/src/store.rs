@@ -183,6 +183,11 @@ pub struct BalanceRow {
     pub received_at: String,
     pub staleness: Staleness,
     pub outcome: String,
+    /// Whether the read that wrote this row is still this adapter's
+    /// current one ([`open_balance_read`]). `false` says "no read since
+    /// has refreshed this line" -- the row is a record of what was true
+    /// then, not a claim about now, and nothing may render it `live`.
+    pub from_latest_read: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -819,7 +824,7 @@ pub fn append_retraction(
 }
 
 /// The highest retraction revision per `(adapter_id, local_id)`. A record
-/// is live iff its chain head's revision exceeds this.
+/// is live iff its chain's highest revision exceeds this.
 pub fn retraction_high_water(
     conn: &Connection,
     adapter_id: &str,
@@ -881,18 +886,41 @@ pub fn retractions_for(
 // Balances
 // ---------------------------------------------------------------------
 
+/// Opens a READ for this adapter and returns its id.
+///
+/// Called once, unconditionally, at the start of every refresh of an
+/// adapter -- before the spawn, before the hello, before anything that can
+/// fail. Everything a refresh manages to read is stamped with the id it
+/// returns; everything it does not read simply keeps an older one, and
+/// [`BalanceRow::from_latest_read`] is then false for it without any
+/// failure path having had to remember to say so.
+///
+/// Opening a read twice for one refresh is harmless by construction: only
+/// the CURRENT value is ever compared against, so an extra bump changes
+/// nothing except the integers involved.
+pub fn open_balance_read(conn: &Connection, adapter_id: &str) -> Result<i64> {
+    Ok(conn.query_row(
+        "UPDATE adapter SET balance_read = balance_read + 1
+         WHERE adapter_id = ?1
+         RETURNING balance_read",
+        rusqlite::params![adapter_id],
+        |row| row.get(0),
+    )?)
+}
+
 pub fn append_balance(
     conn: &Connection,
     adapter_id: &str,
+    read_id: i64,
     balance: &Balance,
     outcome: &str,
 ) -> Result<()> {
     conn.execute(
         "INSERT INTO balance (
-            adapter_id, resource_id, category, canonical_hint, amount_asset, amount,
+            adapter_id, read_id, resource_id, category, canonical_hint, amount_asset, amount,
             prov_provider_id, prov_surface, observed_at, effective_at, completeness,
             received_at, staleness, outcome
-         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
+         ) VALUES (?1, ?15, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
         rusqlite::params![
             adapter_id,
             balance.resource_id,
@@ -919,6 +947,7 @@ pub fn append_balance(
             balance.provenance.received_at.as_str(),
             spelling(&balance.provenance.staleness)?,
             outcome,
+            read_id,
         ],
     )?;
     Ok(())
@@ -932,10 +961,16 @@ pub fn balance_history(
     adapter_id: &str,
     resource_id: &str,
 ) -> Result<Vec<BalanceRow>> {
+    // The freshness join. `LEFT JOIN` + `COALESCE` because the one way
+    // this can find no adapter row is an adapter that is gone, and a
+    // figure whose adapter no longer exists is emphatically not current;
+    // every failure of this comparison must fall on the stale side.
     let mut stmt = conn.prepare(
-        "SELECT balance_id, adapter_id, resource_id, category, canonical_hint,
-                amount_asset, amount, prov_provider_id, received_at, staleness, outcome
-         FROM balance WHERE adapter_id = ?1 AND resource_id = ?2 ORDER BY balance_id",
+        "SELECT b.balance_id, b.adapter_id, b.resource_id, b.category, b.canonical_hint,
+                b.amount_asset, b.amount, b.prov_provider_id, b.received_at, b.staleness,
+                b.outcome, COALESCE(b.read_id = a.balance_read, 0)
+         FROM balance b LEFT JOIN adapter a ON a.adapter_id = b.adapter_id
+         WHERE b.adapter_id = ?1 AND b.resource_id = ?2 ORDER BY b.balance_id",
     )?;
     let rows = stmt.query_map(rusqlite::params![adapter_id, resource_id], |row| {
         Ok((
@@ -950,6 +985,7 @@ pub fn balance_history(
             row.get::<_, String>(8)?,
             row.get::<_, String>(9)?,
             row.get::<_, String>(10)?,
+            row.get::<_, i64>(11)?,
         ))
     })?;
     let mut out = Vec::new();
@@ -966,6 +1002,7 @@ pub fn balance_history(
             received_at,
             staleness,
             outcome,
+            from_latest_read,
         ) = row?;
         out.push(BalanceRow {
             balance_id,
@@ -981,6 +1018,7 @@ pub fn balance_history(
             received_at,
             staleness: from_spelling::<Staleness>(&staleness)?,
             outcome,
+            from_latest_read: from_latest_read != 0,
         });
     }
     Ok(out)

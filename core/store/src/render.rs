@@ -4,9 +4,14 @@
 //! 1. **`amount: null` prints `unknown`, never `0`.** A wallet whose
 //!    balance could not be read is not a wallet holding nothing, and a
 //!    zero is a number a user acts on.
-//! 2. **A failed read never erases a figure.** It prints the last one
-//!    observed as `stale (as of T)`, or `unavailable` when there has never
-//!    been one. Blanking the line loses information the store still holds.
+//! 2. **A read that did not happen never erases a figure, and never keeps
+//!    it reading `live`.** It prints the last figure observed as `stale (as
+//!    of T)`, or `unavailable` when there has never been one. Blanking the
+//!    line loses information the store still holds; leaving it `live`
+//!    asserts a freshness nobody measured. Which of the two a line is comes
+//!    from `BalanceRow::from_latest_read` -- a fact about whether the
+//!    newest read wrote this row, not a marker some failing path had to
+//!    remember to write.
 //! 3. **Every figure carries source and freshness on its own line.** A
 //!    number with no provenance beside it is a number nobody can check.
 //!
@@ -43,17 +48,25 @@ pub fn balance_line(category: &str, history: &[&BalanceRow]) -> String {
     let Some(latest) = history.last() else {
         return format!("  {category:<14} unavailable");
     };
-    match (&latest.amount, latest.staleness) {
+    // **Two independent claims, and `live` needs both.** `staleness` is
+    // what the ADAPTER said about the figure it handed over;
+    // `from_latest_read` is whether any read since has refreshed this line
+    // at all. A row the newest read did not rewrite is a record of what
+    // was true then -- however live the read that produced it was.
+    let live = latest.from_latest_read && latest.staleness == Staleness::Live;
+    match (&latest.amount, live) {
         // A figure the adapter just read. `live`, and the amount verbatim.
-        (Some(amount), Staleness::Live) => format!(
+        (Some(amount), true) => format!(
             "  {category:<14} {:>14} {}   live · {} · {}",
             amount.to_string(),
             amount.asset().as_str(),
             latest.provider_id,
             time_of_day(&latest.received_at)
         ),
-        // The adapter said outright that this is not current.
-        (Some(amount), _) => format!(
+        // Either the adapter said outright that this is not current, or
+        // no read since has looked again. Both print the figure with the
+        // date it was actually observed.
+        (Some(amount), false) => format!(
             "  {category:<14} {:>14} {}   stale (as of {}) · {} · {}",
             amount.to_string(),
             amount.asset().as_str(),
@@ -62,15 +75,16 @@ pub fn balance_line(category: &str, history: &[&BalanceRow]) -> String {
             time_of_day(&latest.received_at)
         ),
         // Rule 1: the adapter looked and does not know. Not zero.
-        (None, Staleness::Live) => format!(
+        (None, true) => format!(
             "  {category:<14} {:>14}     unknown · {} · {}",
             "unknown",
             latest.provider_id,
             time_of_day(&latest.received_at)
         ),
-        // Rule 2: the read failed. Show the last figure there ever was,
-        // marked stale; only say `unavailable` when there is none.
-        (None, _) => match history
+        // Rule 2: the read failed, or never happened. Show the last figure
+        // there ever was, marked stale; only say `unavailable` when there
+        // is none.
+        (None, false) => match history
             .iter()
             .rev()
             .find_map(|row| row.amount.as_ref().map(|amount| (amount, row)))

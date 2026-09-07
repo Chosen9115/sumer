@@ -33,6 +33,7 @@ fn row(
     received_at: &str,
     staleness: Staleness,
     outcome: &str,
+    from_latest_read: bool,
 ) -> BalanceRow {
     BalanceRow {
         balance_id: 0,
@@ -45,6 +46,7 @@ fn row(
         received_at: received_at.to_owned(),
         staleness,
         outcome: outcome.to_owned(),
+        from_latest_read,
     }
 }
 
@@ -62,6 +64,7 @@ fn a_null_balance_from_a_different_provider_keeps_the_original_providers_identit
         "2026-01-10T00:00:00Z",
         Staleness::Cached,
         "stale:2026-01-01T00:00:00Z",
+        true,
     );
     let failed = row(
         "provider-b",
@@ -69,6 +72,7 @@ fn a_null_balance_from_a_different_provider_keeps_the_original_providers_identit
         "2026-01-20T00:00:00Z",
         Staleness::Unavailable,
         "unavailable",
+        true,
     );
     let line = balance_line("available", &[&cached, &failed]);
 
@@ -90,36 +94,58 @@ fn a_null_balance_from_a_different_provider_keeps_the_original_providers_identit
     );
 }
 
-/// **The same bug, the `unread:` marker shape**: a host-authored marker
-/// (§ref `mark_unread`) copies the adapter's own provider forward, so
-/// provider attribution is never wrong here -- but its `received_at` is
-/// host-stamped at the moment the marker was written, which must not
-/// replace the adapter's own claimed as-of date on the recovered line.
+/// **The same bug, one read later**: a row the newest read did not rewrite
+/// prints the ADAPTER's own as-of date, not the receipt time of the row
+/// itself. There is no marker row to carry a host timestamp any more --
+/// the row is the adapter's, and only its freshness verdict changed.
 #[test]
-fn an_unread_marker_after_a_cached_balance_keeps_the_adapters_own_as_of_date() {
+fn a_row_no_later_read_refreshed_keeps_the_adapters_own_as_of_date() {
     let cached = row(
         "provider-a",
         Some("42.00"),
         "2026-01-10T00:00:00Z",
         Staleness::Cached,
         "stale:2026-01-01T00:00:00Z",
+        false,
     );
-    let marker = row(
-        "provider-a",
-        None,
-        "2026-01-20T00:00:00Z",
-        Staleness::Unavailable,
-        "unread:refresh_failed",
-    );
-    let line = balance_line("available", &[&cached, &marker]);
+    let line = balance_line("available", &[&cached]);
 
     assert!(
-        line.contains("2026-01-01"),
-        "the adapter's own as-of survives past the marker: {line}"
+        line.contains("42.00") && line.contains("stale (as of"),
+        "the figure survives, marked stale: {line}"
     );
     assert!(
-        !line.contains("2026-01-20"),
-        "the marker's receipt time must not masquerade as the as-of date: {line}"
+        line.contains("2026-01-01"),
+        "the adapter's own as-of is what dates the figure: {line}"
+    );
+    assert!(
+        !line.contains("live"),
+        "a line no read since has refreshed is not live: {line}"
+    );
+}
+
+/// **The rule itself, with nothing else moving.** Same row, same adapter
+/// staleness, same everything -- except whether the newest read is the one
+/// that wrote it. That single bit is the whole of freshness now, so it is
+/// worth one test that changes nothing else.
+#[test]
+fn the_same_row_reads_live_only_while_it_is_the_latest_reads_own() {
+    let fresh = row(
+        "provider-a",
+        Some("42.00"),
+        "2026-01-10T00:00:00Z",
+        Staleness::Live,
+        "fetched",
+        true,
+    );
+    let mut superseded = fresh.clone();
+    superseded.from_latest_read = false;
+
+    assert!(balance_line("available", &[&fresh]).contains("live"));
+    let stale = balance_line("available", &[&superseded]);
+    assert!(
+        !stale.contains("live") && stale.contains("42.00") && stale.contains("stale (as of"),
+        "a read that did not refresh this line leaves the figure, not its freshness: {stale}"
     );
 }
 
@@ -398,22 +424,24 @@ async fn a_category_that_stops_being_reported_stops_reading_live() {
     );
 }
 
-/// **F5**: the host-authored marker row invents nothing.
+/// **F5**: a read that did not happen writes NOTHING.
 ///
-/// `spec/observation.md` §1 defines `surface` as the adapter's account of
-/// where a read came from and `observed_at` as adapter-claimed and carried
-/// through unmodified; §8.4 gives retractions their own table precisely so
-/// a host has "no provider field to fabricate". A marker row lands in the
-/// same append-only stream adapter rows do, so every adapter-shaped column
-/// on it must be COPIED from the row it marks unread -- as `provider_id`
-/// already was -- and never authored by the host. `canonical_hint` is a
-/// property of the category, not of the read, so it survives too.
+/// The host used to answer "this figure was not refreshed" with a marker
+/// row of its own, in the same append-only stream adapter rows live in --
+/// which meant every adapter-authored column on it had to be copied
+/// forward rather than invented (`spec/observation.md` §1, §8.4). The rule
+/// held only as long as every writer remembered it.
+///
+/// Now the stream holds adapter rows and nothing else: the fact that a
+/// category was not refreshed is the ABSENCE of a row from the newest
+/// read. A host that writes no row cannot fabricate a provider field, and
+/// there is no second kind of row for a reader to have to tell apart.
 #[tokio::test]
-async fn a_marker_row_invents_no_adapter_authored_field() {
+async fn a_read_that_did_not_happen_writes_no_row_at_all() {
     if !support::python3_available() {
         return;
     }
-    let scratch = Scratch::new("render-marker-provenance");
+    let scratch = Scratch::new("render-no-host-row");
     let history = || vec![page(None, vec![obs("a", "1.00")], drained_status(None))];
     let mut hinted = balance("available", Some("42.00"));
     hinted["canonical_hint"] = json!("available");
@@ -428,66 +456,140 @@ async fn a_marker_row_invents_no_adapter_authored_field() {
     refresh_run(&mut store, &fixture, 1, SweepOptions::default()).await;
 
     let rows = balance_columns(&store, "available");
-    assert_eq!(rows.len(), 2, "one adapter row, then one marker: {rows:?}");
-    let (adapter_row, marker) = (&rows[0], &rows[1]);
-
     assert_eq!(
-        marker.canonical_hint, adapter_row.canonical_hint,
-        "the hint is a property of the CATEGORY; a read that did not happen \
-         does not erase it: {rows:?}"
+        rows.len(),
+        1,
+        "the second read said nothing about this category, so it wrote \
+         nothing -- the only row is the adapter's own: {rows:?}"
     );
+    assert_eq!(rows[0].amount.as_deref(), Some("42.00"));
     assert_eq!(
-        marker.surface, adapter_row.surface,
-        "`surface` is the adapter's account of where the read came from -- \
-         carried forward, never authored by the host: {rows:?}"
-    );
-    assert_eq!(
-        marker.observed_at, adapter_row.observed_at,
-        "`observed_at` is adapter-claimed and carried through unmodified \
-         (spec/observation.md §1): {rows:?}"
-    );
-    assert_eq!(
-        marker.provider_id, adapter_row.provider_id,
-        "and the provider, as before: {rows:?}"
+        rows[0].canonical_hint.as_deref(),
+        Some("available"),
+        "and it is untouched: {rows:?}"
     );
 
-    // The host-authored columns, and the one field that tells a consumer
-    // this row is host-authored at all.
+    // The row is the adapter's, unchanged -- and it is no longer live.
+    let available = line(&store, "available");
+    assert!(
+        available.contains("42.00") && !available.contains("live"),
+        "the figure survives the read that did not happen; its freshness \
+         does not: {available}"
+    );
+}
+
+/// **F6**: a resource DROPPED from a successful listing stops reading
+/// `live`.
+///
+/// The first refresh lists the account and reads `42.00`. The second lists
+/// nothing at all -- a wholly successful `resources.list` that no longer
+/// mentions it, which is what a closed card or a removed wallet looks like
+/// -- and reads balances for the resources that remain. `sumer balances`
+/// still enumerates the account from the STORE, so the figure is still on
+/// screen, and under the old marker scheme it was still on screen marked
+/// `live`: every marker loop iterated *this run's* resource ids, so a
+/// resource nobody listed was never visited and nothing was ever written
+/// against it. Freshness is now a property of the row, so there is no loop
+/// to leave a resource out of.
+#[tokio::test]
+async fn a_resource_dropped_from_a_listing_stops_reading_live() {
+    if !support::python3_available() {
+        return;
+    }
+    let scratch = Scratch::new("render-dropped-resource");
+    let listed = Run::new(vec![page(
+        None,
+        vec![obs("a", "1.00")],
+        drained_status(None),
+    )])
+    .balances(vec![balance("available", Some("42.00"))]);
+    // Same adapter, same connection, a successful listing that simply does
+    // not mention the resource any more.
+    let dropped = Run::new(Vec::new()).lists(&[]).balances(Vec::new());
+
+    let fixture = fixture(&scratch, vec![listed, dropped]);
+    let mut store = store(&scratch);
+    refresh_run(&mut store, &fixture, 0, SweepOptions::default()).await;
+    assert!(line(&store, "available").contains("live"), "the first read");
+
+    refresh_run(&mut store, &fixture, 1, SweepOptions::default()).await;
+    let available = line(&store, "available");
+    assert!(
+        !available.contains("live"),
+        "a resource this refresh never even asked about cannot be live: {available}"
+    );
+    assert!(
+        available.contains("42.00") && available.contains("stale (as of"),
+        "and rule 2 still holds -- the last figure survives, marked stale: {available}"
+    );
+}
+
+/// **F7**: a balance that names ANOTHER adapter never becomes this
+/// adapter's figure.
+///
+/// Adapter A announces `hello` as A, correctly, and then returns a balance
+/// whose `provenance.adapter_id` is B, for `2000.00`. Nothing downstream of
+/// the decode can catch it: `append_balance` stores the CONNECTION's
+/// adapter id, so the contradiction is discarded and the money is filed
+/// under A. `history.read` refuses exactly this shape (§8.1 condition 8);
+/// this earlier, separate write was never covered.
+///
+/// The reply is refused whole, so the refresh reports a failure and writes
+/// no balance row -- and, freshness being derived, what was on screen goes
+/// stale rather than staying `live` with someone else's number on it.
+#[tokio::test]
+async fn a_balance_naming_another_adapter_is_refused_and_never_displayed() {
+    if !support::python3_available() {
+        return;
+    }
+    let scratch = Scratch::new("render-foreign-balance");
+    let history = || vec![page(None, vec![obs("a", "1.00")], drained_status(None))];
+    let honest = Run::new(history()).balances(vec![balance("available", Some("42.00"))]);
+    let mut foreign = balance("available", Some("2000.00"));
+    foreign["provenance"]["adapter_id"] = json!("some-other-adapter");
+    let impostor = Run::new(history()).balances(vec![foreign]);
+
+    let fixture = fixture(&scratch, vec![honest, impostor]);
+    let mut store = store(&scratch);
+    refresh_run(&mut store, &fixture, 0, SweepOptions::default()).await;
+    refresh_run(&mut store, &fixture, 1, SweepOptions::default()).await;
+
+    let rows = balance_columns(&store, "available");
     assert_eq!(
-        marker.amount, None,
-        "never a figure, never a zero: {rows:?}"
+        rows.len(),
+        1,
+        "a balance the connection attributed to another adapter is not \
+         stored under this one: {rows:?}"
     );
-    assert_eq!(marker.staleness, "unavailable");
+    let available = line(&store, "available");
     assert!(
-        marker.outcome.starts_with("unread:"),
-        "a consumer must be able to tell a host-authored marker from an \
-         adapter row, and `outcome` is the host's own column: {rows:?}"
+        !available.contains("2000.00"),
+        "and it never reaches the screen as this adapter's figure: {available}"
     );
     assert!(
-        !adapter_row.outcome.starts_with("unread:"),
-        "and a real adapter row never wears that prefix: {rows:?}"
+        !available.contains("live"),
+        "the read was refused, so nothing it did not refresh is live: {available}"
+    );
+    assert!(
+        available.contains("42.00"),
+        "the last honest figure is still there, marked stale: {available}"
     );
 }
 
 /// The balance columns `BalanceRow` does not carry. Read straight from the
-/// table, because the point of the assertion above is what was WRITTEN.
+/// table, because the point of the assertions above is what was WRITTEN --
+/// and, more often now, what was not.
 #[derive(Debug)]
 struct RawBalance {
     canonical_hint: Option<String>,
     amount: Option<String>,
-    provider_id: String,
-    surface: String,
-    observed_at: String,
-    staleness: String,
-    outcome: String,
 }
 
 fn balance_columns(store: &sumer_store::Store, category: &str) -> Vec<RawBalance> {
     let mut stmt = store
         .conn()
         .prepare(
-            "SELECT canonical_hint, amount, prov_provider_id, prov_surface,
-                    observed_at, staleness, outcome
+            "SELECT canonical_hint, amount
              FROM balance WHERE category = ?1 ORDER BY balance_id",
         )
         .unwrap();
@@ -496,11 +598,6 @@ fn balance_columns(store: &sumer_store::Store, category: &str) -> Vec<RawBalance
             Ok(RawBalance {
                 canonical_hint: row.get(0)?,
                 amount: row.get(1)?,
-                provider_id: row.get(2)?,
-                surface: row.get(3)?,
-                observed_at: row.get(4)?,
-                staleness: row.get(5)?,
-                outcome: row.get(6)?,
             })
         })
         .unwrap();
