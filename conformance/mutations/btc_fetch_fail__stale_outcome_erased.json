@@ -1,0 +1,26 @@
+{
+  "fixture": "bitcoin/btc_fetch_fail",
+  "assertions": [
+    "A1",
+    "A3",
+    "A7"
+  ],
+  "adapter": "btc_stale_outcome_erased.py",
+  "adapter_argv": [
+    "python3",
+    "{root}/conformance/cases/bitcoin/two_phase.py",
+    "0,1",
+    "{bin}/sumer-bitcoin-adapter",
+    "--wallets",
+    "{root}/adapters/bitcoin/corpus/fetch_fail/wallets.json",
+    "--source",
+    "file:{root}/adapters/bitcoin/corpus/fetch_fail"
+  ],
+  "why": "The outcome stops being stale{as_of} and becomes a plain fetched. The remembered balances still ride out at the right figures, so nothing about the money looks wrong -- what is erased is that they are REMEMBERED rather than read, which for a wallet whose provider has gone dark is the only thing a caller needs to know. THREE assertions answer, and all three are the point. A7: expect.statuses names outcome stale{as_of} and no status entry carries it any more. A3: the host DERIVES provenance.staleness per resource from that resource's own outcome, so expect.provenance's declared 'cached' comes back 'live'. A1: the same derivation is stamped on the balance lines themselves, which expect.ledger declares 'cached' as part of the sequence. Staleness cannot be flipped for one line and not the other -- it is one per-resource derivation from one status -- so this is the smallest real break, not a blunt one. WHAT THIS PROVES AND WHAT IT DOES NOT: it proves btc_fetch_fail can still tell a cached answer from a live one. It mutates nothing inside the adapter -- the wrapper spawns the real binary and rewrites its stdout -- and a mapping that is wrong identically in map.rs and in the hand-written expect block survives it.",
+  "patch": [],
+  "covers": [
+    "A1",
+    "A3",
+    "A7"
+  ]
+}

@@ -1,0 +1,24 @@
+[package]
+name = "sumer-bitcoin-adapter"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lints]
+workspace = true
+
+[[bin]]
+name = "sumer-bitcoin-adapter"
+path = "src/main.rs"
+
+[dependencies]
+sumer-wire = { path = "../../core/wire" }
+sumer-money = { path = "../../core/money" }
+serde = { workspace = true }
+serde_json = { workspace = true }
+# Blocking HTTP, rustls only: this adapter is synchronous by design (one
+# request in flight, spec/wire.md 7), so an async client would drag in a
+# runtime for nothing. `gzip` is off -- Esplora's listings are small enough
+# that a decompressor is a dependency bought for no measured gain.
+ureq = { version = "3", default-features = false, features = ["rustls"] }

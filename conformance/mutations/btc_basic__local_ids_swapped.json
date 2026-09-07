@@ -1,0 +1,22 @@
+{
+  "fixture": "bitcoin/btc_basic",
+  "assertions": [
+    "A2"
+  ],
+  "covers": [
+    "A2"
+  ],
+  "adapter": "btc_local_ids_swapped.py",
+  "adapter_argv": [
+    "python3",
+    "{root}/conformance/cases/bitcoin/two_phase.py",
+    "0",
+    "{bin}/sumer-bitcoin-adapter",
+    "--wallets",
+    "{root}/adapters/bitcoin/corpus/basic/wallets.json",
+    "--source",
+    "file:{root}/adapters/bitcoin/corpus/basic"
+  ],
+  "why": "The distinct local_ids in each reply are rotated by one: every id the wallet has is still emitted exactly once, attached to the wrong transaction. The SET of ids is unchanged, the live set is unchanged, the count is unchanged, and both executions rotate identically so purity across them is unchanged too -- what changes is which record each id names, which is exactly what a per-record comparison exists to see. WHAT THIS PROVES AND WHAT IT DOES NOT: it proves btc_basic binds ids to records rather than counting them. It mutates nothing inside the adapter, and a local_id derivation that is wrong in the same way in map.rs and in the expect block survives it.",
+  "patch": []
+}

@@ -1,0 +1,1226 @@
+{
+  "case": "btc_basic",
+  "expect": {
+    "assertions": [
+      "A1",
+      "A2",
+      "A6",
+      "A7",
+      "A8"
+    ],
+    "resources": [
+      {
+        "resource_id": "vault",
+        "kind": "bitcoin_wallet",
+        "label": "Pizza + BIP173 example",
+        "provider_extra": {
+          "address_count": 2
+        }
+      }
+    ],
+    "ledger": {
+      "vault": {
+        "balances": [
+          {
+            "category": "confirmed",
+            "canonical_hint": "confirmed",
+            "amount": {
+              "asset": "sat",
+              "amount": "379983"
+            },
+            "provenance": {
+              "adapter_id": "sumer-bitcoin",
+              "surface": "esplora.address_stats",
+              "observed_at": "2026-09-07T14:43:28Z",
+              "staleness": "live",
+              "completeness": "complete"
+            }
+          },
+          {
+            "category": "unconfirmed",
+            "canonical_hint": "unconfirmed",
+            "amount": {
+              "asset": "sat",
+              "amount": "0"
+            },
+            "provenance": {
+              "adapter_id": "sumer-bitcoin",
+              "surface": "esplora.address_stats",
+              "observed_at": "2026-09-07T14:43:28Z",
+              "staleness": "live",
+              "completeness": "complete"
+            }
+          }
+        ],
+        "history": [
+          {
+            "local_id": "vault:a1075db55d416d3ca199f55b6084e2115b9345e16c5cf302fc80e9d5fbf5d48d",
+            "state": "active",
+            "posting": "posted",
+            "amount": {
+              "asset": "sat",
+              "amount": "1000000000000"
+            },
+            "fees": null,
+            "raw_sign": "provider_positive",
+            "provider_extra": {
+              "confirmed": true,
+              "block_height": 57043,
+              "block_hash": "00000000152340ca42227603908689183edc47355204e7aca59383b0aaac1fd8"
+            },
+            "provenance": {
+              "adapter_id": "sumer-bitcoin",
+              "surface": "esplora.tx",
+              "observed_at": "2026-09-07T14:43:28Z",
+              "effective_at": "2010-05-22T18:16:31Z",
+              "staleness": "live",
+              "completeness": "complete"
+            },
+            "description": "received 1000000000000 sat"
+          },
+          {
+            "local_id": "vault:cca7507897abc89628f450e8b1e0c6fca4ec3f7b34cccf55f3f531c659ff4d79",
+            "state": "active",
+            "posting": "posted",
+            "amount": {
+              "asset": "sat",
+              "amount": "-1000000000000"
+            },
+            "fees": {
+              "asset": "sat",
+              "amount": "0"
+            },
+            "raw_sign": "provider_negative",
+            "provider_extra": {
+              "confirmed": true,
+              "block_height": 57044,
+              "block_hash": "0000000013ab9f8ed78b254a429d3d5ad52905362e01bf6c682940337721eb51"
+            },
+            "provenance": {
+              "adapter_id": "sumer-bitcoin",
+              "surface": "esplora.tx",
+              "observed_at": "2026-09-07T14:43:28Z",
+              "effective_at": "2010-05-22T18:26:08Z",
+              "staleness": "live",
+              "completeness": "complete"
+            },
+            "description": "sent 1000000000000 sat"
+          },
+          {
+            "local_id": "vault:2c63ac6d71e696dea43ef1ef7fba8c376a6a220383e73a17ba6c3795996db112",
+            "state": "active",
+            "posting": "posted",
+            "amount": {
+              "asset": "sat",
+              "amount": "10000"
+            },
+            "fees": null,
+            "raw_sign": "provider_positive",
+            "provider_extra": {
+              "confirmed": true,
+              "block_height": 352701,
+              "block_hash": "0000000000000000000b0f82373b32adac1c13dd5242e52ef1111b58a57b1d19"
+            },
+            "provenance": {
+              "adapter_id": "sumer-bitcoin",
+              "surface": "esplora.tx",
+              "observed_at": "2026-09-07T14:43:28Z",
+              "effective_at": "2015-04-19T00:14:38Z",
+              "staleness": "live",
+              "completeness": "complete"
+            }
+          },
+          {
+            "local_id": "vault:62104aa084f4a158cb9aa545ee30d68db88bb22d4a66904b78d41e4512c1969a",
+            "state": "active",
+            "posting": "posted",
+            "amount": {
+              "asset": "sat",
+              "amount": "100000"
+            },
+            "fees": null,
+            "raw_sign": "provider_positive",
+            "provider_extra": {
+              "confirmed": true,
+              "block_height": 474237,
+              "block_hash": "00000000000000000094dd476cd44f20cc05d7618bded407947c162d554b5eea"
+            },
+            "provenance": {
+              "adapter_id": "sumer-bitcoin",
+              "surface": "esplora.tx",
+              "observed_at": "2026-09-07T14:43:28Z",
+              "effective_at": "2017-07-04T20:17:07Z",
+              "staleness": "live",
+              "completeness": "complete"
+            }
+          },
+          {
+            "local_id": "vault:59ef8b5633c2a8bf0a21edcbc4b9f271572061f81d42b366fe3b8bc0ec68014e",
+            "state": "active",
+            "posting": "posted",
+            "amount": {
+              "asset": "sat",
+              "amount": "21258"
+            },
+            "fees": null,
+            "raw_sign": "provider_positive",
+            "provider_extra": {
+              "confirmed": true,
+              "block_height": 504550,
+              "block_hash": "0000000000000000005a80fe2371482d0f1fa11cd452552555e9f1bdede2e2a8"
+            },
+            "provenance": {
+              "adapter_id": "sumer-bitcoin",
+              "surface": "esplora.tx",
+              "observed_at": "2026-09-07T14:43:28Z",
+              "effective_at": "2018-01-16T20:49:47Z",
+              "staleness": "live",
+              "completeness": "complete"
+            }
+          },
+          {
+            "local_id": "vault:5a50f6437228d3c6b1830f57f02fc96ec7790c01a178d0b1c4e4fb746218543a",
+            "state": "active",
+            "posting": "posted",
+            "amount": {
+              "asset": "sat",
+              "amount": "61302"
+            },
+            "fees": null,
+            "raw_sign": "provider_positive",
+            "provider_extra": {
+              "confirmed": true,
+              "block_height": 504550,
+              "block_hash": "0000000000000000005a80fe2371482d0f1fa11cd452552555e9f1bdede2e2a8"
+            },
+            "provenance": {
+              "adapter_id": "sumer-bitcoin",
+              "surface": "esplora.tx",
+              "observed_at": "2026-09-07T14:43:28Z",
+              "effective_at": "2018-01-16T20:49:47Z",
+              "staleness": "live",
+              "completeness": "complete"
+            }
+          },
+          {
+            "local_id": "vault:30570b95cb45d15787a88bd58086bd78fc6bb2cc6cb16afbaf3bc0bd3733875a",
+            "state": "active",
+            "posting": "posted",
+            "amount": {
+              "asset": "sat",
+              "amount": "9309"
+            },
+            "fees": null,
+            "raw_sign": "provider_positive",
+            "provider_extra": {
+              "confirmed": true,
+              "block_height": 511210,
+              "block_hash": "0000000000000000003e52809d0c60a34b8a5711ff1d6a087ab4067be0d795cc"
+            },
+            "provenance": {
+              "adapter_id": "sumer-bitcoin",
+              "surface": "esplora.tx",
+              "observed_at": "2026-09-07T14:43:28Z",
+              "effective_at": "2018-02-27T21:05:52Z",
+              "staleness": "live",
+              "completeness": "complete"
+            }
+          },
+          {
+            "local_id": "vault:49de9ea077feee38d4952023fbe9cbdbb9020675667c9637ea0f1a456cc40030",
+            "state": "active",
+            "posting": "posted",
+            "amount": {
+              "asset": "sat",
+              "amount": "-91869"
+            },
+            "fees": {
+              "asset": "sat",
+              "amount": "250"
+            },
+            "raw_sign": "provider_negative",
+            "provider_extra": {
+              "confirmed": true,
+              "block_height": 533422,
+              "block_hash": "0000000000000000000e96099cb972c181cde1a42adda625440fb14936dc160e"
+            },
+            "provenance": {
+              "adapter_id": "sumer-bitcoin",
+              "surface": "esplora.tx",
+              "observed_at": "2026-09-07T14:43:28Z",
+              "effective_at": "2018-07-24T10:52:58Z",
+              "staleness": "live",
+              "completeness": "complete"
+            },
+            "description": "sent 91869 sat"
+          },
+          {
+            "local_id": "vault:6e05c708d88cc5bf0f1533938c969de2cc48f438b0ae28ce89fefbaa1938185a",
+            "state": "active",
+            "posting": "posted",
+            "amount": {
+              "asset": "sat",
+              "amount": "1111"
+            },
+            "fees": null,
+            "raw_sign": "provider_positive",
+            "provider_extra": {
+              "confirmed": true,
+              "block_height": 547057,
+              "block_hash": "0000000000000000001377e3fa320b8c92cb417b1be5cb8ddaca370f1897b667"
+            },
+            "provenance": {
+              "adapter_id": "sumer-bitcoin",
+              "surface": "esplora.tx",
+              "observed_at": "2026-09-07T14:43:28Z",
+              "effective_at": "2018-10-23T19:53:31Z",
+              "staleness": "live",
+              "completeness": "complete"
+            }
+          },
+          {
+            "local_id": "vault:c11d03f65dcabc6589044cd71cf436ac9b4e2ff88f2823483d5f4781f6a3cc38",
+            "state": "active",
+            "posting": "posted",
+            "amount": {
+              "asset": "sat",
+              "amount": "600"
+            },
+            "fees": null,
+            "raw_sign": "provider_positive",
+            "provider_extra": {
+              "confirmed": true,
+              "block_height": 551926,
+              "block_hash": "00000000000000000007935d45d25bd4a077040d00790ecab854a647727d7ff8"
+            },
+            "provenance": {
+              "adapter_id": "sumer-bitcoin",
+              "surface": "esplora.tx",
+              "observed_at": "2026-09-07T14:43:28Z",
+              "effective_at": "2018-11-29T12:48:50Z",
+              "staleness": "live",
+              "completeness": "complete"
+            }
+          },
+          {
+            "local_id": "vault:61b090d90b0f98566b87eb18d16dafaea6cdf27d7bb8ca12c7dd4bb7f8371c4a",
+            "state": "active",
+            "posting": "posted",
+            "amount": {
+              "asset": "sat",
+              "amount": "-600"
+            },
+            "fees": {
+              "asset": "sat",
+              "amount": "2127"
+            },
+            "raw_sign": "provider_negative",
+            "provider_extra": {
+              "confirmed": true,
+              "block_height": 552194,
+              "block_hash": "0000000000000000000967ea3839354ce10dfe4de8cd3ded35f4728e7bba8ce7"
+            },
+            "provenance": {
+              "adapter_id": "sumer-bitcoin",
+              "surface": "esplora.tx",
+              "observed_at": "2026-09-07T14:43:28Z",
+              "effective_at": "2018-12-01T21:14:50Z",
+              "staleness": "live",
+              "completeness": "complete"
+            }
+          },
+          {
+            "local_id": "vault:aea9b1f2bc361046b1fd6d23d1cfc406342651823776cef81e847e474696f57a",
+            "state": "active",
+            "posting": "posted",
+            "amount": {
+              "asset": "sat",
+              "amount": "546"
+            },
+            "fees": null,
+            "raw_sign": "provider_positive",
+            "provider_extra": {
+              "confirmed": true,
+              "block_height": 582752,
+              "block_hash": "00000000000000000010b04a5065dcae5e52ebb1eeab5a1e4212a0b514c337cd"
+            },
+            "provenance": {
+              "adapter_id": "sumer-bitcoin",
+              "surface": "esplora.tx",
+              "observed_at": "2026-09-07T14:43:28Z",
+              "effective_at": "2019-06-28T00:47:34Z",
+              "staleness": "live",
+              "completeness": "complete"
+            }
+          },
+          {
+            "local_id": "vault:24949288ab32c8e4d870747609e46e21ca0ec61d6607fd71880e7800753d4016",
+            "state": "active",
+            "posting": "posted",
+            "amount": {
+              "asset": "sat",
+              "amount": "-546"
+            },
+            "fees": {
+              "asset": "sat",
+              "amount": "1623"
+            },
+            "raw_sign": "provider_negative",
+            "provider_extra": {
+              "confirmed": true,
+              "block_height": 584091,
+              "block_hash": "00000000000000000007dd56575737f542f24ca7a33c9de0e421c8135ee9c646"
+            },
+            "provenance": {
+              "adapter_id": "sumer-bitcoin",
+              "surface": "esplora.tx",
+              "observed_at": "2026-09-07T14:43:28Z",
+              "effective_at": "2019-07-06T04:51:42Z",
+              "staleness": "live",
+              "completeness": "complete"
+            }
+          },
+          {
+            "local_id": "vault:897cea35c5db6c27fd48b66115d9bb848e543b4aae9b7a701286f1b11a798f7f",
+            "state": "active",
+            "posting": "posted",
+            "amount": {
+              "asset": "sat",
+              "amount": "1000"
+            },
+            "fees": null,
+            "raw_sign": "provider_positive",
+            "provider_extra": {
+              "confirmed": true,
+              "block_height": 586755,
+              "block_hash": "0000000000000000001989f018054194102643827f90aabaa2cd608ca70bdc2e"
+            },
+            "provenance": {
+              "adapter_id": "sumer-bitcoin",
+              "surface": "esplora.tx",
+              "observed_at": "2026-09-07T14:43:28Z",
+              "effective_at": "2019-07-24T03:10:36Z",
+              "staleness": "live",
+              "completeness": "complete"
+            }
+          },
+          {
+            "local_id": "vault:584aa542604f62481c6bfe73a315b89f4db3ecac21f88fe8c53ffb411826b5e5",
+            "state": "active",
+            "posting": "posted",
+            "amount": {
+              "asset": "sat",
+              "amount": "-1000"
+            },
+            "fees": {
+              "asset": "sat",
+              "amount": "9154"
+            },
+            "raw_sign": "provider_negative",
+            "provider_extra": {
+              "confirmed": true,
+              "block_height": 591226,
+              "block_hash": "000000000000000000113167d8395582fb0d344ea2bb27d6be5d783ee2ef718d"
+            },
+            "provenance": {
+              "adapter_id": "sumer-bitcoin",
+              "surface": "esplora.tx",
+              "observed_at": "2026-09-07T14:43:28Z",
+              "effective_at": "2019-08-22T11:06:11Z",
+              "staleness": "live",
+              "completeness": "complete"
+            }
+          },
+          {
+            "local_id": "vault:c66f9df1e261037ac48cce9cd69dcd881ca6cb0f058ce4fad0063ccf9eadbeab",
+            "state": "active",
+            "posting": "posted",
+            "amount": {
+              "asset": "sat",
+              "amount": "1000"
+            },
+            "fees": null,
+            "raw_sign": "provider_positive",
+            "provider_extra": {
+              "confirmed": true,
+              "block_height": 592326,
+              "block_hash": "00000000000000000003741fa8c231fbde2278b635fe4a639335e8498a5d51b7"
+            },
+            "provenance": {
+              "adapter_id": "sumer-bitcoin",
+              "surface": "esplora.tx",
+              "observed_at": "2026-09-07T14:43:28Z",
+              "effective_at": "2019-08-29T20:22:21Z",
+              "staleness": "live",
+              "completeness": "complete"
+            }
+          },
+          {
+            "local_id": "vault:ec6389b1b4cf5e9b913c86dac334f01a0723fe870cdadeac532bb815a70a1cf1",
+            "state": "active",
+            "posting": "posted",
+            "amount": {
+              "asset": "sat",
+              "amount": "-1000"
+            },
+            "fees": {
+              "asset": "sat",
+              "amount": "316"
+            },
+            "raw_sign": "provider_negative",
+            "provider_extra": {
+              "confirmed": true,
+              "block_height": 593664,
+              "block_hash": "000000000000000000001ee89ab024cf3ef7769c1458de99df1f49d032a40fc1"
+            },
+            "provenance": {
+              "adapter_id": "sumer-bitcoin",
+              "surface": "esplora.tx",
+              "observed_at": "2026-09-07T14:43:28Z",
+              "effective_at": "2019-09-07T11:21:41Z",
+              "staleness": "live",
+              "completeness": "complete"
+            }
+          },
+          {
+            "local_id": "vault:1318b899852c8ecd4c7ff4c540ea469e36b15f781ca517a94168da72b68e427d",
+            "state": "active",
+            "posting": "posted",
+            "amount": {
+              "asset": "sat",
+              "amount": "141482"
+            },
+            "fees": null,
+            "raw_sign": "provider_positive",
+            "provider_extra": {
+              "confirmed": true,
+              "block_height": 615962,
+              "block_hash": "00000000000000000010bc91a58d8f2302421aeb746ceb79edef2651ed3c4be3"
+            },
+            "provenance": {
+              "adapter_id": "sumer-bitcoin",
+              "surface": "esplora.tx",
+              "observed_at": "2026-09-07T14:43:28Z",
+              "effective_at": "2020-02-04T16:18:26Z",
+              "staleness": "live",
+              "completeness": "complete"
+            }
+          },
+          {
+            "local_id": "vault:519c79dc444009744e5dec35817d0a7530ba3601aed58ac34837397134177db8",
+            "state": "active",
+            "posting": "posted",
+            "amount": {
+              "asset": "sat",
+              "amount": "2817"
+            },
+            "fees": null,
+            "raw_sign": "provider_positive",
+            "provider_extra": {
+              "confirmed": true,
+              "block_height": 707034,
+              "block_hash": "0000000000000000000a03efc05853e887da01ce57a3c38205307f0c4a8bff31"
+            },
+            "provenance": {
+              "adapter_id": "sumer-bitcoin",
+              "surface": "esplora.tx",
+              "observed_at": "2026-09-07T14:43:28Z",
+              "effective_at": "2021-10-28T02:36:55Z",
+              "staleness": "live",
+              "completeness": "complete"
+            }
+          },
+          {
+            "local_id": "vault:5985e205ee287d1dbae17a2228016140cbe9656d4acb9213be0db12aa3ea6b25",
+            "state": "active",
+            "posting": "posted",
+            "amount": {
+              "asset": "sat",
+              "amount": "-2817"
+            },
+            "fees": {
+              "asset": "sat",
+              "amount": "220"
+            },
+            "raw_sign": "provider_negative",
+            "provider_extra": {
+              "confirmed": true,
+              "block_height": 707046,
+              "block_hash": "0000000000000000000b3f6281ab151ce1c273b9beb0d178eace105454ee6698"
+            },
+            "provenance": {
+              "adapter_id": "sumer-bitcoin",
+              "surface": "esplora.tx",
+              "observed_at": "2026-09-07T14:43:28Z",
+              "effective_at": "2021-10-28T04:09:23Z",
+              "staleness": "live",
+              "completeness": "complete"
+            }
+          },
+          {
+            "local_id": "vault:9b95987933d18c56af1bb206bc79691d8c31d39a63921ef2b09800cf011f59b7",
+            "state": "active",
+            "posting": "posted",
+            "amount": {
+              "asset": "sat",
+              "amount": "-546"
+            },
+            "fees": {
+              "asset": "sat",
+              "amount": "234"
+            },
+            "raw_sign": "provider_negative",
+            "provider_extra": {
+              "confirmed": true,
+              "block_height": 729541,
+              "block_hash": "0000000000000000000878ea0f3b9b6467a8939cb4e66c42c6825e714a693a43"
+            },
+            "provenance": {
+              "adapter_id": "sumer-bitcoin",
+              "surface": "esplora.tx",
+              "observed_at": "2026-09-07T14:43:28Z",
+              "effective_at": "2022-03-29T10:34:47Z",
+              "staleness": "live",
+              "completeness": "complete"
+            }
+          },
+          {
+            "local_id": "vault:c8af747506d064711c2b3f9a9e052ecc8b8f2783c05d342b493edcd6afc3318c",
+            "state": "active",
+            "posting": "posted",
+            "amount": {
+              "asset": "sat",
+              "amount": "546"
+            },
+            "fees": null,
+            "raw_sign": "provider_positive",
+            "provider_extra": {
+              "confirmed": true,
+              "block_height": 729541,
+              "block_hash": "0000000000000000000878ea0f3b9b6467a8939cb4e66c42c6825e714a693a43"
+            },
+            "provenance": {
+              "adapter_id": "sumer-bitcoin",
+              "surface": "esplora.tx",
+              "observed_at": "2026-09-07T14:43:28Z",
+              "effective_at": "2022-03-29T10:34:47Z",
+              "staleness": "live",
+              "completeness": "complete"
+            }
+          },
+          {
+            "local_id": "vault:65a74c97240778e8e83004a37f641b793528c58c6c3956bf41f3f94cfb58c58e",
+            "state": "active",
+            "posting": "posted",
+            "amount": {
+              "asset": "sat",
+              "amount": "546"
+            },
+            "fees": null,
+            "raw_sign": "provider_positive",
+            "provider_extra": {
+              "confirmed": true,
+              "block_height": 729673,
+              "block_hash": "00000000000000000008708cba42cb77495df1659e118f73f91bb3fb80093a1a"
+            },
+            "provenance": {
+              "adapter_id": "sumer-bitcoin",
+              "surface": "esplora.tx",
+              "observed_at": "2026-09-07T14:43:28Z",
+              "effective_at": "2022-03-30T08:35:35Z",
+              "staleness": "live",
+              "completeness": "complete"
+            }
+          },
+          {
+            "local_id": "vault:aa791a854529338cfdffe87d8a685944f9c656cba63f20627d01322d9ee39a3a",
+            "state": "active",
+            "posting": "posted",
+            "amount": {
+              "asset": "sat",
+              "amount": "-546"
+            },
+            "fees": {
+              "asset": "sat",
+              "amount": "234"
+            },
+            "raw_sign": "provider_negative",
+            "provider_extra": {
+              "confirmed": true,
+              "block_height": 729675,
+              "block_hash": "000000000000000000072436619e93926cc828946f5d006ded2a21fe6ee3837a"
+            },
+            "provenance": {
+              "adapter_id": "sumer-bitcoin",
+              "surface": "esplora.tx",
+              "observed_at": "2026-09-07T14:43:28Z",
+              "effective_at": "2022-03-30T08:43:19Z",
+              "staleness": "live",
+              "completeness": "complete"
+            }
+          },
+          {
+            "local_id": "vault:379d8040fbdd9b5875b97b094456e889da902c5c704627e3be6fd3b56cb4d600",
+            "state": "active",
+            "posting": "posted",
+            "amount": {
+              "asset": "sat",
+              "amount": "-546"
+            },
+            "fees": {
+              "asset": "sat",
+              "amount": "234"
+            },
+            "raw_sign": "provider_negative",
+            "provider_extra": {
+              "confirmed": true,
+              "block_height": 729677,
+              "block_hash": "000000000000000000045afaea500710073735c8b192998479fe85e6e76d5410"
+            },
+            "provenance": {
+              "adapter_id": "sumer-bitcoin",
+              "surface": "esplora.tx",
+              "observed_at": "2026-09-07T14:43:28Z",
+              "effective_at": "2022-03-30T08:56:08Z",
+              "staleness": "live",
+              "completeness": "complete"
+            }
+          },
+          {
+            "local_id": "vault:e9930b942f6b5d3492854d62d8122940f86766c6e3da1467a979ff66daed9a8f",
+            "state": "active",
+            "posting": "posted",
+            "amount": {
+              "asset": "sat",
+              "amount": "546"
+            },
+            "fees": null,
+            "raw_sign": "provider_positive",
+            "provider_extra": {
+              "confirmed": true,
+              "block_height": 729677,
+              "block_hash": "000000000000000000045afaea500710073735c8b192998479fe85e6e76d5410"
+            },
+            "provenance": {
+              "adapter_id": "sumer-bitcoin",
+              "surface": "esplora.tx",
+              "observed_at": "2026-09-07T14:43:28Z",
+              "effective_at": "2022-03-30T08:56:08Z",
+              "staleness": "live",
+              "completeness": "complete"
+            }
+          },
+          {
+            "local_id": "vault:1880480de3c1e427a611cc07ce0dbfd62fb1cfb213a0662b4b7040a69655a9be",
+            "state": "active",
+            "posting": "posted",
+            "amount": {
+              "asset": "sat",
+              "amount": "631"
+            },
+            "fees": null,
+            "raw_sign": "provider_positive",
+            "provider_extra": {
+              "confirmed": true,
+              "block_height": 735106,
+              "block_hash": "00000000000000000007fcbff3e3412409bd056027dfa0cbe2e0eadc223d4982"
+            },
+            "provenance": {
+              "adapter_id": "sumer-bitcoin",
+              "surface": "esplora.tx",
+              "observed_at": "2026-09-07T14:43:28Z",
+              "effective_at": "2022-05-06T01:48:18Z",
+              "staleness": "live",
+              "completeness": "complete"
+            }
+          },
+          {
+            "local_id": "vault:6de8a857249b9cdd621941ac02096c1e0efa19f43a53b043d5f4cc152fb4aa0b",
+            "state": "active",
+            "posting": "posted",
+            "amount": {
+              "asset": "sat",
+              "amount": "697"
+            },
+            "fees": null,
+            "raw_sign": "provider_positive",
+            "provider_extra": {
+              "confirmed": true,
+              "block_height": 736315,
+              "block_hash": "00000000000000000001a804a43649251848abcaed1db196ffba937ede50beac"
+            },
+            "provenance": {
+              "adapter_id": "sumer-bitcoin",
+              "surface": "esplora.tx",
+              "observed_at": "2026-09-07T14:43:28Z",
+              "effective_at": "2022-05-14T07:18:37Z",
+              "staleness": "live",
+              "completeness": "complete"
+            }
+          },
+          {
+            "local_id": "vault:a268df84c50fc3d21c6163a558cdb56af6a34f310d1c72f4dc33b6492e74c742",
+            "state": "active",
+            "posting": "posted",
+            "amount": {
+              "asset": "sat",
+              "amount": "677"
+            },
+            "fees": null,
+            "raw_sign": "provider_positive",
+            "provider_extra": {
+              "confirmed": true,
+              "block_height": 736352,
+              "block_hash": "000000000000000000031160a4f37ec8d95ec342aa85ab578bcd5fc2dcab5824"
+            },
+            "provenance": {
+              "adapter_id": "sumer-bitcoin",
+              "surface": "esplora.tx",
+              "observed_at": "2026-09-07T14:43:28Z",
+              "effective_at": "2022-05-14T12:23:43Z",
+              "staleness": "live",
+              "completeness": "complete"
+            }
+          },
+          {
+            "local_id": "vault:d365765932cc7158c5484254a64196e273cb0108c7edc3fcec45d0510374a8e3",
+            "state": "active",
+            "posting": "posted",
+            "amount": {
+              "asset": "sat",
+              "amount": "643"
+            },
+            "fees": null,
+            "raw_sign": "provider_positive",
+            "provider_extra": {
+              "confirmed": true,
+              "block_height": 736453,
+              "block_hash": "000000000000000000031c49d72611f769b38a67e4ebe2558b87cd335c60f2ad"
+            },
+            "provenance": {
+              "adapter_id": "sumer-bitcoin",
+              "surface": "esplora.tx",
+              "observed_at": "2026-09-07T14:43:28Z",
+              "effective_at": "2022-05-15T08:01:11Z",
+              "staleness": "live",
+              "completeness": "complete"
+            }
+          },
+          {
+            "local_id": "vault:4221ff28411a87e6d412458689c471b875dd43aca7d02c7fb7c7331855581434",
+            "state": "active",
+            "posting": "posted",
+            "amount": {
+              "asset": "sat",
+              "amount": "-2648"
+            },
+            "fees": {
+              "asset": "sat",
+              "amount": "632"
+            },
+            "raw_sign": "provider_negative",
+            "provider_extra": {
+              "confirmed": true,
+              "block_height": 740966,
+              "block_hash": "000000000000000000093cf4a6b9b62bf38d5a138fc00c4318c18c2c3b34769c"
+            },
+            "provenance": {
+              "adapter_id": "sumer-bitcoin",
+              "surface": "esplora.tx",
+              "observed_at": "2026-09-07T14:43:28Z",
+              "effective_at": "2022-06-15T21:15:19Z",
+              "staleness": "live",
+              "completeness": "complete"
+            }
+          },
+          {
+            "local_id": "vault:395206d164c0b6e65712893f2a3fb5365308786abc9065657f3b8f724222e329",
+            "state": "active",
+            "posting": "posted",
+            "amount": {
+              "asset": "sat",
+              "amount": "1000"
+            },
+            "fees": null,
+            "raw_sign": "provider_positive",
+            "provider_extra": {
+              "confirmed": true,
+              "block_height": 773371,
+              "block_hash": "00000000000000000002439c46a3089d594eb638a98a19a74742d6a59871f167"
+            },
+            "provenance": {
+              "adapter_id": "sumer-bitcoin",
+              "surface": "esplora.tx",
+              "observed_at": "2026-09-07T14:43:28Z",
+              "effective_at": "2023-01-24T09:38:03Z",
+              "staleness": "live",
+              "completeness": "complete"
+            }
+          },
+          {
+            "local_id": "vault:26e92e945d21914349da7628b306f86580cd2bad4a8e9f12241c3d56b84435b3",
+            "state": "active",
+            "posting": "posted",
+            "amount": {
+              "asset": "sat",
+              "amount": "546"
+            },
+            "fees": null,
+            "raw_sign": "provider_positive",
+            "provider_extra": {
+              "confirmed": true,
+              "block_height": 790931,
+              "block_hash": "0000000000000000000300251d38bcee6deffa188b6fc2aa32fdc976ee72455c"
+            },
+            "provenance": {
+              "adapter_id": "sumer-bitcoin",
+              "surface": "esplora.tx",
+              "observed_at": "2026-09-07T14:43:28Z",
+              "effective_at": "2023-05-22T19:19:25Z",
+              "staleness": "live",
+              "completeness": "complete"
+            }
+          },
+          {
+            "local_id": "vault:fda5d2efa69cdc81b6093152d9cabb07d697f98d1d23c1c1f3905fa23d26469d",
+            "state": "active",
+            "posting": "posted",
+            "amount": {
+              "asset": "sat",
+              "amount": "546"
+            },
+            "fees": null,
+            "raw_sign": "provider_positive",
+            "provider_extra": {
+              "confirmed": true,
+              "block_height": 844547,
+              "block_hash": "00000000000000000000a28489b3574f7c226d11b44c874e14585274eadcc0b6"
+            },
+            "provenance": {
+              "adapter_id": "sumer-bitcoin",
+              "surface": "esplora.tx",
+              "observed_at": "2026-09-07T14:43:28Z",
+              "effective_at": "2024-05-22T07:43:25Z",
+              "staleness": "live",
+              "completeness": "complete"
+            }
+          },
+          {
+            "local_id": "vault:600389bd5ea879a8f96f68e025b7be634176a979c32e102815b6782d955b7920",
+            "state": "active",
+            "posting": "posted",
+            "amount": {
+              "asset": "sat",
+              "amount": "546"
+            },
+            "fees": null,
+            "raw_sign": "provider_positive",
+            "provider_extra": {
+              "confirmed": true,
+              "block_height": 845121,
+              "block_hash": "000000000000000000033b6b627953604925f93e9461668d175615ab89f0f0ce"
+            },
+            "provenance": {
+              "adapter_id": "sumer-bitcoin",
+              "surface": "esplora.tx",
+              "observed_at": "2026-09-07T14:43:28Z",
+              "effective_at": "2024-05-25T18:22:33Z",
+              "staleness": "live",
+              "completeness": "complete"
+            }
+          },
+          {
+            "local_id": "vault:c201f48abf5cbb069a5cffefbc6ea04acc2450fdb46598ad12456af43310b300",
+            "state": "active",
+            "posting": "posted",
+            "amount": {
+              "asset": "sat",
+              "amount": "546"
+            },
+            "fees": null,
+            "raw_sign": "provider_positive",
+            "provider_extra": {
+              "confirmed": true,
+              "block_height": 845121,
+              "block_hash": "000000000000000000033b6b627953604925f93e9461668d175615ab89f0f0ce"
+            },
+            "provenance": {
+              "adapter_id": "sumer-bitcoin",
+              "surface": "esplora.tx",
+              "observed_at": "2026-09-07T14:43:28Z",
+              "effective_at": "2024-05-25T18:22:33Z",
+              "staleness": "live",
+              "completeness": "complete"
+            }
+          },
+          {
+            "local_id": "vault:692711604378a71e097499034e6209d6872f5f2adf27c150ce822dad5f9495e8",
+            "state": "active",
+            "posting": "posted",
+            "amount": {
+              "asset": "sat",
+              "amount": "546"
+            },
+            "fees": null,
+            "raw_sign": "provider_positive",
+            "provider_extra": {
+              "confirmed": true,
+              "block_height": 851093,
+              "block_hash": "000000000000000000000e58e567c1e0709ac7ea697051e6b098400a2dae556a"
+            },
+            "provenance": {
+              "adapter_id": "sumer-bitcoin",
+              "surface": "esplora.tx",
+              "observed_at": "2026-09-07T14:43:28Z",
+              "effective_at": "2024-07-07T12:03:01Z",
+              "staleness": "live",
+              "completeness": "complete"
+            }
+          },
+          {
+            "local_id": "vault:881db2b47fe09f6cad8361bd95a8daffc797e72705043eb8f3006aed084ffd73",
+            "state": "active",
+            "posting": "posted",
+            "amount": {
+              "asset": "sat",
+              "amount": "1010"
+            },
+            "fees": null,
+            "raw_sign": "provider_positive",
+            "provider_extra": {
+              "confirmed": true,
+              "block_height": 864522,
+              "block_hash": "0000000000000000000123ee79d8029c7c5c8fa4e04a661eb30de8a01145ecde"
+            },
+            "provenance": {
+              "adapter_id": "sumer-bitcoin",
+              "surface": "esplora.tx",
+              "observed_at": "2026-09-07T14:43:28Z",
+              "effective_at": "2024-10-07T01:53:29Z",
+              "staleness": "live",
+              "completeness": "complete"
+            }
+          },
+          {
+            "local_id": "vault:42677788bd21c2fa0db20f1997048a358cea033a72e32d8adad4fa1618c581bd",
+            "state": "active",
+            "posting": "posted",
+            "amount": {
+              "asset": "sat",
+              "amount": "546"
+            },
+            "fees": null,
+            "raw_sign": "provider_positive",
+            "provider_extra": {
+              "confirmed": true,
+              "block_height": 874525,
+              "block_hash": "000000000000000000026a4c23e9dbba99b20cc3be3180037f2425a82bcb0477"
+            },
+            "provenance": {
+              "adapter_id": "sumer-bitcoin",
+              "surface": "esplora.tx",
+              "observed_at": "2026-09-07T14:43:28Z",
+              "effective_at": "2024-12-13T07:28:17Z",
+              "staleness": "live",
+              "completeness": "complete"
+            }
+          },
+          {
+            "local_id": "vault:0d149d10995e6605d9364c018960200751f74929b4c3cbd3d3f83f04c566b5b4",
+            "state": "active",
+            "posting": "posted",
+            "amount": {
+              "asset": "sat",
+              "amount": "571"
+            },
+            "fees": null,
+            "raw_sign": "provider_positive",
+            "provider_extra": {
+              "confirmed": true,
+              "block_height": 943050,
+              "block_hash": "00000000000000000001ee4de3344d42c5192a98b7d475e572b09ff0694eefd1"
+            },
+            "provenance": {
+              "adapter_id": "sumer-bitcoin",
+              "surface": "esplora.tx",
+              "observed_at": "2026-09-07T14:43:28Z",
+              "effective_at": "2026-03-31T10:13:36Z",
+              "staleness": "live",
+              "completeness": "complete"
+            }
+          },
+          {
+            "local_id": "vault:20d6d2b97d95c0f0017626528534a8057f7337a7e84d34004420624ddc4cd7ed",
+            "state": "active",
+            "posting": "posted",
+            "amount": {
+              "asset": "sat",
+              "amount": "55097"
+            },
+            "fees": null,
+            "raw_sign": "provider_positive",
+            "provider_extra": {
+              "confirmed": true,
+              "block_height": 950526,
+              "block_hash": "0000000000000000000180f65fa44259be5828c5d9afc63495a16584f5a4eb62"
+            },
+            "provenance": {
+              "adapter_id": "sumer-bitcoin",
+              "surface": "esplora.tx",
+              "observed_at": "2026-09-07T14:43:28Z",
+              "effective_at": "2026-05-22T14:44:02Z",
+              "staleness": "live",
+              "completeness": "complete"
+            }
+          },
+          {
+            "local_id": "vault:fb09391d781d415397b7bddba62cfb7929d72957040c93a6e29de3911af4bf68",
+            "state": "active",
+            "posting": "posted",
+            "amount": {
+              "asset": "sat",
+              "amount": "66436"
+            },
+            "fees": null,
+            "raw_sign": "provider_positive",
+            "provider_extra": {
+              "confirmed": true,
+              "block_height": 950531,
+              "block_hash": "00000000000000000001b9a1ae40b361a17b9a675e109929d5660ad09f3b46ef"
+            },
+            "provenance": {
+              "adapter_id": "sumer-bitcoin",
+              "surface": "esplora.tx",
+              "observed_at": "2026-09-07T14:43:28Z",
+              "effective_at": "2026-05-22T15:31:52Z",
+              "staleness": "live",
+              "completeness": "complete"
+            }
+          },
+          {
+            "local_id": "vault:2f78adf4d3a18dddffa27a9eec8b6f7d5aedded8292ff2edf4c2fcea33f11435",
+            "state": "active",
+            "posting": "posted",
+            "amount": {
+              "asset": "sat",
+              "amount": "2000"
+            },
+            "fees": null,
+            "raw_sign": "provider_positive",
+            "provider_extra": {
+              "confirmed": true,
+              "block_height": 959785,
+              "block_hash": "000000000000000000011d900edd7bc4c7453be73364193346b299963e63160c"
+            },
+            "provenance": {
+              "adapter_id": "sumer-bitcoin",
+              "surface": "esplora.tx",
+              "observed_at": "2026-09-07T14:43:28Z",
+              "effective_at": "2026-07-27T04:59:37Z",
+              "staleness": "live",
+              "completeness": "complete"
+            }
+          },
+          {
+            "local_id": "vault:e761ea67210b1f4e836e0e0e9ac0187c550fe40fce05bb6b4b4501c6157a625f",
+            "state": "active",
+            "posting": "posted",
+            "amount": {
+              "asset": "sat",
+              "amount": "-2000"
+            },
+            "fees": {
+              "asset": "sat",
+              "amount": "123"
+            },
+            "raw_sign": "provider_negative",
+            "provider_extra": {
+              "confirmed": true,
+              "block_height": 959785,
+              "block_hash": "000000000000000000011d900edd7bc4c7453be73364193346b299963e63160c"
+            },
+            "provenance": {
+              "adapter_id": "sumer-bitcoin",
+              "surface": "esplora.tx",
+              "observed_at": "2026-09-07T14:43:28Z",
+              "effective_at": "2026-07-27T04:59:37Z",
+              "staleness": "live",
+              "completeness": "complete"
+            }
+          }
+        ]
+      }
+    },
+    "live": {
+      "vault": [
+        "vault:a1075db55d416d3ca199f55b6084e2115b9345e16c5cf302fc80e9d5fbf5d48d",
+        "vault:cca7507897abc89628f450e8b1e0c6fca4ec3f7b34cccf55f3f531c659ff4d79",
+        "vault:2c63ac6d71e696dea43ef1ef7fba8c376a6a220383e73a17ba6c3795996db112",
+        "vault:62104aa084f4a158cb9aa545ee30d68db88bb22d4a66904b78d41e4512c1969a",
+        "vault:59ef8b5633c2a8bf0a21edcbc4b9f271572061f81d42b366fe3b8bc0ec68014e",
+        "vault:5a50f6437228d3c6b1830f57f02fc96ec7790c01a178d0b1c4e4fb746218543a",
+        "vault:30570b95cb45d15787a88bd58086bd78fc6bb2cc6cb16afbaf3bc0bd3733875a",
+        "vault:49de9ea077feee38d4952023fbe9cbdbb9020675667c9637ea0f1a456cc40030",
+        "vault:6e05c708d88cc5bf0f1533938c969de2cc48f438b0ae28ce89fefbaa1938185a",
+        "vault:c11d03f65dcabc6589044cd71cf436ac9b4e2ff88f2823483d5f4781f6a3cc38",
+        "vault:61b090d90b0f98566b87eb18d16dafaea6cdf27d7bb8ca12c7dd4bb7f8371c4a",
+        "vault:aea9b1f2bc361046b1fd6d23d1cfc406342651823776cef81e847e474696f57a",
+        "vault:24949288ab32c8e4d870747609e46e21ca0ec61d6607fd71880e7800753d4016",
+        "vault:897cea35c5db6c27fd48b66115d9bb848e543b4aae9b7a701286f1b11a798f7f",
+        "vault:584aa542604f62481c6bfe73a315b89f4db3ecac21f88fe8c53ffb411826b5e5",
+        "vault:c66f9df1e261037ac48cce9cd69dcd881ca6cb0f058ce4fad0063ccf9eadbeab",
+        "vault:ec6389b1b4cf5e9b913c86dac334f01a0723fe870cdadeac532bb815a70a1cf1",
+        "vault:1318b899852c8ecd4c7ff4c540ea469e36b15f781ca517a94168da72b68e427d",
+        "vault:519c79dc444009744e5dec35817d0a7530ba3601aed58ac34837397134177db8",
+        "vault:5985e205ee287d1dbae17a2228016140cbe9656d4acb9213be0db12aa3ea6b25",
+        "vault:9b95987933d18c56af1bb206bc79691d8c31d39a63921ef2b09800cf011f59b7",
+        "vault:c8af747506d064711c2b3f9a9e052ecc8b8f2783c05d342b493edcd6afc3318c",
+        "vault:65a74c97240778e8e83004a37f641b793528c58c6c3956bf41f3f94cfb58c58e",
+        "vault:aa791a854529338cfdffe87d8a685944f9c656cba63f20627d01322d9ee39a3a",
+        "vault:379d8040fbdd9b5875b97b094456e889da902c5c704627e3be6fd3b56cb4d600",
+        "vault:e9930b942f6b5d3492854d62d8122940f86766c6e3da1467a979ff66daed9a8f",
+        "vault:1880480de3c1e427a611cc07ce0dbfd62fb1cfb213a0662b4b7040a69655a9be",
+        "vault:6de8a857249b9cdd621941ac02096c1e0efa19f43a53b043d5f4cc152fb4aa0b",
+        "vault:a268df84c50fc3d21c6163a558cdb56af6a34f310d1c72f4dc33b6492e74c742",
+        "vault:d365765932cc7158c5484254a64196e273cb0108c7edc3fcec45d0510374a8e3",
+        "vault:4221ff28411a87e6d412458689c471b875dd43aca7d02c7fb7c7331855581434",
+        "vault:395206d164c0b6e65712893f2a3fb5365308786abc9065657f3b8f724222e329",
+        "vault:26e92e945d21914349da7628b306f86580cd2bad4a8e9f12241c3d56b84435b3",
+        "vault:fda5d2efa69cdc81b6093152d9cabb07d697f98d1d23c1c1f3905fa23d26469d",
+        "vault:600389bd5ea879a8f96f68e025b7be634176a979c32e102815b6782d955b7920",
+        "vault:c201f48abf5cbb069a5cffefbc6ea04acc2450fdb46598ad12456af43310b300",
+        "vault:692711604378a71e097499034e6209d6872f5f2adf27c150ce822dad5f9495e8",
+        "vault:881db2b47fe09f6cad8361bd95a8daffc797e72705043eb8f3006aed084ffd73",
+        "vault:42677788bd21c2fa0db20f1997048a358cea033a72e32d8adad4fa1618c581bd",
+        "vault:0d149d10995e6605d9364c018960200751f74929b4c3cbd3d3f83f04c566b5b4",
+        "vault:20d6d2b97d95c0f0017626528534a8057f7337a7e84d34004420624ddc4cd7ed",
+        "vault:fb09391d781d415397b7bddba62cfb7929d72957040c93a6e29de3911af4bf68",
+        "vault:2f78adf4d3a18dddffa27a9eec8b6f7d5aedded8292ff2edf4c2fcea33f11435",
+        "vault:e761ea67210b1f4e836e0e0e9ac0187c550fe40fce05bb6b4b4501c6157a625f"
+      ]
+    },
+    "statuses": {
+      "vault": {
+        "outcome": {
+          "fetched": {
+            "page_empty": false
+          }
+        }
+      }
+    },
+    "status_read": {
+      "vault": {
+        "credential_expires_at": null,
+        "strong_auth_expires_at": null,
+        "history_start": null
+      }
+    },
+    "provenance": {
+      "vault": {
+        "staleness": "live",
+        "completeness": "complete"
+      }
+    },
+    "notes": "One watch-only wallet over two addresses, replayed from JSON recorded from blockstream.info on 2026-09-07 (adapters/bitcoin/corpus/basic/RECORDED.md). Every amount here was worked out by hand from that JSON, never from adapter output; the 44 net deltas sum to 379983, which is exactly the confirmed balance the provider's own chain_stats counters give (funded minus spent, summed over the two addresses) -- an arithmetic reconciliation no adapter code takes part in. The order is the whole point of the sequence: ascending by (block height, txid), which is NOT the order the provider returns (newest-first, 25 per page, and this wallet's larger address needs two of those pages), and NOT chronological within a block either -- at height 729541 the spend 9b95.. is emitted before the receive c8af.., because 9b95 < c8af. Five blocks carry two of this wallet's transactions each. fees ride only on the transactions where the wallet itself spent, and one of those (cca75078.., the 2010 pizza spend) legitimately carries fees \"0\": a free transaction, which is an unsigned zero and legal, unlike the signed zero spec/money.md bans. The fee FIGURES are declared, not just their presence: each one is the recorded transaction's own `fee` field, and each satisfies that transaction's own inputs minus its outputs -- a second reading of the same recorded JSON that no adapter code takes part in."
+  }
+}

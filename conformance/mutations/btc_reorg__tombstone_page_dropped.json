@@ -1,0 +1,22 @@
+{
+  "fixture": "bitcoin/btc_reorg",
+  "assertions": [
+    "A2"
+  ],
+  "covers": [
+    "A2"
+  ],
+  "adapter": "btc_tombstone_page_dropped.py",
+  "adapter_argv": [
+    "python3",
+    "{root}/conformance/cases/bitcoin/two_phase.py",
+    "0,1",
+    "{bin}/sumer-bitcoin-adapter",
+    "--wallets",
+    "{root}/adapters/bitcoin/corpus/reorg/wallets.json",
+    "--source",
+    "file:{root}/adapters/bitcoin/corpus/reorg"
+  ],
+  "why": "The reorg tombstone is deleted from the reply on its way out, so the wallet reads as if the spend were still in the chain. The live set is byte-identical either way -- a tombstoned record is not live -- so only sequence equality over the whole emitted history can contradict it. WHAT THIS PROVES AND WHAT IT DOES NOT: it proves btc_reorg can still see a missing tombstone. It mutates nothing inside the adapter: the wrapper spawns the real binary and rewrites its stdout. A wrong mapping baked identically into map.rs and into this case's hand-written expect block survives it, and survives every other mutant here.",
+  "patch": []
+}

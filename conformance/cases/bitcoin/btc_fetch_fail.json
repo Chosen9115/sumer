@@ -1,0 +1,146 @@
+{
+  "case": "btc_fetch_fail",
+  "expect": {
+    "assertions": [
+      "A1",
+      "A3",
+      "A4",
+      "A7"
+    ],
+    "resources": [
+      {
+        "resource_id": "cold",
+        "kind": "bitcoin_wallet",
+        "label": "Two addresses, one unreachable",
+        "provider_extra": {
+          "address_count": 2
+        }
+      },
+      {
+        "resource_id": "fresh",
+        "kind": "bitcoin_wallet",
+        "label": "Never once read",
+        "provider_extra": {
+          "address_count": 1
+        }
+      }
+    ],
+    "ledger": {
+      "cold": {
+        "balances": [
+          {
+            "category": "confirmed",
+            "canonical_hint": "confirmed",
+            "amount": {
+              "asset": "sat",
+              "amount": "379983"
+            },
+            "provenance": {
+              "adapter_id": "sumer-bitcoin",
+              "surface": "esplora.address_stats",
+              "observed_at": "2026-09-08T14:43:28Z",
+              "staleness": "cached",
+              "completeness": "complete"
+            }
+          },
+          {
+            "category": "unconfirmed",
+            "canonical_hint": "unconfirmed",
+            "amount": {
+              "asset": "sat",
+              "amount": "0"
+            },
+            "provenance": {
+              "adapter_id": "sumer-bitcoin",
+              "surface": "esplora.address_stats",
+              "observed_at": "2026-09-08T14:43:28Z",
+              "staleness": "cached",
+              "completeness": "complete"
+            }
+          }
+        ],
+        "history": []
+      },
+      "fresh": {
+        "balances": [
+          {
+            "category": "confirmed",
+            "canonical_hint": "confirmed",
+            "amount": null,
+            "provenance": {
+              "adapter_id": "sumer-bitcoin",
+              "surface": "esplora.address_stats",
+              "observed_at": "2026-09-08T14:43:28Z",
+              "staleness": "unavailable",
+              "completeness": "complete"
+            }
+          },
+          {
+            "category": "unconfirmed",
+            "canonical_hint": "unconfirmed",
+            "amount": null,
+            "provenance": {
+              "adapter_id": "sumer-bitcoin",
+              "surface": "esplora.address_stats",
+              "observed_at": "2026-09-08T14:43:28Z",
+              "staleness": "unavailable",
+              "completeness": "complete"
+            }
+          }
+        ],
+        "history": []
+      }
+    },
+    "live": {
+      "cold": [],
+      "fresh": []
+    },
+    "statuses": {
+      "cold": {
+        "outcome": {
+          "stale": {
+            "as_of": "2026-09-07T14:43:28Z"
+          }
+        },
+        "provider_detail": {
+          "raw": {
+            "status": 503,
+            "body": "Esplora is unavailable\n"
+          }
+        }
+      },
+      "fresh": {
+        "outcome": "unavailable",
+        "provider_detail": {
+          "raw": {
+            "status": 503,
+            "body": "Esplora is unavailable\n"
+          }
+        }
+      }
+    },
+    "status_read": {
+      "cold": {
+        "credential_expires_at": null,
+        "strong_auth_expires_at": null,
+        "history_start": null
+      },
+      "fresh": {
+        "credential_expires_at": null,
+        "strong_auth_expires_at": null,
+        "history_start": null
+      }
+    },
+    "provenance": {
+      "cold": {
+        "staleness": "cached",
+        "completeness": "complete"
+      },
+      "fresh": {
+        "staleness": "unavailable",
+        "completeness": "complete"
+      }
+    },
+    "notes": "The case that keeps the positive-evidence rule from shipping untested. Two adapter lifetimes over one --state-dir: run0 reads both of cold's addresses and records them, run1 answers 503 for one of them. Seventeen of cold's transactions are now absent from everything the adapter can read, and NOT ONE of them is tombstoned: a tombstone needs a direct GET /tx/:txid 404, and a fetch that failed is not evidence of anything. cold's declared history is EMPTY -- a fetch failure anywhere in a sync suppresses the diff entirely, so there is no partial page either -- and its balances are the figures run0 recorded (379983 and 0), carried by outcome stale{as_of} with the host deriving staleness 'cached' from it. fresh is the other half: it was never readable, so there is no prior answer to be stale about, and its two balance lines are amount null. Null is UNKNOWN and is never \"0\" -- a wallet that could not be read is not a wallet holding nothing, and btc_fetch_fail__unknown_balance_rendered_as_zero is the mutant that holds it."
+  }
+}

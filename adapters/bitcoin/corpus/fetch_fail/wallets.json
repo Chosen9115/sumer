@@ -1,0 +1,19 @@
+{
+ "wallets": [
+  {
+   "resource_id": "cold",
+   "label": "Two addresses, one unreachable",
+   "addresses": [
+    "15mKKb2eos1hWa6tisdPwwDC1a5J1y9nma",
+    "17SkEw2md5avVNyYgj6RiXuQKNwkXaxFyQ"
+   ]
+  },
+  {
+   "resource_id": "fresh",
+   "label": "Never once read",
+   "addresses": [
+    "bc1qnjg0jd8228aq7egyzacy8cys3knf9xvrerkf9g"
+   ]
+  }
+ ]
+}

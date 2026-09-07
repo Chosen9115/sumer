@@ -1,0 +1,1106 @@
+//! `sumer-bitcoin-adapter`: a watch-only Bitcoin adapter over Esplora.
+//!
+//! One process, JSON Lines on stdin/stdout, `spec/wire.md` 1. Serial
+//! (`max_in_flight: 1`): a sync is blocking HTTP and there is nothing for
+//! a runtime to overlap.
+//!
+//! Two rules this file exists to keep:
+//!
+//! - **Nothing reaches stdout before the hello reply.** This process
+//!   writes to stdout in exactly one place ([`write_reply`]), reached only
+//!   from the request loop. Every diagnostic goes to stderr.
+//! - **stdin EOF is the end.** The read loop exits on a zero-length read
+//!   and `main` returns; work in flight is dropped, because its reply has
+//!   nowhere to go (`spec/wire.md` 7).
+
+mod map;
+mod seen;
+mod source;
+mod wallet;
+
+use map::{Ctx, Cursor, PAGE_BUDGET_BYTES};
+use source::{FetchError, Source};
+use std::cell::RefCell;
+use std::collections::HashMap;
+use std::fmt::Display;
+use std::io::{self, BufRead, Write};
+use std::path::{Path, PathBuf};
+use sumer_wire::{
+    BalancesReadParams, BalancesReadReply, CursorResumable, ErrorBody, HelloParams, HelloReply,
+    HistoryReadParams, HistoryReadReply, PageReply, PageRequest, ProviderDetail, ReadOutcome,
+    Reply, Request, RequestId, ResourceDescriptor, ResourceStatus, ResourcesListParams,
+    ResourcesListReply, Rfc3339, StatusReadParams, StatusReadReply, WireErrorCode,
+    OP_BALANCES_READ, OP_HELLO, OP_HISTORY_READ, OP_RESOURCES_LIST, OP_STATUS_READ,
+};
+use wallet::Wallet;
+
+const ADAPTER_ID: &str = "sumer-bitcoin";
+const PROTOCOL: &str = "1";
+
+/// Blockstream's public Esplora. One protocol, three deployments: point
+/// `--source` at mempool.space's `/api`, or at your own esplora/electrs,
+/// and no code changes. Never at a service that wants an xpub.
+const DEFAULT_SOURCE: &str = "https://blockstream.info/api";
+
+const USAGE: &str = "\
+usage: sumer-bitcoin-adapter --wallets <file.json> [options]
+
+  --wallets <path>     wallet definitions (required); see README.md
+  --source <target>    https://host/api  (an Esplora deployment), or
+                       file:<dir>        (a recorded corpus)
+                       default: https://blockstream.info/api
+  --state-dir <dir>    where seen.json lives. Without it every sync is a
+                       first run: no tombstones, and no `stale` answers.
+  --record <dir>       write every HTTP response into <dir> as a replayable
+                       corpus (HTTP source only)
+";
+
+fn main() -> std::process::ExitCode {
+    let options = match Options::parse(std::env::args().skip(1)) {
+        Ok(o) => o,
+        Err(e) => {
+            eprintln!("sumer-bitcoin-adapter: {e}\n\n{USAGE}");
+            return std::process::ExitCode::from(2);
+        }
+    };
+    let wallets = match wallet::load(&options.wallets) {
+        Ok(w) => w,
+        Err(e) => {
+            eprintln!("sumer-bitcoin-adapter: {e}");
+            return std::process::ExitCode::from(2);
+        }
+    };
+    let adapter = Adapter {
+        wallets,
+        source: options.source,
+        store: seen::Store::new(options.state_dir),
+        crawls: RefCell::new(HashMap::new()),
+    };
+
+    let stdin = io::stdin();
+    let mut input = stdin.lock();
+    let mut out = io::stdout().lock();
+    let mut line = String::new();
+    loop {
+        line.clear();
+        match input.read_line(&mut line) {
+            // stdin EOF: the defined end of a connection. Exit.
+            Ok(0) => break,
+            Ok(_) => {}
+            Err(e) => {
+                eprintln!("sumer-bitcoin-adapter: stdin: {e}");
+                break;
+            }
+        }
+        let frame = line.trim_end_matches(['\n', '\r']);
+        if frame.is_empty() {
+            continue;
+        }
+        if let Some(reply) = adapter.handle(frame) {
+            if let Err(e) = write_reply(&mut out, &reply) {
+                eprintln!("sumer-bitcoin-adapter: stdout: {e}");
+                break;
+            }
+        }
+    }
+    std::process::ExitCode::SUCCESS
+}
+
+/// The only place this process writes to stdout.
+fn write_reply(out: &mut impl Write, reply: &Reply<serde_json::Value>) -> io::Result<()> {
+    let line = serde_json::to_string(reply)?;
+    out.write_all(line.as_bytes())?;
+    out.write_all(b"\n")?;
+    out.flush()
+}
+
+// ---------------------------------------------------------------------
+// Command line
+// ---------------------------------------------------------------------
+
+struct Options {
+    wallets: PathBuf,
+    source: Source,
+    state_dir: Option<PathBuf>,
+}
+
+impl Options {
+    fn parse(args: impl Iterator<Item = String>) -> Result<Options, String> {
+        let (mut wallets, mut state_dir, mut record) = (None, None, None);
+        let mut target = DEFAULT_SOURCE.to_owned();
+        let mut args = args.peekable();
+        while let Some(flag) = args.next() {
+            let mut value = || {
+                args.next()
+                    .ok_or_else(|| format!("{flag}: missing its value"))
+            };
+            match flag.as_str() {
+                "--wallets" => wallets = Some(PathBuf::from(value()?)),
+                "--source" => target = value()?,
+                "--state-dir" => state_dir = Some(PathBuf::from(value()?)),
+                "--record" => record = Some(PathBuf::from(value()?)),
+                "-h" | "--help" => return Err("help requested".to_owned()),
+                other => return Err(format!("unknown argument {other:?}")),
+            }
+        }
+        let wallets = wallets.ok_or("--wallets is required")?;
+        let source = match target.strip_prefix("file:") {
+            Some(dir) => {
+                if record.is_some() {
+                    return Err(
+                        "--record needs an HTTP --source; there is nothing to record from a corpus"
+                            .to_owned(),
+                    );
+                }
+                Source::replay(Path::new(dir), fixture_run())
+            }
+            None => Source::http(target, record),
+        };
+        Ok(Options {
+            wallets,
+            source,
+            state_dir,
+        })
+    }
+}
+
+/// `SUMER_FIXTURE_RUN` (`spec/wire.md` 11) selects which run subdirectory
+/// of a corpus this process replays, so a two-phase scenario -- write
+/// state, then fail a fetch -- is two adapter lifetimes over two corpora.
+fn fixture_run() -> u64 {
+    std::env::var("SUMER_FIXTURE_RUN")
+        .ok()
+        .and_then(|v| v.trim().parse().ok())
+        .unwrap_or(0)
+}
+
+// ---------------------------------------------------------------------
+// Dispatch
+// ---------------------------------------------------------------------
+
+struct Adapter {
+    wallets: Vec<Wallet>,
+    source: Source,
+    store: seen::Store,
+    /// One point-in-time crawl per resource, alive from the first page
+    /// request until the crawl drains or the process exits. `RefCell`
+    /// rather than a lock because this adapter is serial by declaration
+    /// (`max_in_flight: 1`) and single-threaded by construction.
+    ///
+    /// This is not persistence. The host spawns one adapter process and
+    /// multiplexes many requests over it, so a snapshot held between two
+    /// pages of one crawl is work already done inside one connection,
+    /// not state carried across them.
+    crawls: RefCell<HashMap<String, Crawl>>,
+}
+
+/// One crawl's snapshot: everything a page of it is planned from.
+struct Crawl {
+    /// The instant the crawl was taken. Every page of it reports this as
+    /// `observed_at`, because that is when the provider was observed --
+    /// pages two and three did not observe anything.
+    observed_at: Rfc3339,
+    chain: wallet::ChainData,
+    /// What `seen.json` remembered when the crawl began. Frozen with the
+    /// rest of it: the by-txid section's membership must not shift between
+    /// pages either.
+    seen_txs: map::SeenTxs,
+}
+
+fn invalid(e: impl Display) -> ErrorBody {
+    ErrorBody::new(WireErrorCode::InvalidRequest, e.to_string())
+}
+
+fn internal(e: impl Display) -> ErrorBody {
+    ErrorBody::new(WireErrorCode::Internal, e.to_string())
+}
+
+/// A status entry with every field this adapter never populates left
+/// absent by construction: `credential_expires_at` and
+/// `strong_auth_expires_at` do not exist for a watch-only wallet -- there
+/// is no credential and no authentication session -- and `degraded` is
+/// unreachable because this adapter's `provider_extra` is a fixed handful
+/// of scalars, so no observation it builds approaches
+/// `MAX_OBSERVATION_BYTES`.
+fn status(resource_id: &str, outcome: ReadOutcome) -> ResourceStatus {
+    ResourceStatus {
+        resource_id: resource_id.to_owned(),
+        outcome,
+        degraded: None,
+        provider_detail: None,
+        page: None,
+        credential_expires_at: None,
+        strong_auth_expires_at: None,
+        history_start: None,
+    }
+}
+
+fn with_detail(mut s: ResourceStatus, detail: &ProviderDetail) -> ResourceStatus {
+    s.provider_detail = Some(detail.clone());
+    s
+}
+
+/// A `resource_id` this adapter was never configured with.
+///
+/// `not_fetched`, not `gone`: `gone` claims the resource used to exist and
+/// no longer does, which this adapter cannot know -- a wallet it has no
+/// config line for is one it never had.
+fn unknown_resource(resource_id: &str) -> ResourceStatus {
+    with_detail(
+        status(resource_id, ReadOutcome::NotFetched),
+        &ProviderDetail {
+            code: "unknown_resource".to_owned(),
+            message: "no wallet with this resource_id is configured".to_owned(),
+            raw: serde_json::Value::Null,
+        },
+    )
+}
+
+impl Adapter {
+    fn handle(&self, frame: &str) -> Option<Reply<serde_json::Value>> {
+        let value: serde_json::Value = match serde_json::from_str(frame) {
+            Ok(v) => v,
+            Err(e) => {
+                // No id, no addressee. The host owns framing; a frame this
+                // adapter cannot parse is not something it can answer.
+                eprintln!("sumer-bitcoin-adapter: unparseable frame: {e}");
+                return None;
+            }
+        };
+        let id = value.get("id").and_then(serde_json::Value::as_u64);
+        let request: Request = match serde_json::from_value(value) {
+            Ok(r) => r,
+            Err(e) => {
+                let id = RequestId(id?);
+                return Some(Reply::err(id, invalid(e)));
+            }
+        };
+        let id = request.id;
+        let params = if request.params.is_null() {
+            serde_json::json!({})
+        } else {
+            request.params
+        };
+        let result = match request.op.as_str() {
+            OP_HELLO => hello(&params),
+            OP_RESOURCES_LIST => self.resources_list(&params),
+            OP_BALANCES_READ => self.balances_read(&params),
+            OP_HISTORY_READ => self.history_read(&params),
+            OP_STATUS_READ => self.status_read(&params),
+            other => Err(ErrorBody::new(
+                WireErrorCode::Unsupported,
+                "operation not supported by this adapter",
+            )
+            .with_detail(serde_json::json!({"op": other}))),
+        };
+        Some(match result {
+            Ok(ok) => Reply::ok(id, ok),
+            Err(err) => Reply::err(id, err),
+        })
+    }
+
+    fn lookup(&self, resource_id: &str) -> Option<&Wallet> {
+        self.wallets.iter().find(|w| w.resource_id == resource_id)
+    }
+
+    fn ctx(&self, w: &Wallet, observed_at: &Rfc3339) -> Ctx {
+        Ctx {
+            resource_id: w.resource_id.clone(),
+            adapter_id: ADAPTER_ID.to_owned(),
+            provider_id: self.source.provider_id(),
+            observed_at: observed_at.clone(),
+        }
+    }
+
+    fn observed_at(&self) -> Result<Rfc3339, ErrorBody> {
+        map::rfc3339_utc(self.source.now()).map_err(|e| internal(format!("clock: byte {}", e.at)))
+    }
+
+    fn resources_list(&self, params: &serde_json::Value) -> Result<serde_json::Value, ErrorBody> {
+        let _: ResourcesListParams = serde_json::from_value(params.clone()).map_err(invalid)?;
+        let resources = self
+            .wallets
+            .iter()
+            .map(|w| {
+                let mut extra = serde_json::Map::new();
+                // The COUNT and the fingerprint, never the addresses: a
+                // resource listing is not the place to hand a wallet's
+                // address set to anything that reads a log.
+                extra.insert("address_count".to_owned(), w.addresses.len().into());
+                extra.insert(
+                    "address_set_sha256".to_owned(),
+                    w.address_hash.clone().into(),
+                );
+                ResourceDescriptor {
+                    resource_id: w.resource_id.clone(),
+                    provider_id: self.source.provider_id(),
+                    kind: "bitcoin_wallet".to_owned(),
+                    label: w.label.clone(),
+                    provider_extra: Some(extra),
+                }
+            })
+            .collect();
+        serde_json::to_value(ResourcesListReply { resources }).map_err(internal)
+    }
+
+    fn balances_read(&self, params: &serde_json::Value) -> Result<serde_json::Value, ErrorBody> {
+        let params: BalancesReadParams = serde_json::from_value(params.clone()).map_err(invalid)?;
+        let observed_at = self.observed_at()?;
+        let mut observations = Vec::new();
+        let mut statuses = Vec::new();
+        let mut abandoned = false;
+
+        for resource_id in &params.resource_ids {
+            let Some(w) = self.lookup(resource_id) else {
+                statuses.push(unknown_resource(resource_id));
+                continue;
+            };
+            let ctx = self.ctx(w, &observed_at);
+            // Two lines always, whatever happened. `amount: null` is
+            // UNKNOWN and is never rendered "0": a balance that could not
+            // be read is not a balance of nothing.
+            let (mut confirmed, mut unconfirmed) = (None, None);
+            let outcome = if abandoned {
+                status(resource_id, ReadOutcome::NotFetched)
+            } else {
+                match wallet::balances(&self.source, w) {
+                    Ok((c, u)) => {
+                        confirmed = Some(c);
+                        unconfirmed = Some(u);
+                        let mut recorded = self.store.load(&w.resource_id, &w.address_hash);
+                        recorded.confirmed = confirmed;
+                        recorded.unconfirmed = unconfirmed;
+                        self.record_state(w, &observed_at, &recorded);
+                        status(resource_id, ReadOutcome::Fetched { page_empty: false })
+                    }
+                    Err(FetchError::RateLimited {
+                        retry_after_ms,
+                        detail,
+                    }) => {
+                        // Everything after this in the batch is
+                        // `not_fetched`: hammering a provider that just
+                        // said stop is not a read strategy.
+                        abandoned = true;
+                        with_detail(
+                            status(resource_id, ReadOutcome::RateLimited { retry_after_ms }),
+                            &detail,
+                        )
+                    }
+                    Err(FetchError::Unavailable { detail }) => {
+                        let recorded = self.store.load(&w.resource_id, &w.address_hash);
+                        match recorded.as_of.clone() {
+                            Some(as_of) => {
+                                confirmed = recorded.confirmed;
+                                unconfirmed = recorded.unconfirmed;
+                                with_detail(
+                                    status(resource_id, ReadOutcome::Stale { as_of }),
+                                    &detail,
+                                )
+                            }
+                            None => {
+                                with_detail(status(resource_id, ReadOutcome::Unavailable), &detail)
+                            }
+                        }
+                    }
+                }
+            };
+            observations
+                .extend(map::balance_lines(&ctx, confirmed, unconfirmed).map_err(internal)?);
+            statuses.push(outcome);
+        }
+        serde_json::to_value(BalancesReadReply {
+            observations,
+            statuses,
+        })
+        .map_err(internal)
+    }
+
+    fn history_read(&self, params: &serde_json::Value) -> Result<serde_json::Value, ErrorBody> {
+        let params: HistoryReadParams = serde_json::from_value(params.clone()).map_err(invalid)?;
+        let mut observations = Vec::new();
+        let mut statuses = Vec::new();
+        let mut abandoned = false;
+
+        for query in &params.resources {
+            let resource_id = &query.resource_id;
+            // A cursor this adapter did not mint, or a window it does not
+            // serve, is a request it cannot process AS A WHOLE -- an
+            // envelope error, and deliberately without a `resource_id` in
+            // the detail (spec/wire.md 8: wanting one there is the signal
+            // that a status outcome was the right channel, and neither of
+            // these is a fact about a resource).
+            let from = match &query.page {
+                None => None,
+                Some(PageRequest::Cursor { cursor }) => {
+                    Some(Cursor::parse(cursor).map_err(invalid)?)
+                }
+                Some(PageRequest::Window { .. }) => {
+                    return Err(ErrorBody::new(
+                        WireErrorCode::InvalidRequest,
+                        "this adapter serves cursor pages only; Bitcoin history is ordered by \
+                         block, not by wall-clock time",
+                    )
+                    .with_detail(serde_json::json!({"page_kind": "window"})))
+                }
+            };
+            let Some(w) = self.lookup(resource_id) else {
+                statuses.push(unknown_resource(resource_id));
+                continue;
+            };
+            if abandoned {
+                statuses.push(status(resource_id, ReadOutcome::NotFetched));
+                continue;
+            }
+
+            // A request with no `page` starts a NEW crawl (Ruling A8:
+            // absent means "from the start of available history"); a
+            // cursor continues the crawl already in hand, and falls back
+            // to a fresh one if this process has no memory of it.
+            let start_a_crawl = from.is_none() || !self.crawls.borrow().contains_key(resource_id);
+            if start_a_crawl {
+                let observed_at = self.observed_at()?;
+                let recorded = self.store.load(&w.resource_id, &w.address_hash);
+                match wallet::sync(&self.source, w, &recorded.txs) {
+                    Ok(chain) => {
+                        self.crawls.borrow_mut().insert(
+                            resource_id.clone(),
+                            Crawl {
+                                observed_at,
+                                chain,
+                                seen_txs: recorded.txs,
+                            },
+                        );
+                    }
+                    // ANY fetch failure suppresses the diff ENTIRELY: no
+                    // observations, and no `page` either -- claiming a
+                    // resume point for a read that did not happen would be
+                    // fiction.
+                    Err(FetchError::RateLimited {
+                        retry_after_ms,
+                        detail,
+                    }) => {
+                        abandoned = true;
+                        statuses.push(with_detail(
+                            status(resource_id, ReadOutcome::RateLimited { retry_after_ms }),
+                            &detail,
+                        ));
+                        continue;
+                    }
+                    Err(FetchError::Unavailable { detail }) => {
+                        statuses.push(with_detail(
+                            match recorded.as_of {
+                                Some(as_of) => status(resource_id, ReadOutcome::Stale { as_of }),
+                                None => status(resource_id, ReadOutcome::Unavailable),
+                            },
+                            &detail,
+                        ));
+                        continue;
+                    }
+                }
+            }
+
+            // Every page of one crawl is served from the SAME snapshot --
+            // the same transactions, the same remembered state, the same
+            // `observed_at`. Re-reading live data between pages would let
+            // a transaction arriving mid-pagination shift every later
+            // page, duplicating, skipping or reordering observations while
+            // the cursor advanced over a dataset that moved underneath it.
+            let (page, snapshot_at, delivered_in_full) = {
+                let crawls = self.crawls.borrow();
+                let Some(crawl) = crawls.get(resource_id) else {
+                    return Err(internal("the crawl snapshot vanished before it was read"));
+                };
+                let chain = map::Chain {
+                    txs: &crawl.chain.txs,
+                    mempool: &crawl.chain.mempool,
+                    gone: &crawl.chain.gone,
+                };
+                let ctx = self.ctx(w, &crawl.observed_at);
+                let plan = map::plan(&ctx, &chain, &w.owned, &crawl.seen_txs, from.as_ref())
+                    .map_err(internal)?;
+                let page = map::cut_page(plan, PAGE_BUDGET_BYTES).map_err(internal)?;
+                let delivered = page
+                    .next
+                    .is_none()
+                    .then(|| map::next_seen(&chain, &w.owned, &crawl.seen_txs));
+                (page, crawl.observed_at.clone(), delivered)
+            };
+
+            // The baseline moves only once the crawl has been delivered in
+            // full, and the spent snapshot is dropped. A crawl the host
+            // abandons mid-page leaves the old baseline in place, so the
+            // next sync re-derives it rather than trusting a
+            // half-delivered diff.
+            if let Some(txs) = delivered_in_full {
+                let recorded = self.store.load(&w.resource_id, &w.address_hash);
+                self.record_state(
+                    w,
+                    &snapshot_at,
+                    &seen::Seen {
+                        as_of: Some(snapshot_at.clone()),
+                        confirmed: recorded.confirmed,
+                        unconfirmed: recorded.unconfirmed,
+                        txs,
+                    },
+                );
+                self.crawls.borrow_mut().remove(resource_id);
+            }
+
+            let mut entry = status(
+                resource_id,
+                ReadOutcome::Fetched {
+                    page_empty: page.observations.is_empty(),
+                },
+            );
+            entry.page = Some(PageReply {
+                cursor_resumable: CursorResumable::Exact,
+                next: page
+                    .next
+                    .map(|c| PageRequest::Cursor { cursor: c.encode() }),
+                window_capped_to: None,
+                page_size_reduced_to: page.page_size_reduced_to,
+            });
+            observations.extend(page.observations);
+            statuses.push(entry);
+        }
+        serde_json::to_value(HistoryReadReply {
+            observations,
+            statuses,
+        })
+        .map_err(internal)
+    }
+
+    /// Reachability, one address per wallet. No `stale` here: a cached
+    /// answer says nothing about whether the provider is reachable NOW,
+    /// which is the only question this op asks.
+    fn status_read(&self, params: &serde_json::Value) -> Result<serde_json::Value, ErrorBody> {
+        let params: StatusReadParams = serde_json::from_value(params.clone()).map_err(invalid)?;
+        let mut statuses = Vec::new();
+        let mut abandoned = false;
+        for resource_id in &params.resource_ids {
+            let Some(w) = self.lookup(resource_id) else {
+                statuses.push(unknown_resource(resource_id));
+                continue;
+            };
+            let Some(address) = w.addresses.first() else {
+                statuses.push(unknown_resource(resource_id));
+                continue;
+            };
+            if abandoned {
+                statuses.push(status(resource_id, ReadOutcome::NotFetched));
+                continue;
+            }
+            statuses.push(match self.source.address_stats(address) {
+                // `status.read` carries no observations at all, so its
+                // page is empty by definition.
+                Ok(_) => status(resource_id, ReadOutcome::Fetched { page_empty: true }),
+                Err(FetchError::RateLimited {
+                    retry_after_ms,
+                    detail,
+                }) => {
+                    abandoned = true;
+                    with_detail(
+                        status(resource_id, ReadOutcome::RateLimited { retry_after_ms }),
+                        &detail,
+                    )
+                }
+                Err(FetchError::Unavailable { detail }) => {
+                    with_detail(status(resource_id, ReadOutcome::Unavailable), &detail)
+                }
+            });
+        }
+        serde_json::to_value(StatusReadReply { statuses }).map_err(internal)
+    }
+
+    /// A state write that fails is logged and survived: the next sync
+    /// simply sees an older baseline, which under positive evidence costs
+    /// a delayed tombstone and never an invented one.
+    fn record_state(&self, w: &Wallet, as_of: &Rfc3339, state: &seen::Seen) {
+        if let Err(e) = self
+            .store
+            .save(&w.resource_id, &w.address_hash, as_of, state)
+        {
+            eprintln!(
+                "sumer-bitcoin-adapter: could not record state for {}: {e}",
+                w.resource_id
+            );
+        }
+    }
+}
+
+fn hello(params: &serde_json::Value) -> Result<serde_json::Value, ErrorBody> {
+    let params: HelloParams = serde_json::from_value(params.clone()).map_err(invalid)?;
+    if !params.protocol.iter().any(|v| v == PROTOCOL) {
+        return Err(ErrorBody::new(
+            WireErrorCode::UnsupportedProtocol,
+            "this adapter speaks protocol 1 only",
+        )
+        .with_detail(serde_json::json!({"offered": params.protocol})));
+    }
+    serde_json::to_value(HelloReply {
+        protocol: PROTOCOL.to_owned(),
+        adapter_id: ADAPTER_ID.to_owned(),
+        adapter_version: env!("CARGO_PKG_VERSION").to_owned(),
+        capabilities: vec![
+            OP_RESOURCES_LIST.to_owned(),
+            OP_BALANCES_READ.to_owned(),
+            OP_HISTORY_READ.to_owned(),
+            OP_STATUS_READ.to_owned(),
+        ],
+        local_id_derivation: map::LOCAL_ID_DERIVATION.to_owned(),
+        // Serial by design: one blocking HTTP sync at a time.
+        max_in_flight: 1,
+    })
+    .map_err(internal)
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn hello_declares_the_four_read_capabilities_and_the_derivation() {
+        let ok = hello(&serde_json::json!({"protocol": ["1"]})).unwrap();
+        assert_eq!(ok["protocol"], "1");
+        assert_eq!(ok["adapter_id"], ADAPTER_ID);
+        assert_eq!(ok["local_id_derivation"], "btc-txid@1");
+        assert_eq!(ok["max_in_flight"], 1);
+        assert_eq!(ok["capabilities"].as_array().unwrap().len(), 4);
+    }
+
+    #[test]
+    fn hello_refuses_a_version_it_was_not_offered() {
+        let err = hello(&serde_json::json!({"protocol": ["2", "999"]})).unwrap_err();
+        assert_eq!(err.code, WireErrorCode::UnsupportedProtocol);
+    }
+
+    // -----------------------------------------------------------------
+    // End to end over a corpus: the positive-evidence rule, exercised
+    // through the same code path a real sync takes.
+    // -----------------------------------------------------------------
+
+    const ADDR: &str = "bc1qexample0";
+
+    fn ok_of(reply: Reply<serde_json::Value>) -> serde_json::Value {
+        match reply {
+            Reply::Ok { ok, .. } => ok,
+            Reply::Err { err, .. } => panic!("expected ok, got err: {err:?}"),
+        }
+    }
+
+    fn request(op: &str, params: serde_json::Value) -> String {
+        serde_json::json!({"id": 1, "op": op, "params": params}).to_string()
+    }
+
+    /// A two-run corpus: run 0 answers everything, run 1 fails the chain
+    /// listing with a 500 and has no address stats at all.
+    fn fetch_fail_corpus(txid: &str) -> PathBuf {
+        let root = std::env::temp_dir().join(format!(
+            "sumer-btc-e2e-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        let write = |rel: &str, body: &str| {
+            let path = root.join(rel);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, body).unwrap();
+        };
+        write("run0/now", "1767225600");
+        write(
+            &format!("run0/address_{ADDR}.json"),
+            &serde_json::json!({
+                "address": ADDR,
+                "chain_stats": {"funded_txo_sum": 900, "spent_txo_sum": 0, "tx_count": 1},
+                "mempool_stats": {"funded_txo_sum": 0, "spent_txo_sum": 0, "tx_count": 0},
+            })
+            .to_string(),
+        );
+        write(
+            &format!("run0/address_{ADDR}_txs_chain.json"),
+            &serde_json::json!([{
+                "txid": txid,
+                "fee": 100,
+                "status": {
+                    "confirmed": true, "block_height": 800_000,
+                    "block_hash": "0".repeat(64), "block_time": 1_600_000_000i64
+                },
+                "vin": [{"prevout": {"scriptpubkey_address": "bc1qthem0000", "value": 1_000}}],
+                "vout": [{"scriptpubkey_address": ADDR, "value": 900}],
+            }])
+            .to_string(),
+        );
+        write(&format!("run0/address_{ADDR}_txs_mempool.json"), "[]");
+        // Run 1: the provider is having a bad day.
+        write("run1/now", "1767312000");
+        write(
+            &format!("run1/address_{ADDR}_txs_chain.status"),
+            "500\nupstream is on fire",
+        );
+        root
+    }
+
+    fn adapter_over(root: &Path, run: u64, state: &Path) -> Adapter {
+        let config = root.join("wallets.json");
+        if !config.exists() {
+            std::fs::write(
+                &config,
+                serde_json::json!({"wallets": [{"resource_id": "w", "addresses": [ADDR]}]})
+                    .to_string(),
+            )
+            .unwrap();
+        }
+        Adapter {
+            wallets: wallet::load(&config).unwrap(),
+            source: Source::replay(root, run),
+            store: seen::Store::new(Some(state.to_path_buf())),
+            crawls: RefCell::new(HashMap::new()),
+        }
+    }
+
+    /// The case the whole positive-evidence rule stands or falls on: a
+    /// read that failed must produce ZERO tombstones, `stale { as_of }`,
+    /// and the balances the last good read established.
+    #[test]
+    fn a_failed_fetch_suppresses_the_diff_entirely() {
+        let txid = "a".repeat(64);
+        let root = fetch_fail_corpus(&txid);
+        let state = root.join("state");
+
+        // Phase 1: everything answers.
+        let phase1 = adapter_over(&root, 0, &state);
+        let balances = ok_of(
+            phase1
+                .handle(&request(
+                    OP_BALANCES_READ,
+                    serde_json::json!({"resource_ids": ["w"]}),
+                ))
+                .unwrap(),
+        );
+        assert_eq!(balances["observations"][0]["amount"]["amount"], "900");
+        assert_eq!(balances["observations"][1]["amount"]["amount"], "0");
+        assert_eq!(
+            balances["statuses"][0]["outcome"]["fetched"]["page_empty"],
+            false
+        );
+
+        let history = ok_of(
+            phase1
+                .handle(&request(
+                    OP_HISTORY_READ,
+                    serde_json::json!({"resources": [{"resource_id": "w"}]}),
+                ))
+                .unwrap(),
+        );
+        assert_eq!(history["observations"].as_array().unwrap().len(), 1);
+        assert_eq!(history["observations"][0]["local_id"], format!("w:{txid}"));
+        assert_eq!(history["observations"][0]["state"], "active");
+        assert_eq!(history["observations"][0]["amount"]["amount"], "900");
+        assert!(history["statuses"][0]["page"]["next"].is_null(), "drained");
+        assert_eq!(history["statuses"][0]["page"]["cursor_resumable"], "exact");
+
+        // Phase 2: the chain listing 500s. The transaction is absent from
+        // every listing this run -- and absence is NOT evidence.
+        let phase2 = adapter_over(&root, 1, &state);
+        let history = ok_of(
+            phase2
+                .handle(&request(
+                    OP_HISTORY_READ,
+                    serde_json::json!({"resources": [{"resource_id": "w"}]}),
+                ))
+                .unwrap(),
+        );
+        assert_eq!(
+            history["observations"].as_array().unwrap().len(),
+            0,
+            "no partial diff, and above all no invented tombstone"
+        );
+        let status = &history["statuses"][0];
+        assert_eq!(
+            status["outcome"]["stale"]["as_of"], "2026-01-01T00:00:00Z",
+            "stale is a NORMAL outcome, dated by the last good read"
+        );
+        assert!(
+            status["page"].is_null(),
+            "a read that did not happen claims no resume point"
+        );
+        assert_eq!(status["provider_detail"]["code"], "http_500");
+        assert_eq!(
+            status["provider_detail"]["raw"]["body"],
+            "upstream is on fire"
+        );
+
+        let balances = ok_of(
+            phase2
+                .handle(&request(
+                    OP_BALANCES_READ,
+                    serde_json::json!({"resource_ids": ["w"]}),
+                ))
+                .unwrap(),
+        );
+        assert_eq!(
+            balances["statuses"][0]["outcome"]["stale"]["as_of"],
+            "2026-01-01T00:00:00Z"
+        );
+        assert_eq!(
+            balances["observations"][0]["amount"]["amount"], "900",
+            "the last good balance is preserved and reported as stale"
+        );
+
+        // Phase 3: run 0 again, with the phase-1 state still on disk. The
+        // transaction is back in the listing, nothing vanished, and the
+        // sync is quiet.
+        let phase3 = adapter_over(&root, 0, &state);
+        let history = ok_of(
+            phase3
+                .handle(&request(
+                    OP_HISTORY_READ,
+                    serde_json::json!({"resources": [{"resource_id": "w"}]}),
+                ))
+                .unwrap(),
+        );
+        assert_eq!(history["observations"][0]["state"], "active");
+        assert!(history["observations"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|o| o["tombstone_reason"].is_null()));
+
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// A corpus with `count` confirmed transactions, chained across the
+    /// 25-per-page chain listing exactly as Esplora pages it.
+    fn paged_corpus(root: &Path, count: usize) {
+        let corpus = root.join("corpus/run0");
+        std::fs::create_dir_all(&corpus).unwrap();
+        std::fs::write(corpus.join("now"), "1767225600").unwrap();
+        std::fs::write(
+            corpus.join(format!("address_{ADDR}_txs_mempool.json")),
+            "[]",
+        )
+        .unwrap();
+
+        let txs: Vec<serde_json::Value> = (0..count)
+            .map(|n| {
+                serde_json::json!({
+                    "txid": format!("{n:064x}"),
+                    "fee": 200,
+                    "status": {
+                        "confirmed": true,
+                        "block_height": 800_000 + n / 10,
+                        "block_hash": format!("{:064x}", 800_000 + n / 10),
+                        "block_time": 1_700_000_000i64,
+                    },
+                    "vin": [{"prevout": {"scriptpubkey_address": "bc1qthem0000", "value": 1_100}}],
+                    "vout": [{"scriptpubkey_address": ADDR, "value": 1_000}],
+                })
+            })
+            .collect();
+
+        let mut name = format!("address_{ADDR}_txs_chain");
+        for chunk in txs.chunks(25) {
+            std::fs::write(
+                corpus.join(format!("{name}.json")),
+                serde_json::Value::Array(chunk.to_vec()).to_string(),
+            )
+            .unwrap();
+            let last = chunk.last().unwrap()["txid"].as_str().unwrap().to_owned();
+            name = format!("address_{ADDR}_txs_chain_{last}");
+        }
+        // A final short page ends the crawl. When the last chunk was
+        // exactly full, that page has to be an empty one.
+        if count.is_multiple_of(25) {
+            std::fs::write(corpus.join(format!("{name}.json")), "[]").unwrap();
+        }
+    }
+
+    /// One crawl is ONE SNAPSHOT, and later pages of it never touch the
+    /// provider again -- proved by deleting the entire corpus after the
+    /// first page and draining the rest anyway.
+    #[test]
+    fn later_pages_of_a_crawl_are_served_from_the_snapshot() {
+        const COUNT: usize = 1_200;
+        let root = std::env::temp_dir().join(format!(
+            "sumer-btc-snapshot-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        paged_corpus(&root, COUNT);
+        let config = root.join("wallets.json");
+        std::fs::write(
+            &config,
+            serde_json::json!({"wallets": [{"resource_id": "w", "addresses": [ADDR]}]}).to_string(),
+        )
+        .unwrap();
+        let adapter = Adapter {
+            wallets: wallet::load(&config).unwrap(),
+            source: Source::replay(&root.join("corpus"), 0),
+            store: seen::Store::new(Some(root.join("state"))),
+            crawls: RefCell::new(HashMap::new()),
+        };
+
+        let page_of = |page: serde_json::Value| -> serde_json::Value {
+            let resource = match page {
+                serde_json::Value::Null => serde_json::json!({"resource_id": "w"}),
+                cursor => serde_json::json!({"resource_id": "w", "page": cursor}),
+            };
+            ok_of(
+                adapter
+                    .handle(&request(
+                        OP_HISTORY_READ,
+                        serde_json::json!({"resources": [resource]}),
+                    ))
+                    .unwrap(),
+            )
+        };
+
+        let first = page_of(serde_json::Value::Null);
+        let next = first["statuses"][0]["page"]["next"].clone();
+        assert!(
+            !next.is_null(),
+            "fixture too small: {COUNT} transactions fit in one 512 KiB page, so this \
+             test would prove nothing about a second one"
+        );
+        assert_eq!(
+            first["statuses"][0]["page"]["page_size_reduced_to"],
+            first["observations"].as_array().unwrap().len(),
+            "a page that cut early reports how many it emitted"
+        );
+
+        // The provider is now gone. Everything from here has to come out
+        // of the snapshot taken at the first page.
+        std::fs::remove_dir_all(root.join("corpus")).unwrap();
+
+        let mut ids: Vec<String> = first["observations"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|o| o["local_id"].as_str().unwrap().to_owned())
+            .collect();
+        let mut cursor = next;
+        let mut pages = 1;
+        while !cursor.is_null() {
+            let reply = page_of(cursor.clone());
+            assert_eq!(
+                reply["statuses"][0]["outcome"]["fetched"]["page_empty"], false,
+                "page {pages}: the snapshot should still be serving observations"
+            );
+            ids.extend(
+                reply["observations"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|o| o["local_id"].as_str().unwrap().to_owned()),
+            );
+            cursor = reply["statuses"][0]["page"]["next"].clone();
+            pages += 1;
+            assert!(pages < 20, "not draining");
+        }
+        assert!(pages > 1, "the crawl must have taken more than one page");
+
+        let expected: Vec<String> = (0..COUNT).map(|n| format!("w:{n:064x}")).collect();
+        assert_eq!(
+            ids, expected,
+            "every transaction, exactly once, in order, across the page boundary"
+        );
+
+        // The drained crawl wrote its baseline and dropped its snapshot.
+        let state: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(root.join("state/w.json")).unwrap())
+                .unwrap();
+        assert_eq!(state["txs"].as_object().unwrap().len(), COUNT);
+        assert_eq!(state["as_of"], "2026-01-01T00:00:00Z");
+
+        // A new `page: None` starts a NEW crawl -- which, with the corpus
+        // deleted, cannot be taken. That is the proof the snapshot was
+        // spent rather than reused as a cache.
+        let fresh = page_of(serde_json::Value::Null);
+        assert_eq!(fresh["observations"].as_array().unwrap().len(), 0);
+        assert_eq!(
+            fresh["statuses"][0]["outcome"]["stale"]["as_of"], "2026-01-01T00:00:00Z",
+            "a fresh crawl against a dead provider is stale, not silently cached"
+        );
+
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn an_unconfigured_resource_is_not_fetched_never_gone() {
+        let txid = "b".repeat(64);
+        let root = fetch_fail_corpus(&txid);
+        let adapter = adapter_over(&root, 0, &root.join("state2"));
+        let reply = ok_of(
+            adapter
+                .handle(&request(
+                    OP_BALANCES_READ,
+                    serde_json::json!({"resource_ids": ["nope"]}),
+                ))
+                .unwrap(),
+        );
+        assert_eq!(reply["statuses"][0]["outcome"], "not_fetched");
+        assert_eq!(reply["statuses"][0]["resource_id"], "nope");
+        assert_eq!(reply["observations"].as_array().unwrap().len(), 0);
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn an_undeclared_op_is_an_err_that_does_not_end_the_connection() {
+        let root = fetch_fail_corpus(&"c".repeat(64));
+        let adapter = adapter_over(&root, 0, &root.join("state3"));
+        let reply = adapter
+            .handle(&request("execute", serde_json::json!({})))
+            .unwrap();
+        match reply {
+            Reply::Err { err, .. } => assert_eq!(err.code, WireErrorCode::Unsupported),
+            Reply::Ok { .. } => panic!("an unknown op must not succeed"),
+        }
+        // ...and the very next request is answered normally.
+        assert!(adapter
+            .handle(&request(OP_RESOURCES_LIST, serde_json::json!({})))
+            .is_some());
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn a_window_page_request_is_refused_without_naming_a_resource() {
+        let root = fetch_fail_corpus(&"d".repeat(64));
+        let adapter = adapter_over(&root, 0, &root.join("state4"));
+        let reply = adapter
+            .handle(&request(
+                OP_HISTORY_READ,
+                serde_json::json!({"resources": [{"resource_id": "w", "page": {
+                    "kind": "window",
+                    "resource_id": "w",
+                    "start": "2026-01-01T00:00:00Z",
+                    "end": "2026-02-01T00:00:00Z"
+                }}]}),
+            ))
+            .unwrap();
+        match reply {
+            Reply::Err { err, .. } => {
+                assert_eq!(err.code, WireErrorCode::InvalidRequest);
+                let detail = err.detail.unwrap();
+                assert!(
+                    detail.get("resource_id").is_none(),
+                    "spec/wire.md 8: an err payload naming a resource wanted a status instead"
+                );
+            }
+            Reply::Ok { .. } => panic!("this adapter serves cursor pages only"),
+        }
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn a_status_entry_never_carries_a_credential_clock() {
+        // Watch-only: there is no credential and no SCA session, so these
+        // two fields are absent by construction, not by remembering.
+        let s = status("w", ReadOutcome::Unavailable);
+        let json = serde_json::to_value(&s).unwrap();
+        assert!(json.get("credential_expires_at").is_none());
+        assert!(json.get("strong_auth_expires_at").is_none());
+    }
+}

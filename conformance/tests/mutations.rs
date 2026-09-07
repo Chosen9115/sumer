@@ -34,6 +34,22 @@
 //!   `mutations/adapters/`, for the mutations a static patch cannot express:
 //!   behaving differently on the *second* process invocation, or corrupting
 //!   the adapter's degrade step rather than its data.
+//! * `adapter_argv` names the adapter the fixture is driven against when it
+//!   is not the Python reference one -- the Bitcoin fixtures, which replay a
+//!   recorded provider corpus through the real `sumer-bitcoin-adapter`. Both
+//!   the mutated run and the baseline run use it, with `{root}` and `{bin}`
+//!   expanded to the repository root and to cargo's binary directory.
+//!
+//!   **The `patch` mechanism does not transfer to those fixtures**, and the
+//!   reason is worth stating: patching a corpus mutates the PROVIDER, and
+//!   then the expected output legitimately changes -- which is the one thing
+//!   a mutant may never do. What transfers is `adapter`: a wrapper that
+//!   spawns the argv above and rewrites what it writes to stdout. So a
+//!   Bitcoin mutant proves that its fixture can still SEE a given break; it
+//!   mutates nothing inside the adapter, and a wrong mapping baked
+//!   identically into `map.rs` and into a hand-written `expect` block
+//!   survives every one of them. That exposure is closed by reading the
+//!   expects against the checksummed provider JSON, by hand.
 //! * `covers` is the `(fixture, assertion)` pair this mutant claims in
 //!   [`COVERAGE`], when that differs from the assertion ids the failure
 //!   messages actually carry. It is not free text; it is bound two
@@ -232,6 +248,17 @@ const COVERS_VIA: &[(&str, &str)] = &[("A8", "A2"), ("A3", "A1"), ("A10", "A2")]
 /// ids could be kept green by one fixture while every other one quietly
 /// stopped asserting anything.
 const COVERAGE: &[(&str, &[&str])] = &[
+    // The three Bitcoin fixtures are driven against the real
+    // `sumer-bitcoin-adapter` over a recorded corpus, so their mutants are
+    // wrappers that rewrite its stdout rather than script patches. What
+    // that proves is that these three cases have TEETH -- it mutates
+    // nothing inside the adapter, and a wrong mapping baked identically
+    // into `map.rs` and into the hand-written `expect` blocks survives
+    // every one of them. That exposure is closed by reading the expects
+    // against the checksummed provider JSON, by hand, and by nothing here.
+    ("bitcoin/btc_basic", &["A2"]),
+    ("bitcoin/btc_fetch_fail", &["A1", "A3", "A7"]),
+    ("bitcoin/btc_reorg", &["A2"]),
     ("duplicate_events", &["A2", "A9"]),
     ("fdx_lossless", &["A1"]),
     ("interrupted_pagination", &["A1", "A5", "A10"]),
@@ -292,6 +319,18 @@ struct Mutant {
     /// static patch cannot express.
     #[serde(default)]
     adapter: Option<String>,
+    /// The adapter this mutant's fixture is driven against, when it is not
+    /// the Python reference one: the full argv, with `{root}` for the
+    /// repository root and `{bin}` for the directory cargo built its
+    /// binaries into.
+    ///
+    /// A patch-based mutation does not transfer to a fixture whose replies
+    /// come from a recorded provider corpus -- patching the corpus mutates
+    /// the PROVIDER, and then the expected output legitimately changes.
+    /// What transfers is `adapter`: a wrapper that spawns the argv named
+    /// here and rewrites what it writes to stdout.
+    #[serde(default)]
+    adapter_argv: Option<Vec<String>>,
     /// Why this break is worth having a mutant for. Required, and required
     /// to be non-empty: an empty `assertions` list is only ever legitimate
     /// when someone has written down why.
@@ -328,6 +367,37 @@ fn repo_root() -> PathBuf {
         .parent()
         .expect("conformance/ has a parent directory")
         .to_path_buf()
+}
+
+/// Where cargo put this workspace's binaries: `<target>/<profile>/`, found
+/// beside this test binary, which lives in `<target>/<profile>/deps/`.
+/// Hardcoding `target/debug` would be wrong under `CARGO_TARGET_DIR` or
+/// `--release`.
+fn binary_dir() -> PathBuf {
+    let mut dir = std::env::current_exe().expect("a test binary has a path");
+    dir.pop();
+    dir.pop();
+    dir
+}
+
+/// The UNMUTATED argv for a fixture: whatever `adapter_argv` names, with
+/// `{root}` and `{bin}` expanded, or the Python reference adapter.
+fn honest_argv(root: &Path, adapter_argv: Option<&[String]>) -> Vec<String> {
+    match adapter_argv {
+        None => vec![
+            "python3".to_owned(),
+            root.join("adapters/fake/fake_adapter.py")
+                .to_string_lossy()
+                .into_owned(),
+        ],
+        Some(argv) => argv
+            .iter()
+            .map(|a| {
+                a.replace("{root}", &root.to_string_lossy())
+                    .replace("{bin}", &binary_dir().to_string_lossy())
+            })
+            .collect(),
+    }
 }
 
 fn mutations_dir() -> PathBuf {
@@ -423,21 +493,24 @@ fn materialize(root: &Path, name: &str, mutant: &Mutant) -> Result<(PathBuf, Vec
         return Err("the patch list left the fixture unchanged".to_owned());
     }
 
-    let adapter_argv = match &mutant.adapter {
-        None => vec![
-            "python3".to_owned(),
-            root.join("adapters/fake/fake_adapter.py")
-                .to_string_lossy()
-                .into_owned(),
-        ],
-        Some(wrapper) => {
-            let path = mutations_dir().join("adapters").join(wrapper);
-            if !path.is_file() {
-                return Err(format!("adapter wrapper {path:?} does not exist"));
-            }
-            vec!["python3".to_owned(), path.to_string_lossy().into_owned()]
+    // The argv under test: the fixture's own adapter (the Python reference
+    // one unless the manifest names another), with a wrapper in front of it
+    // when the mutation is one no static patch can express.
+    let mut adapter_argv = honest_argv(root, mutant.adapter_argv.as_deref());
+    if let Some(wrapper) = &mutant.adapter {
+        let path = mutations_dir().join("adapters").join(wrapper);
+        if !path.is_file() {
+            return Err(format!("adapter wrapper {path:?} does not exist"));
         }
-    };
+        // A wrapper for the reference adapter monkey-patches it in-process
+        // and needs no argv; one for any other adapter spawns it and
+        // rewrites its stdout, so it is handed the whole command line.
+        let mut argv = vec!["python3".to_owned(), path.to_string_lossy().into_owned()];
+        if mutant.adapter_argv.is_some() {
+            argv.append(&mut adapter_argv);
+        }
+        adapter_argv = argv;
+    }
 
     let dir = std::env::temp_dir().join("sumer-mutations");
     std::fs::create_dir_all(&dir).map_err(|e| format!("could not create {dir:?}: {e}"))?;
@@ -501,12 +574,17 @@ async fn every_mutant_is_caught_by_exactly_the_assertions_it_names() {
         let path = root
             .join("conformance/cases")
             .join(format!("{fixture}.json"));
-        let argv = vec![
-            "python3".to_owned(),
-            root.join("adapters/fake/fake_adapter.py")
-                .to_string_lossy()
-                .into_owned(),
-        ];
+        // The baseline is that fixture's OWN adapter, unmutated -- a
+        // Bitcoin fixture measured against the Python reference adapter
+        // would "fail unmutated" for reasons that have nothing to do with
+        // any mutation, and park its mutants forever.
+        let argv = honest_argv(
+            &root,
+            mutants
+                .iter()
+                .find(|(_, m)| m.fixture == fixture)
+                .and_then(|(_, m)| m.adapter_argv.as_deref()),
+        );
         let outcome = sumer_conformance::runner::run_case(&argv, &path).await;
         baseline.insert(fixture, ids(&outcome.failures));
     }
@@ -691,12 +769,36 @@ fn the_coverage_table_is_backed_by_mutants() {
     // 4. Every fixture in the suite has at least one mutant, and every
     //    mutant names a fixture that exists.
     let cases_dir = repo_root().join("conformance/cases");
+    // One level of subdirectory is part of a fixture's name
+    // (`bitcoin/btc_reorg`): the Bitcoin fixtures are grouped because they
+    // are driven against a different adapter, and a fixture the mutation
+    // battery cannot see is one nothing here proves anything about.
     let fixtures: BTreeSet<String> = std::fs::read_dir(&cases_dir)
         .unwrap_or_else(|e| panic!("could not read {cases_dir:?}: {e}"))
         .filter_map(Result::ok)
-        .map(|e| e.path())
-        .filter(|p| p.extension().and_then(|e| e.to_str()) == Some("json"))
-        .filter_map(|p| Some(p.file_stem()?.to_string_lossy().into_owned()))
+        .flat_map(|e| {
+            let path = e.path();
+            if path.is_dir() {
+                let group = e.file_name().to_string_lossy().into_owned();
+                std::fs::read_dir(&path)
+                    .unwrap_or_else(|err| panic!("could not read {path:?}: {err}"))
+                    .filter_map(Result::ok)
+                    .map(|f| f.path())
+                    .map(|p| (group.clone(), p))
+                    .collect::<Vec<_>>()
+            } else {
+                vec![(String::new(), path)]
+            }
+        })
+        .filter(|(_, p)| p.extension().and_then(|e| e.to_str()) == Some("json"))
+        .filter_map(|(group, p)| {
+            let stem = p.file_stem()?.to_string_lossy().into_owned();
+            Some(if group.is_empty() {
+                stem
+            } else {
+                format!("{group}/{stem}")
+            })
+        })
         .collect();
     let mutated: BTreeSet<String> = mutants.iter().map(|(_, m)| m.fixture.clone()).collect();
     assert_eq!(

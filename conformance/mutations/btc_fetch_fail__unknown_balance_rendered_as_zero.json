@@ -1,0 +1,22 @@
+{
+  "fixture": "bitcoin/btc_fetch_fail",
+  "assertions": [
+    "A1"
+  ],
+  "covers": [
+    "A3"
+  ],
+  "adapter": "btc_unknown_balance_rendered_as_zero.py",
+  "adapter_argv": [
+    "python3",
+    "{root}/conformance/cases/bitcoin/two_phase.py",
+    "0,1",
+    "{bin}/sumer-bitcoin-adapter",
+    "--wallets",
+    "{root}/adapters/bitcoin/corpus/fetch_fail/wallets.json",
+    "--source",
+    "file:{root}/adapters/bitcoin/corpus/fetch_fail"
+  ],
+  "why": "The `fresh` wallet was never readable, so both its balance lines are amount null -- UNKNOWN. This mutant renders them \"0\" instead, in satoshis, which is a claim: it says the wallet holds nothing. That is the single most tempting shortcut in a balance mapping and the reason spec/observation.md distinguishes the two at all. WHAT THIS PROVES AND WHAT IT DOES NOT: it proves btc_fetch_fail rejects a zero where it declared unknown. It mutates nothing inside the adapter.",
+  "patch": []
+}

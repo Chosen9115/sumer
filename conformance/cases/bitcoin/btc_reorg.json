@@ -1,0 +1,135 @@
+{
+  "case": "btc_reorg",
+  "expect": {
+    "assertions": [
+      "A2",
+      "A6",
+      "A7"
+    ],
+    "resources": [
+      {
+        "resource_id": "watch",
+        "kind": "bitcoin_wallet",
+        "label": "BIP32 vector 1, m/0'",
+        "provider_extra": {
+          "address_count": 1
+        }
+      }
+    ],
+    "ledger": {
+      "watch": {
+        "balances": [
+          {
+            "category": "confirmed",
+            "canonical_hint": "confirmed",
+            "amount": {
+              "asset": "sat",
+              "amount": "60000"
+            },
+            "provenance": {
+              "adapter_id": "sumer-bitcoin",
+              "surface": "esplora.address_stats",
+              "observed_at": "2026-09-08T14:43:28Z",
+              "staleness": "live",
+              "completeness": "complete"
+            }
+          },
+          {
+            "category": "unconfirmed",
+            "canonical_hint": "unconfirmed",
+            "amount": {
+              "asset": "sat",
+              "amount": "0"
+            },
+            "provenance": {
+              "adapter_id": "sumer-bitcoin",
+              "surface": "esplora.address_stats",
+              "observed_at": "2026-09-08T14:43:28Z",
+              "staleness": "live",
+              "completeness": "complete"
+            }
+          }
+        ],
+        "history": [
+          {
+            "local_id": "watch:884a2eb058b4360cbc5a4fa8131f3e0ec34aff5c635e34feb3c457d12d0bc93d",
+            "state": "active",
+            "posting": "posted",
+            "amount": {
+              "asset": "sat",
+              "amount": "60000"
+            },
+            "fees": null,
+            "raw_sign": "provider_positive",
+            "provider_extra": {
+              "confirmed": true,
+              "block_height": 246485,
+              "block_hash": "000000000000004cb7aa951aa3aa37ce55d972b56bc07df867a84a78a74aed49"
+            },
+            "provenance": {
+              "adapter_id": "sumer-bitcoin",
+              "surface": "esplora.tx",
+              "observed_at": "2026-09-08T14:43:28Z",
+              "effective_at": "2013-07-14T06:18:53Z",
+              "staleness": "live",
+              "completeness": "complete"
+            }
+          },
+          {
+            "local_id": "watch:6d483d103cdc3b0735b5490a22c143c837926ffdde03d874a5a3168abf7d29ca",
+            "state": "tombstoned",
+            "tombstone_reason": "reorged_out",
+            "posting": "unknown",
+            "amount": {
+              "asset": "sat",
+              "amount": "-60000"
+            },
+            "fees": null,
+            "raw_sign": "provider_negative",
+            "description": "reorged out of the best chain",
+            "provider_extra": {
+              "probe": "tx_not_found",
+              "last_seen_block_height": 246488
+            },
+            "provenance": {
+              "adapter_id": "sumer-bitcoin",
+              "surface": "esplora.tx",
+              "observed_at": "2026-09-08T14:43:28Z",
+              "effective_at": null,
+              "staleness": "live",
+              "completeness": "complete"
+            }
+          }
+        ]
+      }
+    },
+    "live": {
+      "watch": [
+        "watch:884a2eb058b4360cbc5a4fa8131f3e0ec34aff5c635e34feb3c457d12d0bc93d"
+      ]
+    },
+    "statuses": {
+      "watch": {
+        "outcome": {
+          "fetched": {
+            "page_empty": false
+          }
+        }
+      }
+    },
+    "status_read": {
+      "watch": {
+        "credential_expires_at": null,
+        "strong_auth_expires_at": null,
+        "history_start": null
+      }
+    },
+    "provenance": {
+      "watch": {
+        "staleness": "live",
+        "completeness": "complete"
+      }
+    },
+    "notes": "TWO adapter lifetimes over one --state-dir: run0 is the wallet as recorded, and the crawl of it writes seen.json; run1 is the counterfactual, and only what run1 emits is declared here. See adapters/bitcoin/corpus/reorg/RECORDED.md for exactly what run1 changes and why it had to be synthesized -- a real chain does not reorg on request. The spend 6d483d10.. is gone from run1's listing AND its direct GET /tx/:txid answers 404, and it is the 404 that makes it a tombstone: absence from a listing is never evidence. The tombstone carries the delta seen.json recorded (-60000), not a fabricated zero, and reason reorged_out rather than dropped_from_mempool because the state file says it was in a block. The balance moves with it: run1's chain_stats no longer record the spend, so confirmed is 60000 again. btc_fetch_fail is the other half of this rule -- the same absence with no 404 behind it, producing no tombstone at all."
+  }
+}

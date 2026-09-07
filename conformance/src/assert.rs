@@ -88,7 +88,13 @@ pub fn json_subset_diff(actual: &Value, expected: &Value, path: &str, diffs: &mu
                 let child = format!("{path}.{k}");
                 match act_map.get(k) {
                     None => diffs.push(format!("{child}: missing (expected {exp_v})")),
-                    Some(act_v) if k == "amount" => compare_amount(act_v, exp_v, &child, diffs),
+                    // `fees` is money too. Without it, a fee's value is never
+                    // compared: the nested `amount` string arrives bare and
+                    // fails to parse as an Amount, so the diff silently
+                    // degrades to presence-and-asset.
+                    Some(act_v) if k == "amount" || k == "fees" => {
+                        compare_amount(act_v, exp_v, &child, diffs)
+                    }
                     Some(act_v) => json_subset_diff(act_v, exp_v, &child, diffs),
                 }
             }
