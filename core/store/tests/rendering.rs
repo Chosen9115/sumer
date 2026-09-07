@@ -251,3 +251,157 @@ fn fixture_with_failing_balances_read(
     std::fs::write(&path, serde_json::to_vec_pretty(&document).unwrap()).unwrap();
     path
 }
+
+/// **F4**: a category that stops being reported must stop reading `live`.
+///
+/// `spec/observation.md` §2 names the provider this happens on: Teller
+/// guarantees only that *at least one* of `ledger`/`available` is present
+/// on any given response. So a second, entirely SUCCESSFUL read that names
+/// one of two categories is the documented normal case. Tracking "did this
+/// read cover it" per RESOURCE misses it by exactly one level: the
+/// resource was covered, the dropped category was not, and its last row --
+/// staleness `Live` -- stays on top forever.
+#[tokio::test]
+async fn a_category_that_stops_being_reported_stops_reading_live() {
+    if !support::python3_available() {
+        return;
+    }
+    let scratch = Scratch::new("render-dropped-category");
+    let history = || vec![page(None, vec![obs("a", "1.00")], drained_status(None))];
+    let both = Run::new(history()).balances(vec![
+        balance("available", Some("42.00")),
+        balance("unconfirmed", Some("5")),
+    ]);
+    // Same read, same success, one category dropped.
+    let one = Run::new(history()).balances(vec![balance("available", Some("42.00"))]);
+
+    let fixture = fixture(&scratch, vec![both, one]);
+    let mut store = store(&scratch);
+    refresh_run(&mut store, &fixture, 0, SweepOptions::default()).await;
+    refresh_run(&mut store, &fixture, 1, SweepOptions::default()).await;
+
+    let unconfirmed = line(&store, "unconfirmed");
+    assert!(
+        !unconfirmed.contains("live"),
+        "a category this read said nothing about is not live: {unconfirmed}"
+    );
+    assert!(
+        unconfirmed.contains("5 usd") && unconfirmed.contains("stale (as of"),
+        "and rule 2 still holds -- the last figure survives, marked stale: {unconfirmed}"
+    );
+    // The reported category is untouched by any of this.
+    assert!(
+        line(&store, "available").contains("live"),
+        "the category the read DID cover is still live: {}",
+        line(&store, "available")
+    );
+}
+
+/// **F5**: the host-authored marker row invents nothing.
+///
+/// `spec/observation.md` §1 defines `surface` as the adapter's account of
+/// where a read came from and `observed_at` as adapter-claimed and carried
+/// through unmodified; §8.4 gives retractions their own table precisely so
+/// a host has "no provider field to fabricate". A marker row lands in the
+/// same append-only stream adapter rows do, so every adapter-shaped column
+/// on it must be COPIED from the row it marks unread -- as `provider_id`
+/// already was -- and never authored by the host. `canonical_hint` is a
+/// property of the category, not of the read, so it survives too.
+#[tokio::test]
+async fn a_marker_row_invents_no_adapter_authored_field() {
+    if !support::python3_available() {
+        return;
+    }
+    let scratch = Scratch::new("render-marker-provenance");
+    let history = || vec![page(None, vec![obs("a", "1.00")], drained_status(None))];
+    let mut hinted = balance("available", Some("42.00"));
+    hinted["canonical_hint"] = json!("available");
+    let good = Run::new(history()).balances(vec![hinted]);
+    let dark = Run::new(history())
+        .balances(vec![])
+        .balance_statuses(json!([{"resource_id": support::RESOURCE_ID, "outcome": "unavailable"}]));
+
+    let fixture = fixture(&scratch, vec![good, dark]);
+    let mut store = store(&scratch);
+    refresh_run(&mut store, &fixture, 0, SweepOptions::default()).await;
+    refresh_run(&mut store, &fixture, 1, SweepOptions::default()).await;
+
+    let rows = balance_columns(&store, "available");
+    assert_eq!(rows.len(), 2, "one adapter row, then one marker: {rows:?}");
+    let (adapter_row, marker) = (&rows[0], &rows[1]);
+
+    assert_eq!(
+        marker.canonical_hint, adapter_row.canonical_hint,
+        "the hint is a property of the CATEGORY; a read that did not happen \
+         does not erase it: {rows:?}"
+    );
+    assert_eq!(
+        marker.surface, adapter_row.surface,
+        "`surface` is the adapter's account of where the read came from -- \
+         carried forward, never authored by the host: {rows:?}"
+    );
+    assert_eq!(
+        marker.observed_at, adapter_row.observed_at,
+        "`observed_at` is adapter-claimed and carried through unmodified \
+         (spec/observation.md §1): {rows:?}"
+    );
+    assert_eq!(
+        marker.provider_id, adapter_row.provider_id,
+        "and the provider, as before: {rows:?}"
+    );
+
+    // The host-authored columns, and the one field that tells a consumer
+    // this row is host-authored at all.
+    assert_eq!(
+        marker.amount, None,
+        "never a figure, never a zero: {rows:?}"
+    );
+    assert_eq!(marker.staleness, "unavailable");
+    assert!(
+        marker.outcome.starts_with("unread:"),
+        "a consumer must be able to tell a host-authored marker from an \
+         adapter row, and `outcome` is the host's own column: {rows:?}"
+    );
+    assert!(
+        !adapter_row.outcome.starts_with("unread:"),
+        "and a real adapter row never wears that prefix: {rows:?}"
+    );
+}
+
+/// The balance columns `BalanceRow` does not carry. Read straight from the
+/// table, because the point of the assertion above is what was WRITTEN.
+#[derive(Debug)]
+struct RawBalance {
+    canonical_hint: Option<String>,
+    amount: Option<String>,
+    provider_id: String,
+    surface: String,
+    observed_at: String,
+    staleness: String,
+    outcome: String,
+}
+
+fn balance_columns(store: &sumer_store::Store, category: &str) -> Vec<RawBalance> {
+    let mut stmt = store
+        .conn()
+        .prepare(
+            "SELECT canonical_hint, amount, prov_provider_id, prov_surface,
+                    observed_at, staleness, outcome
+             FROM balance WHERE category = ?1 ORDER BY balance_id",
+        )
+        .unwrap();
+    let rows = stmt
+        .query_map([category], |row| {
+            Ok(RawBalance {
+                canonical_hint: row.get(0)?,
+                amount: row.get(1)?,
+                provider_id: row.get(2)?,
+                surface: row.get(3)?,
+                observed_at: row.get(4)?,
+                staleness: row.get(5)?,
+                outcome: row.get(6)?,
+            })
+        })
+        .unwrap();
+    rows.map(Result::unwrap).collect()
+}

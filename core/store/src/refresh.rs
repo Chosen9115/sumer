@@ -5,13 +5,13 @@
 //! connection, and every resource of one adapter is swept over the same
 //! one.
 
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeSet, HashSet};
 
 use sumer_host::AdapterHandle;
-use sumer_wire::{Balance, Completeness, Provenance, ReadOutcome, Staleness};
+use sumer_wire::ReadOutcome;
 
 use crate::error::{Result, StoreError};
-use crate::store::{self, BalanceRow, Store};
+use crate::store::{self, Store};
 use crate::sweep::{self, SweepOptions, SweepReport};
 
 #[derive(Debug, Clone, Default)]
@@ -148,9 +148,17 @@ pub async fn refresh_adapter(
     // the adapter's exact amount string, or NULL for "looked, don't know".
     match handle.balances_read(resource_ids.clone()).await {
         Ok(read) => {
-            let mut seen = HashSet::new();
+            // Coverage is keyed per (resource, CATEGORY). Per resource is
+            // one level too coarse: `spec/observation.md` §2 documents
+            // Teller as guaranteeing only that *at least one* of two
+            // categories appears in any given response, so a wholly
+            // successful read routinely drops a category the last one
+            // carried -- and that category's last row goes on reading
+            // `live` forever if the resource merely being mentioned counts
+            // as covering it.
+            let mut covered = HashSet::new();
             for balance in &read.observations {
-                seen.insert(balance.resource_id.as_str());
+                covered.insert((balance.resource_id.as_str(), balance.category.as_str()));
                 let outcome = read
                     .statuses
                     .iter()
@@ -158,22 +166,21 @@ pub async fn refresh_adapter(
                     .map_or_else(|| "unknown".to_owned(), |s| outcome_label(&s.outcome));
                 store::append_balance(store.conn(), adapter_id, balance, &outcome)?;
             }
-            // A resource this reply named no observation for -- an
-            // `unavailable`/`gone`/etc. status with nothing attached, say --
-            // got no line above. Whatever it last reported must not go on
+            // Every category this reply said nothing about -- because the
+            // resource carried an `unavailable`/`gone`/etc. status with
+            // nothing attached, or because the reply simply left that one
+            // category out. Whatever it last reported must not go on
             // reading `live` forever just because nothing rewrote it.
             for resource_id in &resource_ids {
-                if !seen.contains(resource_id.as_str()) {
-                    let outcome = read
-                        .statuses
-                        .iter()
-                        .find(|s| s.resource_id == *resource_id)
-                        .map_or_else(
-                            || "no_observation".to_owned(),
-                            |s| outcome_label(&s.outcome),
-                        );
-                    mark_unread(store.conn(), adapter_id, resource_id, &outcome)?;
-                }
+                let reason = read
+                    .statuses
+                    .iter()
+                    .find(|s| s.resource_id == *resource_id)
+                    .map_or_else(
+                        || "no_observation".to_owned(),
+                        |s| outcome_label(&s.outcome),
+                    );
+                mark_unread(store.conn(), adapter_id, resource_id, &reason, &covered)?;
             }
         }
         Err(e) => {
@@ -191,6 +198,7 @@ pub async fn refresh_adapter(
                     adapter_id,
                     resource_id,
                     &format!("balances.read failed: {e}"),
+                    &HashSet::new(),
                 )?;
             }
             errors.push(format!("balances.read failed: {e}"));
@@ -217,55 +225,84 @@ pub async fn refresh_adapter(
     })
 }
 
-/// A `balances.read` that produced nothing for `resource_id` -- the call
-/// failed outright, or this reply just had no observation for it -- must
-/// not leave the LAST successful read's staleness sitting there looking
-/// current. This re-records each category the resource has ever reported,
-/// figure withheld (never a zero, never a guess), so the next render finds
-/// a non-live row on top and falls back to the last known amount marked
-/// stale (or `unavailable`, if there never was one) instead of reprinting
-/// a `live` line for a read that did not happen this time.
+/// A `balances.read` that produced nothing for a category of
+/// `resource_id` -- the call failed outright, this reply had no
+/// observation for the resource, or it named the resource and left this
+/// one category out -- must not leave the LAST successful read's
+/// staleness sitting there looking current. This re-records every
+/// category `covered` does not name, figure withheld (never a zero, never
+/// a guess), so the next render finds a non-live row on top and falls back
+/// to the last known amount marked stale (or `unavailable`, if there never
+/// was one) instead of reprinting a `live` line for a read that did not
+/// happen this time.
 ///
-/// A resource with no balance history yet is left alone: there is no
-/// figure to protect from looking falsely current.
+/// **The row invents nothing.** It is written as a COPY of the row it
+/// marks unread, so every adapter-authored column -- `canonical_hint`,
+/// `provider_id`, `surface`, `observed_at`, `effective_at` -- carries the
+/// adapter's own last value rather than something the host made up. That
+/// is structural here, not a promise: a host that fills in provenance on
+/// its own behalf is fabricating provider evidence, which is the failure
+/// §8.4 gave retractions their own table to avoid, and this stream has no
+/// separate table to move to.
+///
+/// The four columns that are NOT copied are the host's own: `amount` is
+/// NULL because nothing was read, `received_at` is host-stamped by
+/// definition (§1), `staleness` is host-computed and never on the wire
+/// (§1), and `completeness` is set to the enum's explicit "no claim"
+/// variant -- carrying a `complete` forward onto a read that never
+/// happened would be the fabrication this function is avoiding.
+///
+/// A consumer tells a marker from an adapter row by `outcome`, the one
+/// column the host authors even on the success path: a marker's always
+/// begins `unread:`, and no adapter row's ever does.
+///
+/// A category with no balance history is left alone: there is no figure to
+/// protect from looking falsely current.
 fn mark_unread(
     conn: &rusqlite::Connection,
     adapter_id: &str,
     resource_id: &str,
-    outcome: &str,
+    reason: &str,
+    covered: &HashSet<(&str, &str)>,
 ) -> Result<()> {
     let history = store::balance_history(conn, adapter_id, resource_id)?;
-    let mut latest_per_category: BTreeMap<&str, &BalanceRow> = BTreeMap::new();
-    for row in &history {
-        latest_per_category.insert(row.category.as_str(), row);
-    }
-    if latest_per_category.is_empty() {
-        return Ok(());
-    }
+    let categories: BTreeSet<&str> = history
+        .iter()
+        .map(|row| row.category.as_str())
+        .filter(|category| !covered.contains(&(resource_id, *category)))
+        .collect();
     let received_at = crate::now_rfc3339();
-    for row in latest_per_category.values() {
-        let balance = Balance {
-            resource_id: resource_id.to_owned(),
-            category: row.category.clone(),
-            canonical_hint: None,
-            amount: None,
-            provenance: Provenance {
-                adapter_id: adapter_id.to_owned(),
-                // The provider this category last actually reported --
-                // carried forward, not invented.
-                provider_id: row.provider_id.clone(),
-                // No adapter surface applies to a read that never
-                // happened; this is a host-authored marker, not a claim
-                // about where the (absent) data came from.
-                surface: "no_read".to_owned(),
-                observed_at: received_at.clone(),
-                received_at: received_at.clone(),
-                effective_at: None,
-                staleness: Staleness::Unavailable,
-                completeness: Completeness::Unknown,
-            },
-        };
-        store::append_balance(conn, adapter_id, &balance, outcome)?;
+    for category in categories {
+        // `'unknown'` and `'unavailable'` are the serde spellings of
+        // `Completeness::Unknown` and `Staleness::Unavailable`; a rename
+        // shows up at once as `from_spelling` refusing the row on its way
+        // back out.
+        //
+        // The SQL lives here rather than in `store` because the copy is
+        // the whole point: naming the adapter-authored columns in a
+        // `SELECT` is what makes it impossible for this write to author
+        // one. Round-tripping them through a `Balance` would mean the host
+        // re-typing every value it must not choose.
+        conn.execute(
+            "INSERT INTO balance (
+                adapter_id, resource_id, category, canonical_hint, amount_asset, amount,
+                prov_provider_id, prov_surface, observed_at, effective_at, completeness,
+                received_at, staleness, outcome
+             )
+             SELECT adapter_id, resource_id, category, canonical_hint, NULL, NULL,
+                    prov_provider_id, prov_surface, observed_at, effective_at, 'unknown',
+                    ?4, 'unavailable', ?5
+             FROM balance
+             WHERE adapter_id = ?1 AND resource_id = ?2 AND category = ?3
+             ORDER BY balance_id DESC LIMIT 1",
+            rusqlite::params![
+                adapter_id,
+                resource_id,
+                category,
+                received_at.as_str(),
+                format!("unread:{reason}"),
+            ],
+        )?;
     }
     Ok(())
 }
