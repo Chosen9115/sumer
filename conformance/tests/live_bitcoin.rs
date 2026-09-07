@@ -303,7 +303,24 @@ fn panic_message(error: tokio::task::JoinError) -> String {
 /// either way and is not a failure.
 async fn check_the_invariants() -> bool {
     let binary = adapter_binary();
-    assert!(binary.is_file(), "{} is not built", binary.display());
+    // Same undeclared build dependency as conformance_bitcoin.rs: build it
+    // rather than demand it. This one is #[ignore]d so CI never caught it,
+    // which is exactly why it is worth fixing here.
+    let built =
+        std::process::Command::new(std::env::var("CARGO").unwrap_or_else(|_| "cargo".into()))
+            .args(["build", "-p", "sumer-bitcoin-adapter"])
+            .current_dir(&root)
+            .status();
+    match built {
+        Ok(status) if status.success() => {}
+        Ok(status) => panic!("cargo build -p sumer-bitcoin-adapter failed ({status})"),
+        Err(e) => panic!("could not run cargo to build the adapter: {e}"),
+    }
+    assert!(
+        binary.is_file(),
+        "{} still absent after a successful build",
+        binary.display()
+    );
 
     let dir = std::env::temp_dir().join(format!("sumer-live-{}", std::process::id()));
     std::fs::create_dir_all(&dir).expect("a scratch directory");

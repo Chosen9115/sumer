@@ -90,11 +90,28 @@ async fn the_bitcoin_adapter_passes_every_bitcoin_case() {
     }
     let root = repo_root();
     let binary = adapter_binary();
+
+    // Build it rather than demand it. Cargo cannot express a dependency on
+    // another crate's BINARY on stable, so this test had an undeclared build
+    // dependency: it passed locally off a stale artifact and failed on a clean
+    // checkout. Asking a human to run the right command first is not a
+    // dependency, it is a hope.
+    let built =
+        std::process::Command::new(std::env::var("CARGO").unwrap_or_else(|_| "cargo".into()))
+            .args(["build", "-p", "sumer-bitcoin-adapter"])
+            .current_dir(&root)
+            .status();
+    match built {
+        Ok(status) if status.success() => {}
+        Ok(status) => panic!("cargo build -p sumer-bitcoin-adapter failed ({status})"),
+        Err(e) => panic!("could not run cargo to build the adapter: {e}"),
+    }
+
     assert!(
         binary.is_file(),
-        "{} is not built. Run `cargo test --workspace` (or `cargo build -p \
-         sumer-bitcoin-adapter`): this gate drives the real adapter, and silently \
-         skipping it would leave two cases unrun.",
+        "{} still absent after a successful `cargo build -p sumer-bitcoin-adapter`. \
+         This gate drives the real adapter, and silently skipping it would leave \
+         two cases unrun.",
         binary.display()
     );
 
