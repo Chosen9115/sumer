@@ -741,6 +741,19 @@ connection **as of the instant it commits** the sweep's verdict — inside the
 same decision as the other eight conditions, so that a violation established
 between the last reply and the commit disqualifies rather than being raced past.
 
+**Reading the verdict late is not enough; the ordering MUST be enforced.** A
+host that merely re-reads the violation state shortly before committing has
+narrowed the window, not closed it. Detection typically runs concurrently with
+the sweep — a reader task on another thread — so between the read and the commit
+sits every instruction the commit takes, and a violation published there is one
+the host established *before* the sweep was durable. The absence of a suspension
+point between the read and the commit proves nothing: another thread does not
+need this one to yield. A host MUST therefore make the two mutually exclusive,
+so that every violation it establishes falls either strictly before the verdict
+the sweep judged on or strictly after that sweep is durable. Holding the lock
+that guards the violation state across the commit is the obvious way; any
+mechanism with the same ordering is conforming.
+
 This is not retroactive and does not contradict the paragraph above: the
 ordering is *detection, then commitment*. What is forbidden is reconsidering a
 sweep that has already committed. A sweep that has not committed yet is still

@@ -41,10 +41,17 @@
 //! answer a qualifying final page and then, behind that reply, send a
 //! duplicate or a malformed frame. The host kills the connection but cannot
 //! un-deliver the reply, so the caller holds an `Ok` and no error arm ever
-//! runs. The gate therefore asks the connection what it knows at the last
-//! instant inside the final page's transaction -- see
-//! [`AdapterHandle::contract_violation`] -- rather than trusting the value
-//! it was handed on the way in.
+//! runs. So the gate does not trust the value it was handed on the way in.
+//!
+//! Nor does it merely re-read it late. Reading is not enough: the reader
+//! task publishes violations from another runtime worker thread, so a
+//! verdict read even one instruction before the commit can be overtaken
+//! while the retraction is being derived and written. The gate therefore
+//! **holds** the verdict --
+//! [`AdapterHandle::with_contract_violation_held`] -- across
+//! `txn.commit()`, so every violation this connection commits falls
+//! strictly before the verdict this sweep judged on or strictly after this
+//! sweep was durable. Never in between.
 //!
 //! The taint is FORWARD-ONLY: it disqualifies every sweep that starts after
 //! the violation, not the ones already committed. Detection-then-commitment
@@ -246,9 +253,11 @@ struct Gate {
     /// the crawl row says which violation, not merely that there was one.
     ///
     /// Seeded from the snapshot the caller took before this sweep began,
-    /// and **re-read from the live connection immediately before the
-    /// commit** -- a violation the host detected behind an already-
-    /// delivered reply never becomes an error anyone here could see.
+    /// and re-read from the live connection **inside the critical section
+    /// that commits** -- a violation the host detected behind an already-
+    /// delivered reply never becomes an error anyone here could see, and a
+    /// verdict merely read before the commit can be overtaken by the reader
+    /// thread during it.
     connection_violation: Option<String>,
 }
 
@@ -570,7 +579,7 @@ pub async fn sweep_resource(
             report.revised += counts.revised;
             report.unchanged += counts.unchanged;
 
-            // ---- CONDITION (9), RE-READ AT THE MOMENT OF COMMITMENT --
+            // ---- CONDITION (9) AND THE COMMIT, IN ONE CRITICAL SECTION
             //
             // `input.connection_violation` is a SNAPSHOT taken before this
             // sweep sent its first request, and a violation does not have
@@ -584,86 +593,113 @@ pub async fn sweep_resource(
             // snapshot commits the retraction on the evidence of a
             // connection the host has ALREADY caught lying.
             //
-            // So the gate asks the connection what it knows NOW, and it
-            // asks here: inside the one transaction, after the last page is
-            // ingested, at the last instant before the disqualifier is
-            // decided. There is no await left between this read and the
-            // commit, so nothing this sweep does widens the gap. What is
-            // left is the microseconds a reader running on another thread
-            // might still need to judge a frame already in flight -- and a
-            // frame the host has not judged is not yet a violation to
-            // anyone, which is the honest limit of the condition, not a
-            // hole in it. Reading any earlier reopens exactly the window
-            // the entry snapshot had, just a narrower one.
+            // Re-reading the live verdict here is necessary and NOT
+            // sufficient. The reader task publishes violations from another
+            // worker thread of a multi-threaded runtime (see
+            // `main::block_on`), so a plain read hands back a value that is
+            // already history: between it and the commit sit the retraction
+            // derivation and three metadata writes, and a violation
+            // published anywhere in there would be established BEFORE this
+            // transaction commits and still miss the gate. "There is no
+            // `.await` in between" is not an argument -- another thread
+            // does not need this one to yield.
+            //
+            // So the verdict is not read, it is HELD:
+            // `with_contract_violation_held` takes the connection's lock,
+            // hands the verdict to this closure, and keeps the lock until
+            // the closure returns -- past `txn.commit()`. `record_violation`
+            // takes that same lock, so a violation this connection commits
+            // is established either strictly BEFORE the value below, in
+            // which case it disqualifies the sweep, or strictly AFTER this
+            // transaction is durable, in which case the sweep had already
+            // committed and (9) is not retroactive. There is no third
+            // interleaving to lose a race in.
+            //
+            // Nothing in here may touch the adapter: the lock is not
+            // reentrant. Everything it does call is this crate's SQLite on
+            // a connection this sweep owns exclusively, which is why
+            // freezing the connection cannot deadlock against it. The
+            // reader is stopped for the length of one local commit.
             //
             // Still FORWARD-ONLY: this is detection BEFORE commitment, not
             // a sweep reconsidered after it committed. Sweeps that already
             // finished keep their verdicts (`adr/0006` decision 1).
-            if gate.connection_violation.is_none() {
-                if let Some(kind) = adapter.contract_violation() {
-                    let reason = format!(
-                        "the connection broke the wire contract: {}",
-                        HostError::ProtocolViolation(kind)
-                    );
-                    // And the siblings swept after this one inherit it,
-                    // the same way a violation on this sweep's own
-                    // `history.read` does.
-                    report.contract_violation = Some(reason.clone());
-                    gate.connection_violation = Some(reason);
-                }
-            }
-
-            let disqualifier = gate.disqualifier();
-            if let Some(reason) = &disqualifier {
-                report.disqualified_reason = Some(reason.clone());
-            } else {
-                report.complete = true;
-                let outcome = derive_retractions(
-                    &txn,
-                    input,
-                    crawl_id,
-                    &fold,
-                    &head_meta,
-                    &observed_ids,
-                    &exempt_ids,
-                    now.as_str(),
-                )?;
-                report.retracted = outcome.retracted;
-                report.discrepancies = outcome.discrepancies;
-            }
-
-            store::set_adapter_derivation(&txn, input.adapter_id, input.hello_derivation)?;
-            // The VANTAGE is adopted only by a sweep that RECONCILED it.
-            // `derive_retractions` is the only writer of `vantage_changed`
-            // and it never runs on a disqualified sweep, so storing the
-            // new `provider_id` here unconditionally destroyed both halves
-            // of §8.2's exemption at once: the audit row was never written
-            // and the next sweep, comparing the new vantage against
-            // itself, retracted everything the old vantage could see under
-            // a reason that blames the provider. One non-`exact` page was
-            // enough.
             //
-            // The derivation and the fingerprint are NOT gated with it:
-            // neither exempts anything (condition (7) reads the per-sweep
-            // hello value, §8.3 reads the per-record fingerprint that
-            // `ingest_page` has already stamped on this sweep's rows), so
-            // they are metadata that must stay in step with those rows.
-            store::set_resource_definition(
-                &txn,
-                input.adapter_id,
-                input.resource_id,
-                input.fingerprint,
-                report.complete.then_some(input.provider_id),
-            )?;
-            store::finish_crawl(
-                &txn,
-                crawl_id,
-                gate.drained,
-                report.complete,
-                disqualifier.as_deref(),
-            )?;
-            fault_before_final_commit()?;
-            txn.commit()?;
+            // The honest residual: a violation is what the host has JUDGED,
+            // not what the adapter has WRITTEN. Bytes still in the pipe at
+            // commit time are nobody's violation yet, and no ordering
+            // between the host's own threads can change that -- it would
+            // take waiting for the connection to end, which is a different
+            // (and far more expensive) design.
+            adapter.with_contract_violation_held(|violation| -> Result<()> {
+                if gate.connection_violation.is_none() {
+                    if let Some(kind) = violation {
+                        let reason = format!(
+                            "the connection broke the wire contract: {}",
+                            HostError::ProtocolViolation(kind)
+                        );
+                        // And the siblings swept after this one inherit it,
+                        // the same way a violation on this sweep's own
+                        // `history.read` does.
+                        report.contract_violation = Some(reason.clone());
+                        gate.connection_violation = Some(reason);
+                    }
+                }
+
+                let disqualifier = gate.disqualifier();
+                if let Some(reason) = &disqualifier {
+                    report.disqualified_reason = Some(reason.clone());
+                } else {
+                    report.complete = true;
+                    let outcome = derive_retractions(
+                        &txn,
+                        input,
+                        crawl_id,
+                        &fold,
+                        &head_meta,
+                        &observed_ids,
+                        &exempt_ids,
+                        now.as_str(),
+                    )?;
+                    report.retracted = outcome.retracted;
+                    report.discrepancies = outcome.discrepancies;
+                }
+
+                store::set_adapter_derivation(&txn, input.adapter_id, input.hello_derivation)?;
+                // The VANTAGE is adopted only by a sweep that RECONCILED it.
+                // `derive_retractions` is the only writer of `vantage_changed`
+                // and it never runs on a disqualified sweep, so storing the
+                // new `provider_id` here unconditionally destroyed both halves
+                // of §8.2's exemption at once: the audit row was never written
+                // and the next sweep, comparing the new vantage against
+                // itself, retracted everything the old vantage could see under
+                // a reason that blames the provider. One non-`exact` page was
+                // enough.
+                //
+                // The derivation and the fingerprint are NOT gated with it:
+                // neither exempts anything (condition (7) reads the per-sweep
+                // hello value, §8.3 reads the per-record fingerprint that
+                // `ingest_page` has already stamped on this sweep's rows), so
+                // they are metadata that must stay in step with those rows.
+                store::set_resource_definition(
+                    &txn,
+                    input.adapter_id,
+                    input.resource_id,
+                    input.fingerprint,
+                    report.complete.then_some(input.provider_id),
+                )?;
+                store::finish_crawl(
+                    &txn,
+                    crawl_id,
+                    gate.drained,
+                    report.complete,
+                    disqualifier.as_deref(),
+                )?;
+                probe_the_commit_window(input);
+                fault_before_final_commit()?;
+                txn.commit()?;
+                Ok(())
+            })?;
             return Ok(report);
         }
 
@@ -741,6 +777,23 @@ fn fault_before_final_commit() -> Result<()> {
         ));
     }
     Ok(())
+}
+
+/// The commit window, opened for inspection (test builds only).
+///
+/// Called from inside the critical section that holds condition (9)'s
+/// verdict, at the last instant before `txn.commit()`. Everything the fix
+/// claims is a claim about this exact point: that the connection's verdict
+/// cannot move here. A no-op everywhere but this crate's own tests, and it
+/// **must never touch the adapter** -- the lock it is standing inside is
+/// not reentrant, so an observer has to run on another thread. See
+/// `tests::a_violation_cannot_be_published_between_the_gate_and_the_commit`.
+#[cfg(not(test))]
+fn probe_the_commit_window(_input: &SweepInput<'_>) {}
+
+#[cfg(test)]
+fn probe_the_commit_window(input: &SweepInput<'_>) {
+    tests::probe_the_commit_window(input.fingerprint);
 }
 
 /// Where `--resume` picks up, or `None` if there is nothing safe to resume
@@ -1233,6 +1286,7 @@ pub fn history_start(statuses: &[ResourceStatus], resource_id: &str) -> Option<R
 mod tests {
     use super::*;
     use serde_json::json;
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
     /// One scripted run of `adapters/fake/fake_adapter.py`, answering
     /// `history.read` and nothing else -- these tests call
@@ -1306,6 +1360,178 @@ mod tests {
         )
         .await
         .expect("the fake adapter starts and says hello")
+    }
+
+    // -----------------------------------------------------------------
+    // The commit window
+    // -----------------------------------------------------------------
+
+    /// The fingerprint that arms [`probe_the_commit_window`]. Keyed on a
+    /// value the test owns rather than on a global flag, so the two seams
+    /// in this file cannot fire in each other's sweeps -- `cargo test` runs
+    /// the tests in one binary, in parallel.
+    pub(super) const WINDOW_FINGERPRINT: &str = "fp-commit-window";
+
+    /// How long the sweep is frozen mid-commit while the witness tries to
+    /// get in. The asymmetry is the whole margin: a witness that is NOT
+    /// locked out gets in within its 1ms poll interval, ~300 times over;
+    /// one that IS locked out can never get in, however long this is. So
+    /// there is no duration that makes a broken build pass and no duration
+    /// that makes a correct one fail -- only dead time to trade off, and
+    /// this is 300 times the reaction it is waiting for.
+    const COMMIT_WINDOW: std::time::Duration = std::time::Duration::from_millis(300);
+
+    static WITNESS_READS: AtomicU64 = AtomicU64::new(0);
+    static WITNESS_STOP: AtomicBool = AtomicBool::new(false);
+    static WITNESS_READ_INSIDE_THE_WINDOW: AtomicBool = AtomicBool::new(false);
+
+    /// Called by [`super::probe_the_commit_window`] from inside the
+    /// critical section, at the last instant before `txn.commit()`.
+    pub(super) fn probe_the_commit_window(fingerprint: &str) {
+        if fingerprint != WINDOW_FINGERPRINT {
+            return;
+        }
+        let before = WITNESS_READS.load(Ordering::SeqCst);
+        // Deliberately blocking, and deliberately on this thread: the point
+        // is to hold the connection's verdict for a long, measurable time
+        // and see whether anyone else can reach it.
+        std::thread::sleep(COMMIT_WINDOW);
+        WITNESS_READ_INSIDE_THE_WINDOW.store(
+            WITNESS_READS.load(Ordering::SeqCst) > before,
+            Ordering::SeqCst,
+        );
+    }
+
+    /// **Nothing can publish a violation between the gate's verdict and the
+    /// commit.**
+    ///
+    /// `a_violation_behind_the_final_reply_disqualifies_before_the_commit`
+    /// (in `tests/gate.rs`) pins the other half of condition (9): the gate
+    /// judges the LIVE verdict, not the snapshot it was handed on the way
+    /// in. That test passes on a single-threaded runtime because the
+    /// violation is established before the sweep looks. It says nothing
+    /// about the interval AFTER the look.
+    ///
+    /// That interval is not "a few instructions with no `.await` in them".
+    /// It spans the retraction derivation and three metadata writes, and
+    /// the reader task that publishes violations runs on another worker
+    /// thread of the multi-threaded runtime `main::block_on` builds. A
+    /// violation published there is a violation the host established
+    /// BEFORE this transaction committed, and condition (9) says a sweep
+    /// like that does not get to retract. Reporting it afterwards through
+    /// `close()` does not un-retract the record.
+    ///
+    /// # What is asserted, and why it is not an outcome
+    ///
+    /// No assertion about the database can distinguish the fix from the
+    /// bug here, and it is worth being explicit about that. Under the fix
+    /// the reader is made to wait, so the violation lands after the commit
+    /// and the sweep legitimately retracts; under the bug the violation
+    /// lands during the commit and the sweep illegitimately retracts. Same
+    /// rows. The difference is an ORDERING, so an ordering is what is
+    /// asserted: while the sweep is between its verdict and its commit,
+    /// **no other thread can reach this connection's violation latch**.
+    ///
+    /// The witness does exactly what `Mux::record_violation` does -- takes
+    /// the connection's lock -- and counts every time it gets in. It is an
+    /// OS thread rather than a task on purpose: a task that blocks on a
+    /// std mutex burns a worker, and a test that depends on the runtime
+    /// choosing to poll it is a test that depends on the runtime.
+    ///
+    /// # Which weaker implementation would pass this?
+    ///
+    /// Not the stale snapshot this replaces: its witness gets in ~300
+    /// times during the window. Not "re-read the verdict later" -- however
+    /// late the read, it releases the lock before the commit. Not "hold a
+    /// different lock across the commit" -- the witness takes this one.
+    /// What it does NOT pin by itself is that the verdict the gate judged
+    /// came from inside the held section; `with_contract_violation_held`
+    /// pins that by construction, because handing the value to the closure
+    /// is the only way to obtain it there.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_violation_cannot_be_published_between_the_gate_and_the_commit() {
+        if std::process::Command::new("python3")
+            .arg("--version")
+            .output()
+            .is_err()
+        {
+            eprintln!("python3 not found on PATH -- skipping");
+            return;
+        }
+        let dir = std::env::temp_dir().join(format!("sumer-window-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let fixture = dir.join("fixture.json");
+        std::fs::write(
+            &fixture,
+            serde_json::to_vec(&json!({
+                "case": "commit window",
+                "script": {"runs": [
+                    run(json!([obs("keep", "10.00"), obs("drop", "20.00")])),
+                    run(json!([obs("keep", "11.00")])),
+                ]}
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        let profile = crate::Profile::new(dir.join("profile"));
+        let mut store = Store::init(&profile).unwrap();
+
+        // Two live records, so run 1 -- which omits `drop` -- has a real
+        // retraction to derive and commit. Without one the sweep would
+        // never enter the branch this is about.
+        let handle = connect(&fixture, 0).await;
+        let planted = sweep_resource(&mut store, &handle, &input(WINDOW_FINGERPRINT))
+            .await
+            .unwrap();
+        let _ = handle.close().await;
+        assert!(planted.complete);
+        assert_eq!(planted.new, 2);
+
+        let handle = std::sync::Arc::new(connect(&fixture, 1).await);
+        WITNESS_READS.store(0, Ordering::SeqCst);
+        WITNESS_STOP.store(false, Ordering::SeqCst);
+        WITNESS_READ_INSIDE_THE_WINDOW.store(false, Ordering::SeqCst);
+        let watched = handle.clone();
+        let witness = std::thread::spawn(move || {
+            while !WITNESS_STOP.load(Ordering::SeqCst) {
+                // The same lock `record_violation` takes. The count moves
+                // only once the read has RETURNED, so a read that is
+                // blocked is a read that did not happen.
+                let _ = watched.contract_violation();
+                WITNESS_READS.fetch_add(1, Ordering::SeqCst);
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+        });
+
+        let report = sweep_resource(&mut store, &handle, &input(WINDOW_FINGERPRINT))
+            .await
+            .unwrap();
+
+        WITNESS_STOP.store(true, Ordering::SeqCst);
+        witness.join().unwrap();
+
+        assert!(
+            report.complete && report.retracted == 1,
+            "the window has to be the one a retraction commits in: {report:?}"
+        );
+        assert!(
+            WITNESS_READS.load(Ordering::SeqCst) > 0,
+            "the witness never ran -- this test proves nothing if it did not"
+        );
+        assert!(
+            !WITNESS_READ_INSIDE_THE_WINDOW.load(Ordering::SeqCst),
+            "a thread reached this connection's violation latch while the sweep was \
+             between its condition (9) verdict and its commit. Whatever it could read \
+             it could also WRITE: a violation published there is one the host \
+             established before the retraction was durable, and condition (9) says \
+             that sweep does not retract."
+        );
+
+        let handle = std::sync::Arc::try_unwrap(handle).ok().unwrap();
+        let _ = handle.close().await;
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// **The final page is ONE transaction.**

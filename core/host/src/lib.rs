@@ -333,6 +333,40 @@ impl AdapterHandle {
         self.mux.violation()
     }
 
+    /// The verdict of [`AdapterHandle::contract_violation`], **held frozen
+    /// for the whole of `f`**.
+    ///
+    /// `contract_violation` answers for an instant that is over by the time
+    /// the caller has the value: the reader task runs on another worker
+    /// thread of a multi-threaded runtime and can publish a violation one
+    /// instruction later. A caller that reads the verdict, decides on it,
+    /// and then makes that decision durable is therefore not doing what it
+    /// looks like it is doing -- the absence of an `.await` between the
+    /// three does not exclude another thread, and the interval spans
+    /// whatever work the decision takes, not a few instructions.
+    ///
+    /// This puts the read and the act in one critical section. Everything
+    /// this connection does -- publishing a violation included -- takes the
+    /// same lock, so a violation is established either strictly BEFORE the
+    /// value handed to `f`, or strictly AFTER `f` has returned. That
+    /// ordering is what lets `sumer_store::sweep` say a retraction it
+    /// committed was not licensed by a connection the host had already
+    /// caught lying: not a narrower window, no window.
+    ///
+    /// # The contract on `f`
+    ///
+    /// * `f` MUST NOT call back into this handle. Every entry point takes
+    ///   the same non-reentrant lock; that is a deadlock, not a wait.
+    /// * `f` MUST NOT be slow. The reader loop, the request pump and every
+    ///   in-flight call are stopped for its duration. It cannot `.await`
+    ///   at all -- the signature sees to that.
+    pub fn with_contract_violation_held<T>(
+        &self,
+        f: impl FnOnce(Option<ProtocolViolationKind>) -> T,
+    ) -> T {
+        self.mux.with_violation_held(f)
+    }
+
     /// Ends this connection and reports **how it ended**.
     ///
     /// Closing the child's stdin (see [`mux::Mux::begin_close`]) makes a

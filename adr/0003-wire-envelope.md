@@ -178,4 +178,3 @@ in-memory assumption is stated normatively in `spec/observation.md` §8 and
 argued in ADR 0006: a persisted cursor is written only inside the
 transaction that commits the page which minted it, and it is dropped when
 the resource fingerprint or the adapter's `local_id_derivation` changes.
-
