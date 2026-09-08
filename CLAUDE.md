@@ -21,11 +21,39 @@ merge, and reject. Taste is the bottleneck, not throughput.
 
 ### The cycle (one pass = one PR)
 
+0. **The batch-size rule, which I broke on PR 4 and will not break again.**
+   One PR introduces **one new invariant class**. PR 4 was 12,743 insertions
+   across 50 files — store, revision model, a nine-condition gate, retraction,
+   freshness derivation and a CLI — and cost **nine serial adversarial rounds
+   and ~30 defects**. Defects scale with invariants-per-diff; review rounds are
+   serial. That is the whole arithmetic. If I am tempted to exceed it, the
+   temptation is the signal to split.
+
 1. **Linus decomposes** the backlog into a task set that fits one reviewable PR.
    If it doesn't fit one PR, it's two task sets.
-2. **Opus PR Lead plans** — files touched, contracts, test strategy, the diff shape.
-3. **Fable critiques the plan** — attacks assumptions, finds the missing case,
-   names the over-engineering. Critique targets the plan, not the prose.
+2. **Opus PR Lead plans, and the plan's deliverable is a RED TEST LIST** —
+   one named, executable, *currently failing* case per normative claim the PR
+   introduces, alongside files touched and diff shape. Not prose describing a
+   test strategy: the tests, red, before any implementation exists.
+
+   This is the single change that came out of PR 4's post-mortem. Across ~30
+   defects found in nine rounds, **not one was caught by reading** — every one
+   died to a mutation, an execution, or a differential test. What those nine
+   rounds actually were was serial exploratory test-writing, each reviewer
+   inventing the executions the plan never demanded. Nine gate conditions
+   means nine red tests before a worker starts, derived mechanically from the
+   spec's own MUSTs. Front-load it once in parallel instead of discovering it
+   nine times in series.
+
+3. **Fable AND Codex critique the plan and the test list** — not the prose.
+   Fable attacks assumptions and names over-engineering; Codex attacks from a
+   different engine. Codex used to sit last, over finished code, which is the
+   most expensive position on the board: it found the most severe defects
+   where they cost the most to fix. Diversity belongs where it prevents, not
+   only where it detects.
+
+   The reviewers that have never missed, though, have no model family at all:
+   mutation, differential, conformance, execution. Buy diversity there first.
 4. **Opus refines** the plan against the critique. Rejecting a point is allowed;
    rejecting it silently is not.
 5. **Sonnet workers implement** in parallel, one task each, on the PR branch.
@@ -71,12 +99,43 @@ The project feeds itself. When there's no active task set, I run this:
    suite against `main`; on failure it opens an issue with the failing job, the
    log tail, and the suspect commit range, labelled `ci-failure`. Those land in
    step 1 like any other issue. Green runs stay silent — no issue, no noise.
-4. **I write tests nobody asked for.** Where the system is under-covered or where
+
+   **Nightly also runs exhaustive `cargo-mutants` over `core/store` and
+   `core/host`, and every survivor files an issue.** The curated battery is 43
+   hand-written mutants against ~13,900 lines: it measures what we already
+   thought of, and it was 18/18 green over thirty latent defects. Exhaustive
+   mutation is mechanical, has no model family, and is exactly the verifier
+   class this project's own evidence says works.
+
+4. **Carlos uses it daily, on real accounts.** All seven open issues came from
+   review; **none came from use**. Four PRs in, not one change has started from
+   an observed failure, which is what `constitution/FOUNDING_PLAN.md` §11 asks
+   for. The one live test is `#[ignore]`d and its own comment reads "this one
+   is `#[ignore]`d so CI never caught it". Issue #12 — a `not_fetched` balance
+   still rendering `live` — is in the exact area nine rounds hardened, and an
+   hour of real use would have found it. A review round is not a user.
+5. **I write tests nobody asked for.** Where the system is under-covered or where
    a bug got through review, I add the check. A bug that reached `main` and had no
    test is a two-part fix: the fix, and the test that would have caught it.
 
 The CI workflows and the failure→issue automation get built in the first PR that
 has code to test — building them against an empty repo is theatre.
+
+### The redesign trigger (learned at nine-round prices; do not relearn)
+
+**Two consecutive review rounds finding defects *in the previous round's
+fixes* means the design is enumeration-shaped. Stop patching and invert it.**
+
+The proof is ADR 0006 decision 8. Balance freshness was "on every path where
+a balance was not read, write a marker row" — correct only if every failing
+path is enumerated, and four rounds each found one nobody had. Replacing the
+enumeration with a derivation (a line is fresh iff the read that wrote it is
+the adapter's most recent) deleted 60 lines and made an unread resource stale
+*by construction*, including for reasons nobody has thought of yet.
+
+Related, and also paid for: **a fix that converts an error path into a success
+path is unreviewed code.** Re-keying the fold turned a loud `UNIQUE` violation
+into a silent wrong answer. The crash was the better behaviour.
 
 ### Merge bar (Linus's worldview)
 
