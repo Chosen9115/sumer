@@ -1099,3 +1099,139 @@ async fn a_reply_naming_one_resource_twice_is_refused_on_every_read() {
         other => panic!("a duplicate resource must be refused, got {other:?}"),
     }
 }
+
+// ---------------------------------------------------------------------
+// Holding condition (9)'s verdict must not invent a violation
+// ---------------------------------------------------------------------
+
+/// **Holding the verdict must not stop the connection, or the host starts
+/// inventing violations.**
+///
+/// The shape that broke when the verdict was held on the mux's lifecycle
+/// lock: the gate holds the verdict across a commit, an adapter's late
+/// reply to a tombstoned id arrives during that hold, and delivering it
+/// blocks on the same lock -- inside the reader task, on a runtime worker.
+/// The adapter then exits, `process::supervise` reaps it and gives the
+/// stream `process::READER_DRAIN` to reach its end, and the budget expires
+/// on a reader that is not waiting on the adapter at all but on the host's
+/// own lock. The connection is reported as having held its stdout open
+/// past its exit.
+///
+/// Nothing this adapter did is a violation. It answered late -- which
+/// spec/wire.md §6 permits, and which the host answers with a tombstone,
+/// not a kill -- and then exited. And a false violation is not a safe
+/// direction to fail in: §8.1 condition (9) reads one as grounds to
+/// suppress a retraction, so the host stays quiet about a record it should
+/// have retracted, on evidence it invented.
+///
+/// # Why the assertion is the runtime's clock, and not `StdoutHeldOpen`
+///
+/// Because the stall is deterministic and the misclassification it causes
+/// is not. A reply blocked inside the reader task blocks a runtime worker
+/// **holding that worker's core**, and with it the runtime's driver: no
+/// timers, no readiness, for the whole hold. That is not one stalled
+/// connection, it is the process. Whether the drain budget then expires on
+/// the right side of the reap is a scheduling race -- the freeze often
+/// swallows the reap too and hides its own consequence. Racing that is not
+/// a test; the stall is not a race, and it is the only way to reach the
+/// misclassification, so the stall is what is asserted, alongside the
+/// outcome that must not appear.
+///
+/// # Why the hold runs on its own thread
+///
+/// Because the real one does: `sumer_store`'s sweep commits from the
+/// thread that called `Runtime::block_on`, never from a worker. It also
+/// keeps the measurement honest. A hold that blocks a runtime-associated
+/// thread can stall the driver on *any* build, correct or not, if that
+/// thread happens to be driving -- which is a false failure waiting for a
+/// loaded machine. Blocking a thread the runtime does not own leaves the
+/// only possible stall the one this test is about.
+///
+/// One-sided by construction: on a build that does not stall delivery the
+/// timer keeps its own 20ms schedule and no amount of machine load moves it
+/// near the bound; on one that does, it stops for the whole hold, which is
+/// more than double the bound.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_held_verdict_does_not_freeze_the_connection_or_invent_a_violation() {
+    // 400ms deadline: the first call is tombstoned long before the reply
+    // it is waiting for. The adapter answers it anyway at ~1s and exits in
+    // the same breath.
+    let script = format!(
+        "{PRELUDE}\nimport time\nhello_ok(read())\nreq = read()\ntime.sleep(1.0)\n\
+         send({{'id': req['id'], 'ok': {{'resources': []}}}})\nsys.exit(0)\n"
+    );
+    let handle = std::sync::Arc::new(
+        spawn(&script, Duration::from_millis(400))
+            .await
+            .expect("handshake"),
+    );
+
+    let timed_out = handle.resources_list().await;
+    assert!(
+        matches!(timed_out, Err(HostError::Timeout)),
+        "the first call must be tombstoned, not answered: {timed_out:?}"
+    );
+
+    // A tokio timer on the runtime this connection lives on: the cheapest
+    // thing that stops when the runtime does.
+    let base = std::time::Instant::now();
+    let last_tick = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+    {
+        let last_tick = last_tick.clone();
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+                let now = u64::try_from(base.elapsed().as_millis()).unwrap_or(u64::MAX);
+                last_tick.store(now, std::sync::atomic::Ordering::SeqCst);
+            }
+        });
+    }
+
+    // The gate's critical section, exaggerated to 2.5s: it opens before the
+    // late reply lands (~0.6s from here) and stays open long past the 1s
+    // drain budget the adapter's exit starts.
+    let gate = {
+        let handle = handle.clone();
+        let last_tick = last_tick.clone();
+        std::thread::spawn(move || {
+            handle.with_contract_violation_held(|violation| {
+                std::thread::sleep(Duration::from_millis(2500));
+                let now = u64::try_from(base.elapsed().as_millis()).unwrap_or(u64::MAX);
+                let last = last_tick.load(std::sync::atomic::Ordering::SeqCst);
+                (violation, now.saturating_sub(last))
+            })
+        })
+    };
+    tokio::time::sleep(Duration::from_millis(2600)).await;
+    let (seen, stalled_for) = gate.join().expect("the gate thread");
+
+    assert!(
+        stalled_for < 800,
+        "the runtime went {stalled_for}ms without servicing a 20ms timer while the \
+         verdict was held: delivering a late reply is waiting on the same lock, inside \
+         the reader task, on a worker whose core it holds while it waits. A host that \
+         cannot run its own timers cannot reap a child or meet a drain budget either, \
+         and an adapter that merely answered late gets charged with StdoutHeldOpen"
+    );
+    assert_eq!(
+        seen, None,
+        "nothing this adapter did is a violation: it replied late to an id the host \
+         had already given up on, and spec/wire.md §6 says the connection survives"
+    );
+    assert_eq!(
+        handle.contract_violation(),
+        None,
+        "and none was established while the verdict was held either -- a reply the \
+         host stalled on its own lock is not an adapter holding its stdout open"
+    );
+    let handle = std::sync::Arc::try_unwrap(handle)
+        .ok()
+        .expect("the gate thread is joined");
+    match handle.close().await {
+        Some(Terminal::Crashed(Some(0))) => {}
+        other => panic!(
+            "a late reply and a clean exit, judged while a verdict was held, must \
+             still read as a clean exit -- got {other:?}"
+        ),
+    }
+}

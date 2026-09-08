@@ -605,21 +605,35 @@ pub async fn sweep_resource(
             // does not need this one to yield.
             //
             // So the verdict is not read, it is HELD:
-            // `with_contract_violation_held` takes the connection's lock,
-            // hands the verdict to this closure, and keeps the lock until
-            // the closure returns -- past `txn.commit()`. `record_violation`
-            // takes that same lock, so a violation this connection commits
+            // `with_contract_violation_held` takes the lock guarding the
+            // connection's violation verdict, hands the verdict to this
+            // closure, and keeps it until the closure returns -- past
+            // `txn.commit()`. Both publishers take that same lock (the
+            // reader catching a frame, and the terminal reason that is
+            // itself a violation), so a violation this connection commits
             // is established either strictly BEFORE the value below, in
             // which case it disqualifies the sweep, or strictly AFTER this
             // transaction is durable, in which case the sweep had already
             // committed and (9) is not retroactive. There is no third
             // interleaving to lose a race in.
             //
+            // What is frozen is the VERDICT, not the connection. Replies
+            // are still delivered and the reader still reads while this
+            // runs -- and it has to be that way. Freezing the connection's
+            // lifecycle here stalls the delivery of a late reply inside
+            // the reader task, on a runtime worker that holds its core
+            // while it waits, so the runtime's timers stop with it for the
+            // length of this commit. The drain budget an adapter's stdout
+            // is measured against is one of those timers, and the adapter
+            // that merely answered late is then charged with
+            // `StdoutHeldOpen`. A false violation is not a safe direction
+            // to fail in -- under this very condition it suppresses the
+            // retraction the gate exists to license.
+            //
             // Nothing in here may touch the adapter: the lock is not
             // reentrant. Everything it does call is this crate's SQLite on
             // a connection this sweep owns exclusively, which is why
-            // freezing the connection cannot deadlock against it. The
-            // reader is stopped for the length of one local commit.
+            // holding the verdict cannot deadlock against it.
             //
             // Still FORWARD-ONLY: this is detection BEFORE commitment, not
             // a sweep reconsidered after it committed. Sweeps that already
@@ -696,7 +710,7 @@ pub async fn sweep_resource(
                     disqualifier.as_deref(),
                 )?;
                 probe_the_commit_window(input);
-                fault_before_final_commit()?;
+                fault_before_final_commit(input)?;
                 txn.commit()?;
                 Ok(())
             })?;
@@ -761,7 +775,7 @@ pub async fn sweep_resource(
 /// and the branch exist only under `cfg(test)`, so there is nothing to set
 /// at runtime and no knob to misconfigure.
 #[cfg(not(test))]
-fn fault_before_final_commit() -> Result<()> {
+fn fault_before_final_commit(_input: &SweepInput<'_>) -> Result<()> {
     Ok(())
 }
 
@@ -769,9 +783,17 @@ fn fault_before_final_commit() -> Result<()> {
 static ABORT_BEFORE_FINAL_COMMIT: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
+/// Keyed on the arming test's own fingerprint, like
+/// [`probe_the_commit_window`]. `cargo test` runs this file's tests in one
+/// binary and in parallel, so a bare global flag is a seam that fires in
+/// whichever sweep happens to reach the commit first -- harmless while
+/// exactly one test arms it, and a debugging afternoon the moment a second
+/// one does.
 #[cfg(test)]
-fn fault_before_final_commit() -> Result<()> {
-    if ABORT_BEFORE_FINAL_COMMIT.swap(false, std::sync::atomic::Ordering::SeqCst) {
+fn fault_before_final_commit(input: &SweepInput<'_>) -> Result<()> {
+    if input.fingerprint == tests::FAULT_FINGERPRINT
+        && ABORT_BEFORE_FINAL_COMMIT.swap(false, std::sync::atomic::Ordering::SeqCst)
+    {
         return Err(crate::error::StoreError::Host(
             "simulated crash before the final page's commit".to_owned(),
         ));
@@ -1286,7 +1308,7 @@ pub fn history_start(statuses: &[ResourceStatus], resource_id: &str) -> Option<R
 mod tests {
     use super::*;
     use serde_json::json;
-    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+    use std::sync::atomic::{AtomicU8, Ordering};
 
     /// One scripted run of `adapters/fake/fake_adapter.py`, answering
     /// `history.read` and nothing else -- these tests call
@@ -1372,18 +1394,28 @@ mod tests {
     /// the tests in one binary, in parallel.
     pub(super) const WINDOW_FINGERPRINT: &str = "fp-commit-window";
 
-    /// How long the sweep is frozen mid-commit while the witness tries to
-    /// get in. The asymmetry is the whole margin: a witness that is NOT
-    /// locked out gets in within its 1ms poll interval, ~300 times over;
-    /// one that IS locked out can never get in, however long this is. So
-    /// there is no duration that makes a broken build pass and no duration
-    /// that makes a correct one fail -- only dead time to trade off, and
-    /// this is 300 times the reaction it is waiting for.
-    const COMMIT_WINDOW: std::time::Duration = std::time::Duration::from_millis(300);
+    /// The fingerprint that arms [`super::fault_before_final_commit`], for
+    /// the same reason.
+    pub(super) const FAULT_FINGERPRINT: &str = "fp-final-commit-fault";
 
-    static WITNESS_READS: AtomicU64 = AtomicU64::new(0);
-    static WITNESS_STOP: AtomicBool = AtomicBool::new(false);
-    static WITNESS_READ_INSIDE_THE_WINDOW: AtomicBool = AtomicBool::new(false);
+    /// The window handshake. `probe_the_commit_window` (running INSIDE the
+    /// held section) tells the witness the window is open and then blocks
+    /// until the witness has reported back, so the witness's observation
+    /// is inside the window by construction rather than by timing. No
+    /// sleeps: there is nothing here for a loaded machine to perturb.
+    ///
+    /// `Sender<()>` opens the window, `Receiver<bool>` collects the
+    /// verdict; the test owns the other end of each. A dropped witness
+    /// makes `recv` fail rather than hang.
+    #[allow(clippy::type_complexity)]
+    static WINDOW: std::sync::OnceLock<(
+        std::sync::mpsc::Sender<()>,
+        std::sync::Mutex<std::sync::mpsc::Receiver<bool>>,
+    )> = std::sync::OnceLock::new();
+
+    /// What the witness saw, from inside the window: `0` it never looked,
+    /// `1` the latch was locked (correct), `2` the latch was free.
+    static WINDOW_OBSERVATION: AtomicU8 = AtomicU8::new(0);
 
     /// Called by [`super::probe_the_commit_window`] from inside the
     /// critical section, at the last instant before `txn.commit()`.
@@ -1391,15 +1423,18 @@ mod tests {
         if fingerprint != WINDOW_FINGERPRINT {
             return;
         }
-        let before = WITNESS_READS.load(Ordering::SeqCst);
-        // Deliberately blocking, and deliberately on this thread: the point
-        // is to hold the connection's verdict for a long, measurable time
-        // and see whether anyone else can reach it.
-        std::thread::sleep(COMMIT_WINDOW);
-        WITNESS_READ_INSIDE_THE_WINDOW.store(
-            WITNESS_READS.load(Ordering::SeqCst) > before,
-            Ordering::SeqCst,
-        );
+        let Some((open, verdict)) = WINDOW.get() else {
+            return;
+        };
+        if open.send(()).is_err() {
+            return;
+        }
+        let observed = verdict
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .recv()
+            .map_or(0, |free| if free { 2 } else { 1 });
+        WINDOW_OBSERVATION.store(observed, Ordering::SeqCst);
     }
 
     /// **Nothing can publish a violation between the gate's verdict and the
@@ -1414,40 +1449,50 @@ mod tests {
     ///
     /// That interval is not "a few instructions with no `.await` in them".
     /// It spans the retraction derivation and three metadata writes, and
-    /// the reader task that publishes violations runs on another worker
-    /// thread of the multi-threaded runtime `main::block_on` builds. A
-    /// violation published there is a violation the host established
-    /// BEFORE this transaction committed, and condition (9) says a sweep
-    /// like that does not get to retract. Reporting it afterwards through
-    /// `close()` does not un-retract the record.
+    /// both publishers -- the reader task catching a frame, and `finish`
+    /// latching a terminal reason that is itself a violation -- run on
+    /// other threads. A violation published there is one the host
+    /// established BEFORE this transaction committed, and condition (9)
+    /// says a sweep like that does not get to retract. Reporting it
+    /// afterwards through `close()` does not un-retract the record.
     ///
     /// # What is asserted, and why it is not an outcome
     ///
     /// No assertion about the database can distinguish the fix from the
-    /// bug here, and it is worth being explicit about that. Under the fix
-    /// the reader is made to wait, so the violation lands after the commit
-    /// and the sweep legitimately retracts; under the bug the violation
-    /// lands during the commit and the sweep illegitimately retracts. Same
-    /// rows. The difference is an ORDERING, so an ordering is what is
-    /// asserted: while the sweep is between its verdict and its commit,
-    /// **no other thread can reach this connection's violation latch**.
+    /// bug here. Under the fix the publication is made to wait, so it
+    /// lands after the commit and the sweep legitimately retracts; under
+    /// the bug it lands during the commit and the sweep illegitimately
+    /// retracts. Same rows. The difference is an ORDERING.
     ///
-    /// The witness does exactly what `Mux::record_violation` does -- takes
-    /// the connection's lock -- and counts every time it gets in. It is an
-    /// OS thread rather than a task on purpose: a task that blocks on a
-    /// std mutex burns a worker, and a test that depends on the runtime
-    /// choosing to poll it is a test that depends on the runtime.
+    /// So the ordering is asserted directly, and as an EXCLUSION rather
+    /// than as an absence: from inside the window, the witness `try_lock`s
+    /// the latch every publisher writes through, and a lock it cannot take
+    /// is a lock that is held. The tempting alternative -- a publisher
+    /// hammering in a loop and a counter that must not move -- is unsound
+    /// in both directions: a counter that did not move is also what a
+    /// publisher that had not started yet looks like, and a counter
+    /// incremented outside the lock can move under jitter after a correct
+    /// hold released. A flaky guard on a safety property teaches people to
+    /// re-run.
+    ///
+    /// The handshake pins the observation inside the window from both
+    /// ends: the witness cannot look before the sweep opens the window,
+    /// and the sweep cannot commit before the witness has looked. Nothing
+    /// sleeps and nothing polls.
     ///
     /// # Which weaker implementation would pass this?
     ///
-    /// Not the stale snapshot this replaces: its witness gets in ~300
-    /// times during the window. Not "re-read the verdict later" -- however
-    /// late the read, it releases the lock before the commit. Not "hold a
-    /// different lock across the commit" -- the witness takes this one.
-    /// What it does NOT pin by itself is that the verdict the gate judged
-    /// came from inside the held section; `with_contract_violation_held`
-    /// pins that by construction, because handing the value to the closure
-    /// is the only way to obtain it there.
+    /// Not the stale snapshot this replaces: nothing is held, so the
+    /// witness's `try_lock` succeeds. Not "re-read the verdict later":
+    /// however late the read, the lock is gone before the commit. Not
+    /// "hold a different lock across the commit": the witness takes the
+    /// one publication goes through, and `mux.rs`'s
+    /// `a_violation_cannot_be_published_while_the_verdict_is_held` pins
+    /// that a real `record_violation` is what waits on it. What this does
+    /// NOT pin by itself is that the verdict the gate judged came from
+    /// inside the held section; `with_contract_violation_held` pins that
+    /// by construction, because handing the value to the closure is the
+    /// only way to obtain it there.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn a_violation_cannot_be_published_between_the_gate_and_the_commit() {
         if std::process::Command::new("python3")
@@ -1490,43 +1535,45 @@ mod tests {
         assert_eq!(planted.new, 2);
 
         let handle = std::sync::Arc::new(connect(&fixture, 1).await);
-        WITNESS_READS.store(0, Ordering::SeqCst);
-        WITNESS_STOP.store(false, Ordering::SeqCst);
-        WITNESS_READ_INSIDE_THE_WINDOW.store(false, Ordering::SeqCst);
+        let (open_tx, open_rx) = std::sync::mpsc::channel::<()>();
+        let (verdict_tx, verdict_rx) = std::sync::mpsc::channel::<bool>();
+        WINDOW_OBSERVATION.store(0, Ordering::SeqCst);
+        assert!(
+            WINDOW
+                .set((open_tx, std::sync::Mutex::new(verdict_rx)))
+                .is_ok(),
+            "only this test arms the window"
+        );
+
         let watched = handle.clone();
         let witness = std::thread::spawn(move || {
-            while !WITNESS_STOP.load(Ordering::SeqCst) {
-                // The same lock `record_violation` takes. The count moves
-                // only once the read has RETURNED, so a read that is
-                // blocked is a read that did not happen.
-                let _ = watched.contract_violation();
-                WITNESS_READS.fetch_add(1, Ordering::SeqCst);
-                std::thread::sleep(std::time::Duration::from_millis(1));
+            // An OS thread, not a task: a task that blocks on a std mutex
+            // burns a worker, and a test that depends on the runtime
+            // choosing to poll it is a test that depends on the runtime.
+            if open_rx.recv().is_err() {
+                return;
             }
+            let _ = verdict_tx.send(watched.violation_latch_is_free());
         });
 
         let report = sweep_resource(&mut store, &handle, &input(WINDOW_FINGERPRINT))
             .await
             .unwrap();
-
-        WITNESS_STOP.store(true, Ordering::SeqCst);
         witness.join().unwrap();
 
         assert!(
             report.complete && report.retracted == 1,
             "the window has to be the one a retraction commits in: {report:?}"
         );
-        assert!(
-            WITNESS_READS.load(Ordering::SeqCst) > 0,
-            "the witness never ran -- this test proves nothing if it did not"
-        );
-        assert!(
-            !WITNESS_READ_INSIDE_THE_WINDOW.load(Ordering::SeqCst),
-            "a thread reached this connection's violation latch while the sweep was \
-             between its condition (9) verdict and its commit. Whatever it could read \
-             it could also WRITE: a violation published there is one the host \
-             established before the retraction was durable, and condition (9) says \
-             that sweep does not retract."
+        assert_eq!(
+            WINDOW_OBSERVATION.load(Ordering::SeqCst),
+            1,
+            "0 = the witness never looked, so this test proved nothing; 2 = a thread \
+             could take this connection's violation latch while the sweep was between \
+             its condition (9) verdict and its commit. Whatever it could take it could \
+             also WRITE: a violation published there is one the host established before \
+             the retraction was durable, and condition (9) says that sweep does not \
+             retract."
         );
 
         let handle = std::sync::Arc::try_unwrap(handle).ok().unwrap();
@@ -1580,7 +1627,7 @@ mod tests {
 
         // A clean sweep first: two live records.
         let handle = connect(&fixture, 0).await;
-        let planted = sweep_resource(&mut store, &handle, &input("fp1"))
+        let planted = sweep_resource(&mut store, &handle, &input(FAULT_FINGERPRINT))
             .await
             .unwrap();
         let _ = handle.close().await;
@@ -1592,7 +1639,7 @@ mod tests {
         // transaction commits.
         ABORT_BEFORE_FINAL_COMMIT.store(true, std::sync::atomic::Ordering::SeqCst);
         let handle = connect(&fixture, 1).await;
-        let crashed = sweep_resource(&mut store, &handle, &input("fp1")).await;
+        let crashed = sweep_resource(&mut store, &handle, &input(FAULT_FINGERPRINT)).await;
         let _ = handle.close().await;
         assert!(crashed.is_err(), "the simulated crash aborts the sweep");
 

@@ -105,29 +105,6 @@ struct MuxInner {
     next_id: u64,
     slots: HashMap<u64, Slot>,
     terminal: Option<Terminal>,
-    /// The first fatal protocol violation this connection was **caught
-    /// committing**, published at the instant the reader decoded it --
-    /// which is strictly earlier than `terminal`, and that gap is the
-    /// whole point. `terminal` is latched by `process::supervise`, one
-    /// child reap and one reader-drain later; a caller that asks "has this
-    /// connection broken the contract?" in between would be told no about
-    /// a violation the host had already seen.
-    violation: Option<ProtocolViolationKind>,
-}
-
-impl MuxInner {
-    /// The verdict, from both sources a violation can be established by:
-    /// the reader catching a frame (`violation`, the early one), or a
-    /// terminal reason that is itself a violation -- `AdapterHandle::close`'s
-    /// `StdinEofIgnored` / `StdoutHeldOpen`, which are only knowable at the
-    /// close and never pass through the reader at all. A caller asking the
-    /// question does not care which.
-    fn violation(&self) -> Option<ProtocolViolationKind> {
-        self.violation.or(match self.terminal {
-            Some(Terminal::Violation(kind)) => Some(kind),
-            _ => None,
-        })
-    }
 }
 
 /// The outcome of delivering a reply to a legitimately-tracked id.
@@ -158,6 +135,30 @@ impl From<MuxViolation> for ProtocolViolationKind {
 /// The id/lifecycle/backpressure state for one adapter connection.
 pub struct Mux {
     inner: Mutex<MuxInner>,
+    /// **The publication latch for condition (9)**, and deliberately NOT
+    /// part of `inner`.
+    ///
+    /// The first fatal protocol violation this connection was **caught
+    /// committing**. Two publishers write it, and neither is privileged:
+    /// [`Mux::record_violation`], from the reader task at the instant a
+    /// frame is decoded, and [`Mux::finish`], for a terminal reason that
+    /// is itself a violation -- `AdapterHandle::close`'s `StdinEofIgnored`
+    /// / `StdoutHeldOpen`, which are only knowable at the close and never
+    /// pass through the reader at all. First one wins; a caller asking
+    /// "has this connection broken the contract?" does not care which
+    /// published it.
+    ///
+    /// It gets its own lock because [`Mux::with_violation_held`] holds
+    /// that lock across a caller's commit. Held on `inner`, that froze the
+    /// whole connection lifecycle for the duration: a late, tombstoned
+    /// reply then blocks in [`Mux::deliver`] -- inside the reader task, on
+    /// a runtime worker that keeps its core while it waits, so the
+    /// runtime's timers and readiness stop with it. `process::READER_DRAIN`
+    /// is one of those timers, and the adapter that merely answered late
+    /// is charged with `StdoutHeldOpen`: a violation manufactured by the
+    /// mechanism that exists to report violations honestly. Only the
+    /// verdict needs freezing, so only the verdict is frozen.
+    verdict: Mutex<Option<ProtocolViolationKind>>,
     outbox: mpsc::Sender<QueuedRequest>,
     /// Concurrency gate for `max_in_flight`. Starts at 1 permit (enough for
     /// the hello call); [`Mux::raise_concurrency`] tops it up once the
@@ -297,8 +298,8 @@ impl Mux {
                 next_id: 0,
                 slots: HashMap::new(),
                 terminal: None,
-                violation: None,
             }),
+            verdict: Mutex::new(None),
             outbox: tx,
             semaphore: semaphore.clone(),
             transcript,
@@ -382,11 +383,40 @@ impl Mux {
     /// exit-watcher (on process exit) call this unconditionally without
     /// racing each other for which reason "wins".
     pub fn finish(&self, reason: Terminal) -> bool {
+        // **Only a reason that publishes takes the publication latch.** An
+        // ordinary crash is not a violation and has nothing to publish, so
+        // it must not queue behind a held verdict: `supervise` calls this
+        // from a runtime worker, and a worker blocked on a lock keeps its
+        // core -- no timers, no readiness, for the rest of the caller's
+        // commit. Ending an honest connection is not worth stopping the
+        // runtime for.
+        //
+        // A violation-carrying reason does wait, and that wait IS the
+        // guarantee: publication is what `with_violation_held` excludes.
+        //
+        // `verdict` FIRST, then `inner`, and never the other way round --
+        // that is the lock order this connection has, and this is the only
+        // place that holds both. Publishing under the same lock that
+        // latches `terminal` keeps the two in step: a violation this
+        // finish establishes is never visible LATER than the terminal
+        // reason carrying it, so a gate that saw no violation was not
+        // racing one that had already been decided.
+        let mut verdict = match reason {
+            Terminal::Violation(_) => Some(self.verdict.lock().unwrap_or_else(|e| e.into_inner())),
+            Terminal::Crashed(_) => None,
+        };
         let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         if inner.terminal.is_some() {
             return false;
         }
         inner.terminal = Some(reason);
+        // Only the reason that WON publishes. A loser announcing its kind
+        // would report a violation on a connection whose terminal reason
+        // is an ordinary crash -- a false violation, which is the one
+        // thing worse than a missed one.
+        if let (Terminal::Violation(kind), Some(verdict)) = (reason, verdict.as_mut()) {
+            verdict.get_or_insert(kind);
+        }
         let pending: Vec<_> = inner
             .slots
             .values_mut()
@@ -443,9 +473,16 @@ impl Mux {
     /// This is deliberately not `finish`: finishing resolves every pending
     /// call, which is `supervise`'s decision to make once it owns the
     /// child's fate. All this does is record what the host now knows.
+    ///
+    /// **It is not the only publisher.** `finish(Terminal::Violation(..))`
+    /// publishes into the same latch, under the same lock, for the two
+    /// kinds that are only knowable at the close. Any claim that a single
+    /// function publishes violations is wrong.
     fn record_violation(&self, kind: ProtocolViolationKind) {
-        let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
-        inner.violation.get_or_insert(kind);
+        self.verdict
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get_or_insert(kind);
     }
 
     /// Has this connection been **established** to have broken the wire
@@ -459,10 +496,22 @@ impl Mux {
     /// value. A caller whose *decision* depends on the answer wants
     /// [`Mux::with_violation_held`] instead.
     pub(crate) fn violation(&self) -> Option<ProtocolViolationKind> {
-        self.inner
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .violation()
+        *self.verdict.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Whether the verdict latch is free **at this instant**. Test support
+    /// for the one property that has no outcome to assert on: that a
+    /// caller inside [`Mux::with_violation_held`] really does exclude
+    /// every publisher, rather than merely failing to be overtaken by one.
+    /// A witness thread calling this from inside another thread's held
+    /// section gets `false` iff the exclusion is real.
+    ///
+    /// Not a synchronization primitive: `true` says only that nothing held
+    /// it when it was asked. Never branch on it outside a test.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn violation_latch_is_free(&self) -> bool {
+        self.verdict.try_lock().is_ok()
     }
 
     /// Reads the violation verdict and **holds it frozen** for the whole of
@@ -478,33 +527,45 @@ impl Mux {
     /// yield.
     ///
     /// So the verdict and the act are put in the same critical section.
-    /// `record_violation` -- and every other mux operation -- takes this
-    /// same lock, so a violation is published either strictly BEFORE the
-    /// value `f` is handed, or strictly AFTER `f` has returned. There is no
-    /// third possibility, and that is the ordering `spec/observation.md`
-    /// §8.1 condition (9) needs to mean anything.
+    /// **Both** publishers take this lock -- `record_violation` (the
+    /// reader, at decode) and `finish` (a terminal reason that is itself a
+    /// violation) -- so a violation is published either strictly BEFORE
+    /// the value `f` is handed, or strictly AFTER `f` has returned. There
+    /// is no third possibility, and that is the ordering
+    /// `spec/observation.md` §8.1 condition (9) needs to mean anything.
+    ///
+    /// # What is frozen, and what deliberately is not
+    ///
+    /// Only [`Mux::verdict`] -- not `MuxInner`. Freezing the connection's
+    /// whole lifecycle here stops `deliver` too, and a late reply blocked
+    /// there blocks the reader task on a runtime worker that holds its
+    /// core while it waits -- which stops the runtime's timers, including
+    /// the drain budget `supervise` measures adapters against, and reports
+    /// an adapter that merely answered late as `StdoutHeldOpen`. So ids
+    /// keep being issued, tombstoned and answered while `f` runs. The only
+    /// thing that waits is a violation trying to become established, which
+    /// is exactly the thing that must wait -- and that wait is why `f`
+    /// must be short.
     ///
     /// # The contract on `f`
     ///
-    /// `f` runs with this connection's lock held, so:
-    ///
-    /// * it MUST NOT call back into this connection (every entry point
-    ///   takes this same non-reentrant lock: that is a deadlock, not a
-    ///   wait), and
+    /// * `f` MUST NOT publish or read this connection's verdict --
+    ///   `record_violation`, `finish`, `violation` and this function all
+    ///   take this same non-reentrant lock, so that is a deadlock, not a
+    ///   wait. Simplest rule: `f` does not touch this connection at all.
     /// * it MUST NOT `.await` -- the signature already forbids it, and the
-    ///   reason is that everything else this connection does, including
-    ///   the reader loop, is stopped for the duration.
+    ///   reason is that a violation cannot be established for as long as
+    ///   `f` runs.
     ///
-    /// ponytail: the reader blocks for as long as `f` runs. Its one caller
-    /// runs a local SQLite commit there, which is microseconds to
-    /// milliseconds. If `f` ever grows something slower, the latch needs
-    /// its own lock rather than `MuxInner`'s.
+    /// ponytail: publication blocks for as long as `f` runs. Its one
+    /// caller runs a local SQLite commit there, which is microseconds to
+    /// milliseconds.
     pub(crate) fn with_violation_held<T>(
         &self,
         f: impl FnOnce(Option<ProtocolViolationKind>) -> T,
     ) -> T {
-        let inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
-        f(inner.violation())
+        let verdict = self.verdict.lock().unwrap_or_else(|e| e.into_inner());
+        f(*verdict)
     }
 
     pub(crate) fn terminal(&self) -> Option<Terminal> {
@@ -882,65 +943,98 @@ mod tests {
     ///
     /// The read half of this is easy to get accidentally right and just as
     /// easy to get wrong: a caller that reads the verdict and then acts on
-    /// it has released the lock, and `record_violation` runs on the reader
-    /// task, on another worker thread. No absence of `.await` in the
-    /// caller excludes another thread.
+    /// it has released the lock, and both publishers -- `record_violation`
+    /// on the reader task and `finish` on the supervisor -- run on other
+    /// threads. No absence of `.await` in the caller excludes them.
     ///
-    /// So the guarantee `with_violation_held` sells is an ORDERING, and
-    /// this asserts it against the real publication path rather than a
-    /// proxy for it: a thread hammering `record_violation` -- exactly what
-    /// the reader loop's `fatal` does -- makes no progress at all for as
-    /// long as the verdict is held, and lands the instant it is released.
+    /// # Why this asserts exclusion and not a counter
     ///
-    /// The window is 100ms against a 1ms hammer: a publisher that is not
-    /// locked out gets ~100 publications in, one that is gets none, and no
-    /// choice of duration changes either. `record_violation` is
-    /// first-wins, so hammering it costs nothing after the first.
+    /// The tempting shape is a publisher hammering in a loop and an
+    /// assertion that its counter did not move. That is unsound twice
+    /// over: the counter not moving is also what you see when the
+    /// publisher had not reached the lock yet (a false PASS on a broken
+    /// build), and the increment lives outside the lock, so a scheduler
+    /// hiccup can move it after a correct hold released (a false FAIL on a
+    /// good one). A flaky guard on a safety property teaches people to
+    /// re-run.
+    ///
+    /// So the witness asserts the exclusion directly: from inside the held
+    /// section, by a handshake that cannot happen anywhere else, it
+    /// `try_lock`s the very latch both publishers write. Held means the
+    /// lock is taken -- there is nothing to time and nothing to lose a
+    /// race to. The channel round-trip pins the observation inside the
+    /// window from both ends: the witness cannot look before the hold is
+    /// entered (it is waiting on `opened`), and the hold cannot return
+    /// before the witness has looked (it is waiting on `observed`).
+    ///
+    /// # Which weaker implementation would pass this?
+    ///
+    /// Not a stale snapshot (`violation()` then act): nothing is held, so
+    /// the try_lock succeeds. Not a re-read just before the act: same.
+    /// Not a hold that releases before the act: the witness looks during
+    /// the act. Not a hold on some OTHER lock: the witness takes this one,
+    /// and the second half -- a real `record_violation` that lands only
+    /// after the hold -- pins that this latch is the one publication goes
+    /// through.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_violation_cannot_be_published_while_the_verdict_is_held() {
         let (mut child, stdin) = silent_child();
         let (kill_tx, _kill_rx) = mpsc::channel(1);
         let mux = Mux::spawn(stdin, kill_tx);
 
-        let published = Arc::new(std::sync::atomic::AtomicU64::new(0));
-        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let publisher = {
+        let (opened_tx, opened_rx) = std::sync::mpsc::channel::<()>();
+        let (observed_tx, observed_rx) = std::sync::mpsc::channel::<bool>();
+        let published = Arc::new(std::sync::atomic::AtomicBool::new(false));
+
+        let witness = {
             let mux = mux.clone();
             let published = published.clone();
-            let stop = stop.clone();
             std::thread::spawn(move || {
-                while !stop.load(std::sync::atomic::Ordering::SeqCst) {
-                    mux.record_violation(ProtocolViolationKind::DuplicateId);
-                    // Counted only once the publication has RETURNED: a
-                    // publisher blocked on the lock has not published.
-                    published.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                    std::thread::sleep(Duration::from_millis(1));
-                }
+                opened_rx.recv().expect("the hold to open the window");
+                let free = mux.violation_latch_is_free();
+                // A real publisher, on the real path, taking the real
+                // lock. It cannot complete until the hold releases; the
+                // assertions below check both halves of that.
+                let publisher = {
+                    let mux = mux.clone();
+                    let published = published.clone();
+                    std::thread::spawn(move || {
+                        mux.record_violation(ProtocolViolationKind::DuplicateId);
+                        published.store(true, std::sync::atomic::Ordering::SeqCst);
+                    })
+                };
+                observed_tx
+                    .send(free)
+                    .expect("the hold to still be waiting");
+                publisher.join().expect("the publisher thread");
             })
         };
 
-        let (before, after) = mux.with_violation_held(|_| {
-            let before = published.load(std::sync::atomic::Ordering::SeqCst);
-            std::thread::sleep(Duration::from_millis(100));
-            (before, published.load(std::sync::atomic::Ordering::SeqCst))
+        let (free, published_during) = mux.with_violation_held(|_| {
+            opened_tx.send(()).expect("the witness thread");
+            let free = observed_rx.recv().expect("the witness to report");
+            (free, published.load(std::sync::atomic::Ordering::SeqCst))
         });
+        witness.join().expect("the witness thread");
 
-        stop.store(true, std::sync::atomic::Ordering::SeqCst);
-        publisher.join().expect("the publisher thread");
-
-        assert_eq!(
-            before, after,
-            "a violation was published while the verdict was held: everything decided \
-             under that hold decided on a verdict that had already moved"
+        assert!(
+            !free,
+            "the violation latch was free while the verdict was held: whatever this \
+             connection was about to commit was decided on a verdict any other thread \
+             could still move"
         );
         assert!(
-            published.load(std::sync::atomic::Ordering::SeqCst) > 0,
-            "the publisher never ran -- this test proves nothing if it did not"
+            !published_during,
+            "a violation was published while the verdict was held"
+        );
+        assert!(
+            published.load(std::sync::atomic::Ordering::SeqCst),
+            "and it lands once the hold is released -- held, not lost"
         );
         assert_eq!(
             mux.violation(),
             Some(ProtocolViolationKind::DuplicateId),
-            "and the violation lands once the hold is released -- held, not lost"
+            "through the same latch the witness proved was locked"
         );
 
         let _ = child.start_kill();

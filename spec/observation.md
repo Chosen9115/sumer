@@ -754,6 +754,16 @@ the sweep judged on or strictly after that sweep is durable. Holding the lock
 that guards the violation state across the commit is the obvious way; any
 mechanism with the same ordering is conforming.
 
+**Only the violation state.** The exclusion MUST NOT extend to the rest of the
+connection. A host that freezes the whole connection for the length of the
+commit stops delivering replies too, and a reply stalled inside the host's own
+reader is a reader that misses whatever deadline the host measures its adapters
+against -- so the adapter gets charged with a violation the host manufactured.
+That is not a safe direction to fail in: under this very condition a false
+violation suppresses a legitimate retraction, so the mechanism meant to keep the
+gate honest becomes a second way to get it wrong. The rule is an ordering on
+publication, and publication is the only thing it may exclude.
+
 This is not retroactive and does not contradict the paragraph above: the
 ordering is *detection, then commitment*. What is forbidden is reconsidering a
 sweep that has already committed. A sweep that has not committed yet is still

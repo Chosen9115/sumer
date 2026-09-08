@@ -333,6 +333,21 @@ impl AdapterHandle {
         self.mux.violation()
     }
 
+    /// Whether this connection's violation latch is free **at this
+    /// instant** -- test support for asserting that a caller inside
+    /// [`AdapterHandle::with_contract_violation_held`] genuinely excludes
+    /// every publisher, rather than merely not being overtaken by one. A
+    /// counter that fails to advance proves nothing; a `try_lock` that
+    /// fails does.
+    ///
+    /// Not a synchronization primitive, and never something to branch on
+    /// in real code: `true` says only that nothing held it when asked.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn violation_latch_is_free(&self) -> bool {
+        self.mux.violation_latch_is_free()
+    }
+
     /// The verdict of [`AdapterHandle::contract_violation`], **held frozen
     /// for the whole of `f`**.
     ///
@@ -345,21 +360,36 @@ impl AdapterHandle {
     /// three does not exclude another thread, and the interval spans
     /// whatever work the decision takes, not a few instructions.
     ///
-    /// This puts the read and the act in one critical section. Everything
-    /// this connection does -- publishing a violation included -- takes the
-    /// same lock, so a violation is established either strictly BEFORE the
-    /// value handed to `f`, or strictly AFTER `f` has returned. That
-    /// ordering is what lets `sumer_store::sweep` say a retraction it
-    /// committed was not licensed by a connection the host had already
-    /// caught lying: not a narrower window, no window.
+    /// This puts the read and the act in one critical section. Both ways a
+    /// violation can be published -- the reader catching a frame, and a
+    /// terminal reason that is itself a violation -- take the same lock,
+    /// so a violation is established either strictly BEFORE the value
+    /// handed to `f`, or strictly AFTER `f` has returned. That ordering is
+    /// what lets `sumer_store::sweep` say a retraction it committed was
+    /// not licensed by a connection the host had already caught lying: not
+    /// a narrower window, no window.
+    ///
+    /// **What is frozen is the verdict, not the connection.** Replies are
+    /// still delivered, ids still issued and tombstoned, and the reader
+    /// still reads while `f` runs. It has to be that way: a lock that
+    /// stopped delivery would stop it inside the reader task, on a runtime
+    /// worker that holds its core while it waits -- which stops the
+    /// runtime's timers, including the drain budget an adapter's stdout is
+    /// measured against, and reports an adapter that merely answered late
+    /// as `StdoutHeldOpen`. That is a wire-contract violation manufactured
+    /// by the very mechanism that exists to report violations honestly,
+    /// and under condition (9) a false violation suppresses a legitimate
+    /// retraction. The only thing `f` blocks is a violation becoming
+    /// established.
     ///
     /// # The contract on `f`
     ///
-    /// * `f` MUST NOT call back into this handle. Every entry point takes
-    ///   the same non-reentrant lock; that is a deadlock, not a wait.
-    /// * `f` MUST NOT be slow. The reader loop, the request pump and every
-    ///   in-flight call are stopped for its duration. It cannot `.await`
-    ///   at all -- the signature sees to that.
+    /// * `f` MUST NOT call back into this handle. `contract_violation`,
+    ///   this function, and the publication paths behind them take the
+    ///   same non-reentrant lock; that is a deadlock, not a wait.
+    /// * `f` MUST NOT be slow. Nothing can be established about this
+    ///   connection's conformance for its duration. It cannot `.await` at
+    ///   all -- the signature sees to that.
     pub fn with_contract_violation_held<T>(
         &self,
         f: impl FnOnce(Option<ProtocolViolationKind>) -> T,
