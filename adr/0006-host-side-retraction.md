@@ -110,6 +110,26 @@ already committed decided on the evidence it had, and decision 3's revision
 comparison revives a wrongly retracted record for free on the next complete
 sweep — so nothing here needs to reach backwards.
 
+Forward-only is about *commitment*, not about *entry*. The gate reads the
+connection's violation state at the moment the sweep commits, not the value it
+was handed on the way in, because a violation does not have to arrive as a
+failed call: an adapter can answer a qualifying final page and break the
+protocol behind that reply, and the host — which cannot un-deliver a reply it
+has already handed over — sees no error at all. Judging the gate on the entry
+snapshot commits the retraction *after* the host has established the connection
+was lying. Re-reading at the commit is still forward-only: detection precedes
+commitment, and no sweep that has already finished is ever reconsidered.
+
+**A violation the host can only establish at the CLOSE is reported, not
+tainted.** Closing the connection is the last thing a refresh does to it, so by
+then every sweep it served has committed; there is nothing left to disqualify,
+and the next refresh gets a different connection that this one's death says
+nothing about. Withholding a retraction is therefore not available and not
+wanted — but silence is not available either. `refresh` records the terminal
+reason as an adapter error, which is what a cron job's exit code carries: a
+refresh must not exit 0 when the last thing the connection did was break the
+wire contract.
+
 The narrowness matters as much as the rule. Only a **contract violation** taints
 — `invalid_request`, or a fatal protocol violation. An honest `err`, a timeout,
 a crash: those are failures in the vocabulary the contract provides, and a host

@@ -36,11 +36,23 @@
 //! confident it looked properly, and this one is not. The conservative
 //! direction costs a stale row; the permissive one destroys a record.
 //!
+//! **(9) is judged at the moment of COMMITMENT**, not at the moment of the
+//! call. A violation does not have to surface as an error: an adapter can
+//! answer a qualifying final page and then, behind that reply, send a
+//! duplicate or a malformed frame. The host kills the connection but cannot
+//! un-deliver the reply, so the caller holds an `Ok` and no error arm ever
+//! runs. The gate therefore asks the connection what it knows at the last
+//! instant inside the final page's transaction -- see
+//! [`AdapterHandle::contract_violation`] -- rather than trusting the value
+//! it was handed on the way in.
+//!
 //! The taint is FORWARD-ONLY: it disqualifies every sweep that starts after
-//! the violation, not the ones already committed. The adapter-wide reads
-//! (`hello`, `resources.list`, `status.read`, `balances.read`) all precede
-//! every sweep, so a violation there taints all of them; a violation inside
-//! one resource's own page loop taints the siblings swept after it. Nothing
+//! the violation, not the ones already committed. Detection-then-commitment
+//! is not retroactivity: this sweep has not committed yet. The adapter-wide
+//! reads (`hello`, `resources.list`, `status.read`, `balances.read`) all
+//! precede every sweep, so a violation there taints all of them; a violation
+//! inside one resource's own page loop taints the siblings swept after it.
+//! Nothing
 //! reaches backwards, because nothing has to: a sweep that already
 //! committed decided on the evidence it had, and a wrongly retracted record
 //! revives on the next complete sweep that carries it (§8.4).
@@ -230,9 +242,13 @@ struct Gate {
     not_fetched: Option<String>,
     /// Condition (9), and the only input to this gate that the page loop
     /// did not observe: a wire-contract violation this connection
-    /// committed EARLIER IN THIS REFRESH, on a read that is not this
-    /// sweep's. Carries the reason so the crawl row says which violation,
-    /// not merely that there was one.
+    /// committed on a read that is not this sweep's. Carries the reason so
+    /// the crawl row says which violation, not merely that there was one.
+    ///
+    /// Seeded from the snapshot the caller took before this sweep began,
+    /// and **re-read from the live connection immediately before the
+    /// commit** -- a violation the host detected behind an already-
+    /// delivered reply never becomes an error anyone here could see.
     connection_violation: Option<String>,
 }
 
@@ -553,6 +569,49 @@ pub async fn sweep_resource(
             report.new += counts.new;
             report.revised += counts.revised;
             report.unchanged += counts.unchanged;
+
+            // ---- CONDITION (9), RE-READ AT THE MOMENT OF COMMITMENT --
+            //
+            // `input.connection_violation` is a SNAPSHOT taken before this
+            // sweep sent its first request, and a violation does not have
+            // to surface as an error to the caller to have happened. An
+            // adapter can answer this page perfectly -- drained, fetched,
+            // exact -- and then, in the same breath, send a duplicate reply
+            // or a malformed frame. The host kills the connection for it,
+            // but it cannot retract a reply it has already handed over, so
+            // the page loop above sees `Ok(read)` and never enters the
+            // error arm `broke_the_contract` lives in. Judging (9) on the
+            // snapshot commits the retraction on the evidence of a
+            // connection the host has ALREADY caught lying.
+            //
+            // So the gate asks the connection what it knows NOW, and it
+            // asks here: inside the one transaction, after the last page is
+            // ingested, at the last instant before the disqualifier is
+            // decided. There is no await left between this read and the
+            // commit, so nothing this sweep does widens the gap. What is
+            // left is the microseconds a reader running on another thread
+            // might still need to judge a frame already in flight -- and a
+            // frame the host has not judged is not yet a violation to
+            // anyone, which is the honest limit of the condition, not a
+            // hole in it. Reading any earlier reopens exactly the window
+            // the entry snapshot had, just a narrower one.
+            //
+            // Still FORWARD-ONLY: this is detection BEFORE commitment, not
+            // a sweep reconsidered after it committed. Sweeps that already
+            // finished keep their verdicts (`adr/0006` decision 1).
+            if gate.connection_violation.is_none() {
+                if let Some(kind) = adapter.contract_violation() {
+                    let reason = format!(
+                        "the connection broke the wire contract: {}",
+                        HostError::ProtocolViolation(kind)
+                    );
+                    // And the siblings swept after this one inherit it,
+                    // the same way a violation on this sweep's own
+                    // `history.read` does.
+                    report.contract_violation = Some(reason.clone());
+                    gate.connection_violation = Some(reason);
+                }
+            }
 
             let disqualifier = gate.disqualifier();
             if let Some(reason) = &disqualifier {

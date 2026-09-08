@@ -162,7 +162,23 @@ fn cmd_connect(profile: &Profile, argv: &[String]) -> sumer_store::Result<ExitCo
         let adapter_id = handle.hello().adapter_id.clone();
         let derivation = handle.hello().local_id_derivation.clone();
         let listed = handle.resources_list().await?;
-        let _ = handle.close().await;
+        // A protocol violation on the way out refuses the connection.
+        //
+        // `connect` is the one command whose result is DURABLE: it writes an
+        // argv into the profile that every later `refresh` will spawn and
+        // trust. An adapter that answered `hello` and `resources.list`
+        // correctly and then broke the wire contract has told us what it is,
+        // and registering it anyway would bake that into the profile -- where
+        // the next refresh meets it as an established adapter rather than as
+        // a candidate. Gate condition (9) exists because a connection that
+        // violates the contract cannot be trusted to license a retraction;
+        // the same connection has no business being written down as one we
+        // will re-spawn.
+        if let Some(sumer_host::Terminal::Violation(kind)) = handle.close().await {
+            return Err(StoreError::Host(format!(
+                "the adapter broke the wire contract as it exited ({kind:?});                  nothing was written to the profile"
+            )));
+        }
         Ok::<_, StoreError>(((adapter_id, derivation), listed.resources))
     })?;
     let (adapter_id, derivation) = adapter_id;

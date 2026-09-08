@@ -235,3 +235,76 @@ fn a_second_writer_exits_three_and_a_reader_still_works() {
     let (_, _, code) = cli.run(&["refresh"]);
     assert_ne!(code, 3, "the lock is released when its holder goes away");
 }
+
+/// **A `connect` whose adapter breaks the contract on the way out writes
+/// nothing.**
+///
+/// `connect` is the one command whose result is durable. It records an argv
+/// that every later `refresh` spawns and trusts, so an adapter that answers
+/// `hello` and `resources.list` correctly and then breaks the wire contract
+/// must not be written down: the next refresh would meet it as an
+/// established adapter rather than as a candidate that failed its audition.
+/// Gate condition (9) refuses to let such a connection license a retraction;
+/// this refuses to let it become one we re-spawn.
+///
+/// The adapter writes an unterminated frame and exits. Nothing will ever
+/// terminate it, so it is detectable only at end of stream -- after both
+/// replies were delivered and judged good, which is exactly why discarding
+/// `close()` hid it.
+#[test]
+fn connect_refuses_an_adapter_that_breaks_the_contract_on_exit() {
+    if !support::python3_available() {
+        eprintln!("python3 not found on PATH -- skipping");
+        return;
+    }
+    build("sumer-store");
+    let cli = Cli {
+        binary: binary("sumer"),
+        profile: Scratch::new("connect-violation").path().join("profile"),
+    };
+    cli.ok(&["init"]);
+
+    let (stdout, stderr, code) = cli.run(&["connect", "python3", "-c", HONEST_THEN_TRUNCATED]);
+
+    assert_ne!(
+        code, 0,
+        "connect must fail on a contract violation\n{stdout}\n{stderr}"
+    );
+    assert!(
+        stderr.contains("broke the wire contract"),
+        "the operator is told what happened, not just that it failed: {stderr}"
+    );
+    // The real assertion: the profile is untouched. A message the user can
+    // read is worth little if the argv landed anyway.
+    let listed = cli.ok(&["status"]);
+    assert!(
+        !listed.contains("fake-adapter"),
+        "nothing was written to the profile:\n{listed}"
+    );
+}
+
+/// Answers `hello` and `resources.list`, then writes a frame with no
+/// terminating newline and exits.
+const HONEST_THEN_TRUNCATED: &str = r#"
+import sys, json
+def send(o):
+    sys.stdout.write(json.dumps(o) + "\n")
+    sys.stdout.flush()
+while True:
+    line = sys.stdin.readline()
+    if not line:
+        break
+    req = json.loads(line)
+    i, op = req["id"], req["op"]
+    if op == "hello":
+        send({"id": i, "ok": {"protocol": "1", "adapter_id": "fake-adapter",
+              "adapter_version": "0.1.0", "local_id_derivation": "fixture-literal@1",
+              "capabilities": ["resources.list", "balances.read", "history.read", "status.read"],
+              "max_in_flight": 1}})
+    elif op == "resources.list":
+        send({"id": i, "ok": {"resources": [{"resource_id": "acct", "provider_id": "p1",
+              "kind": "bank_checking", "label": "Checking"}]}})
+        sys.stdout.write('{"id": 99, "ok": {}')
+        sys.stdout.flush()
+        break
+"#;

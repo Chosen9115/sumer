@@ -704,7 +704,7 @@ nine of these hold:
 | 6 | Every page reported `cursor_resumable: exact` | Derived from §5: `batch_restart`'s intermediate cursor is explicitly not trusted across a resume and `none` has no durable cursor at all, so neither family supports the claim "this read covered the whole span between its start and its drain." A resource in either family therefore never produces a complete sweep, and never retracts. |
 | 7 | It ran over **one connection**, whose hello `local_id_derivation` (`spec/wire.md` §4) the host recorded against that crawl | The ids a sweep is compared against are only comparable to the ids it emitted if one derivation produced both. |
 | 8 | Every observation's `provenance.adapter_id` was the connection's own | §3 keys every per-record structure by `(adapter_id, local_id)`, and a host keys the rows it is about to compare against by the adapter it is connected to. An observation naming another adapter means those two keyings have come apart, and the host is holding two notions of one chain. **A host cannot conclude an absence from a set it cannot key.** |
-| 9 | The connection broke **no wire contract anywhere in this refresh**, including on reads that were not this sweep's |  A host derives absence from the *shape* of a read, so it has to be able to trust that the connection is answering the questions it was asked. An adapter that has just answered one nobody asked has demonstrated it is not. Absence is evidence only when the host is confident it looked properly. |
+| 9 | The connection had broken **no wire contract anywhere in this refresh**, including on reads that were not this sweep's — judged against what the host has established **at the moment this sweep commits**, not merely at the moment of each call | A host derives absence from the *shape* of a read, so it has to be able to trust that the connection is answering the questions it was asked. An adapter that has just answered one nobody asked has demonstrated it is not. Absence is evidence only when the host is confident it looked properly. **A violation need not surface as a failed call**: it can arrive behind a reply the host has already delivered, so a host that judges this condition on a value captured when the sweep started will commit on evidence it has already disproved. |
 
 **Failing any one of the nine makes the sweep PARTIAL.** A partial sweep still
 persists every observation it read — those are evidence, and evidence is never
@@ -729,6 +729,25 @@ has not started yet has no such excuse. In practice the adapter-wide reads
 (`hello`, `resources.list`, `status.read`, `balances.read`) all precede every
 sweep, so a violation there taints all of them; a violation inside one
 resource's own `history.read` taints that resource's siblings swept after it.
+
+**(9) is judged at the moment of COMMITMENT.** A violation is not always
+something a read *returns*. An adapter may answer a qualifying final page —
+drained, `fetched`, `exact` — and, in the same breath, send a duplicate reply or
+a malformed frame. The host detects it and ends the connection, but it cannot
+un-deliver a reply already handed to the caller, and it MUST NOT: a delivered
+reply is delivered. So the sweep holds a successful read and no error arm ever
+runs. A host MUST therefore evaluate (9) against the violation state of the
+connection **as of the instant it commits** the sweep's verdict — inside the
+same decision as the other eight conditions, so that a violation established
+between the last reply and the commit disqualifies rather than being raced past.
+
+This is not retroactive and does not contradict the paragraph above: the
+ordering is *detection, then commitment*. What is forbidden is reconsidering a
+sweep that has already committed. A sweep that has not committed yet is still
+deciding, and it must decide on everything the host knows by then. A host can
+only answer for violations it has judged by that instant — bytes still in
+flight are nobody's violation yet — and that is the honest limit of the
+condition, not a licence to read the answer early.
 
 It is a **condition in this list**, not a separate taint mechanism sitting
 beside it, and that placement is the decision. This table's whole value is that

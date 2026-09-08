@@ -105,6 +105,14 @@ struct MuxInner {
     next_id: u64,
     slots: HashMap<u64, Slot>,
     terminal: Option<Terminal>,
+    /// The first fatal protocol violation this connection was **caught
+    /// committing**, published at the instant the reader decoded it --
+    /// which is strictly earlier than `terminal`, and that gap is the
+    /// whole point. `terminal` is latched by `process::supervise`, one
+    /// child reap and one reader-drain later; a caller that asks "has this
+    /// connection broken the contract?" in between would be told no about
+    /// a violation the host had already seen.
+    violation: Option<ProtocolViolationKind>,
 }
 
 /// The outcome of delivering a reply to a legitimately-tracked id.
@@ -274,6 +282,7 @@ impl Mux {
                 next_id: 0,
                 slots: HashMap::new(),
                 terminal: None,
+                violation: None,
             }),
             outbox: tx,
             semaphore: semaphore.clone(),
@@ -409,6 +418,41 @@ impl Mux {
     /// cancel. Idempotent, and safe on a connection that is already gone.
     pub(crate) fn begin_close(&self) {
         self.closing.notify_one();
+    }
+
+    /// Publishes a fatal protocol violation **the moment it is decoded**,
+    /// before the child has been killed and before a terminal reason is
+    /// latched. First one wins, for the same reason [`Mux::finish`] keeps
+    /// the first reason: what a connection did first is what it did.
+    ///
+    /// This is deliberately not `finish`: finishing resolves every pending
+    /// call, which is `supervise`'s decision to make once it owns the
+    /// child's fate. All this does is record what the host now knows.
+    fn record_violation(&self, kind: ProtocolViolationKind) {
+        let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        inner.violation.get_or_insert(kind);
+    }
+
+    /// Has this connection been **established** to have broken the wire
+    /// contract, as of this instant? The live query behind §8.1 condition
+    /// (9).
+    ///
+    /// Both sources, because a violation can be established either way and
+    /// a caller asking this question does not care which: the reader
+    /// catching a frame (`violation`, the early one), or a terminal reason
+    /// that is itself a violation -- `AdapterHandle::close`'s
+    /// `StdinEofIgnored` / `StdoutHeldOpen`, which are only knowable at the
+    /// close and never pass through the reader at all.
+    ///
+    /// It is a snapshot, and honestly so: it answers for what the host has
+    /// judged by now, not for what the adapter has written. A frame still
+    /// in flight is not yet a violation to anyone.
+    pub(crate) fn violation(&self) -> Option<ProtocolViolationKind> {
+        let inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        inner.violation.or(match inner.terminal {
+            Some(Terminal::Violation(kind)) => Some(kind),
+            _ => None,
+        })
     }
 
     pub(crate) fn terminal(&self) -> Option<Terminal> {
@@ -683,6 +727,19 @@ pub async fn read_loop(
             ProtocolViolationKind::PreHelloOutput
         }
     };
+    // Every fatal exit from this loop goes through here, and the ORDER
+    // inside it is the contract: the violation is published on the mux
+    // *first*, then the kill is requested. `supervise` will latch the same
+    // kind as the terminal reason once it has reaped the child, but that
+    // is a channel hop and a process wait away -- and a caller holding a
+    // reply this connection has already handed it can commit on that reply
+    // in between. Publishing at the point of decode is what makes
+    // `Mux::violation` answer for the frame the host has just judged
+    // rather than for the frame it judged some scheduling ago.
+    let fatal = |kind: ProtocolViolationKind| {
+        mux.record_violation(kind);
+        let _ = kill_tx.try_send(Some(kind));
+    };
     loop {
         let n = match stdout.read(&mut buf).await {
             Ok(0) => {
@@ -691,10 +748,10 @@ pub async fn read_loop(
                 // but an in-progress frame at this point is: nothing will
                 // ever terminate it, and it is not the host's to discard.
                 if decoder.pending_bytes() > 0 {
-                    let _ = kill_tx.try_send(Some(classify(
+                    fatal(classify(
                         hello_done,
                         ProtocolViolationKind::UnterminatedFrame,
-                    )));
+                    ));
                 }
                 return;
             }
@@ -711,12 +768,12 @@ pub async fn read_loop(
         for frame in frames {
             let received_at = crate::time::now_rfc3339();
             if let Err(kind) = mux.on_frame(&mut hello_done, frame, received_at) {
-                let _ = kill_tx.try_send(Some(kind));
+                fatal(kind);
                 return;
             }
         }
         if let Err(kind) = push_result {
-            let _ = kill_tx.try_send(Some(classify(hello_done, kind)));
+            fatal(classify(hello_done, kind));
             return;
         }
     }

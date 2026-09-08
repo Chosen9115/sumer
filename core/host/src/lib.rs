@@ -305,6 +305,34 @@ impl AdapterHandle {
             .unwrap_or_default()
     }
 
+    /// Whether this connection has been **established** to have broken the
+    /// wire contract, as of the instant this is called.
+    ///
+    /// A live query, not a value handed out earlier: the whole reason it
+    /// exists is that a violation can arrive *behind* a reply this
+    /// connection already delivered successfully. The reply is delivered
+    /// -- a delivered reply is delivered, and the host does not retract one
+    /// -- but the caller about to act on it can still ask whether anything
+    /// has since disqualified the connection that served it. That is
+    /// `spec/observation.md` §8.1 condition (9)'s "at the moment of
+    /// commitment", and `sumer_store::sweep` asks it inside the same
+    /// transaction that commits a retraction.
+    ///
+    /// Honest about what it answers: what the host has JUDGED by now, not
+    /// what the adapter has written. Bytes still in the pipe are nobody's
+    /// violation yet. What it does guarantee is that everything the reader
+    /// decoded before it handed over the reply you are holding has already
+    /// been judged -- the reader publishes a violation before it stops.
+    ///
+    /// `None` on a connection the host has caught doing nothing wrong,
+    /// including one that merely failed, timed out, or died: those are
+    /// failures in the vocabulary the contract provides, not violations of
+    /// it.
+    #[must_use]
+    pub fn contract_violation(&self) -> Option<ProtocolViolationKind> {
+        self.mux.violation()
+    }
+
     /// Ends this connection and reports **how it ended**.
     ///
     /// Closing the child's stdin (see [`mux::Mux::begin_close`]) makes a

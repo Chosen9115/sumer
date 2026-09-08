@@ -95,8 +95,29 @@ pub async fn refresh(store: &mut Store, options: &RefreshOptions) -> Result<Refr
         .await;
         // The connection is ended either way: `close` is what makes "the
         // adapter answered everything and then broke the protocol"
-        // observable at all.
-        let _ = handle.close().await;
+        // observable at all -- and a fact nobody looks at is not observable
+        // at all, so the terminal reason is REPORTED. A refresh that
+        // discarded it could finish silently, exit 0, and never mention
+        // that the last thing the connection did was break the protocol.
+        //
+        // It is reported and it does not taint, and both halves are the
+        // same rule. Condition (9) is connection-scoped and forward-only:
+        // by the time a connection can be closed, every sweep it served has
+        // already committed on the evidence it had, and the NEXT refresh
+        // gets a new connection that this one's death says nothing about.
+        // There is nothing left to withhold a retraction from -- so the
+        // only honest thing left to do with it is say it out loud, where a
+        // cron job's exit code carries it (`RefreshReport::failed`).
+        //
+        // Only a VIOLATION. `Terminal::Crashed` is the ordinary end of a
+        // cooperative adapter that exited on stdin EOF, exactly as
+        // `spec/wire.md` §7 tells it to.
+        if let Some(sumer_host::Terminal::Violation(kind)) = handle.close().await {
+            report.adapter_errors.push((
+                adapter.adapter_id.clone(),
+                format!("the connection ended in a wire-contract violation: {kind:?}"),
+            ));
+        }
         match sweeps {
             Ok(adapter_refresh) => {
                 report.sweeps.extend(adapter_refresh.sweeps);

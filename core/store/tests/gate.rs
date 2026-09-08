@@ -874,3 +874,247 @@ async fn a_violation_in_one_sweep_disqualifies_the_next() {
         "the evidence it did read still persists"
     );
 }
+
+/// **A violation that arrives BEHIND a successful reply still disqualifies
+/// the sweep it arrives during.**
+///
+/// The other (9) cases all reach the gate as an `Err` some call returned.
+/// This one cannot: the adapter answers the final page perfectly --
+/// drained, `fetched`, `exact` -- and then, in the same breath, sends a
+/// duplicate reply. The host detects it and kills the connection, but a
+/// delivered reply is delivered: it cannot be retracted out of the
+/// caller's hands, and `core/host/tests/supervisor.rs`'s
+/// `duplicate_reply_is_a_fatal_violation` pins that as correct transport
+/// behaviour. So the sweep is holding `Ok(read)` and no error arm ever
+/// runs.
+///
+/// The bug that shape found: condition (9) was judged against the value
+/// the sweep was handed on the way IN, so it committed the retraction of
+/// `drop` **after the host had already established that the connection
+/// broke the protocol**. Detection, then commitment -- and the gate never
+/// asked the second time.
+///
+/// # Why this is a schedule, not a race
+///
+/// `reply_ok_raw` writes `{"id":N,"ok":<body_json>}\n` to stdout
+/// **verbatim, in one write**. Closing that envelope early inside
+/// `body_json` and appending a second frame therefore puts BOTH lines in
+/// that single write, so the host's next `read` returns both, the decoder
+/// yields both, and the reader loop judges them in one synchronous pass:
+/// it delivers the page, then hits the duplicate and publishes the
+/// violation, all before the runtime can poll the task waiting on that
+/// reply. Two separate writes would leave it to the scheduler which of the
+/// two the host had seen by the time the sweep committed -- and a test
+/// that asserts a fix on a coin flip is not a test.
+///
+/// The duplicate names id `0` -- the hello, the one id every connection
+/// has already answered, and the only one whose value the fixture can know
+/// without guessing at the host's counter.
+#[tokio::test]
+async fn a_violation_behind_the_final_reply_disqualifies_before_the_commit() {
+    if !support::python3_available() {
+        eprintln!("python3 not found on PATH -- skipping");
+        return;
+    }
+    let scratch = Scratch::new("violation-behind-the-reply");
+
+    // The final page, spelled out: `reply_ok_raw` goes on the wire
+    // verbatim, so nothing here gets the fixture defaults filled in.
+    let body = json!({
+        "observations": [{
+            "resource_id": support::RESOURCE_ID,
+            "local_id": "keep",
+            "state": "active",
+            "surface": "s",
+            "posting": "posted",
+            "amount": {"asset": "usd", "amount": "11.00"},
+            "raw_sign": "provider_positive",
+            "description": "keep",
+            "provenance": {
+                "adapter_id": ADAPTER_ID,
+                "provider_id": "p1",
+                "surface": "s",
+                "observed_at": "2026-01-01T00:00:00Z",
+                "completeness": "complete"
+            }
+        }],
+        "statuses": [{
+            "resource_id": support::RESOURCE_ID,
+            "outcome": {"fetched": {"page_empty": false}},
+            "page": {"cursor_resumable": "exact", "next": null}
+        }]
+    });
+    // `<body>}\n{"id":0,"ok":{}` -- the adapter supplies the leading
+    // `{"id":N,"ok":` and the trailing `}\n`, which closes the second frame.
+    let smuggled = format!("{body}}}\n{{\"id\":0,\"ok\":{{}}");
+
+    let fixture = fixture(
+        &scratch,
+        vec![
+            plant(),
+            Run::new(vec![json!({
+                "when": {},
+                "do": [{"op": "reply_ok_raw", "body_json": smuggled}]
+            })]),
+        ],
+    );
+    let mut store = store(&scratch);
+    refresh_run(&mut store, &fixture, 0, SweepOptions::default()).await;
+
+    let report = only(
+        refresh_run(&mut store, &fixture, 1, SweepOptions::default())
+            .await
+            .0,
+    );
+
+    // The reply LANDED and was ingested -- this is what makes the case the
+    // one it claims to be. Without it the test would pass just as happily
+    // against a run where the duplicate arrived first and the page was
+    // never delivered at all, which is the ordinary error arm and proves
+    // nothing.
+    assert_eq!(
+        report.error, None,
+        "this sweep's own reads all SUCCEEDED: the violation never reached it as an error"
+    );
+    assert_eq!(
+        chain_len(&store, "keep"),
+        2,
+        "the final page was delivered and ingested -- a partial sweep still persists its evidence"
+    );
+
+    assert!(
+        !report.complete,
+        "a sweep must not complete on a connection the host has already caught violating"
+    );
+    let reason = report
+        .disqualified_reason
+        .as_deref()
+        .expect("a disqualified sweep records why");
+    assert!(
+        reason.contains("the connection broke the wire contract"),
+        "and it says which violation: {reason:?}"
+    );
+    assert_eq!(
+        retractions(&store),
+        Vec::<(String, String)>::new(),
+        "NOTHING is retracted on the evidence of that connection"
+    );
+    assert!(
+        live_ids(&store).contains(&"drop".to_owned()),
+        "the record the page omitted stays live"
+    );
+}
+
+// ---------------------------------------------------------------------
+// (9)'s companion: the violation NO sweep could ever have seen
+// ---------------------------------------------------------------------
+
+/// **A terminal violation must reach the refresh report.**
+///
+/// This is the one violation condition (9) structurally cannot act on: the
+/// adapter answers every read cleanly and breaks the protocol on the way
+/// out, so by the time it is knowable at all -- `close()` is what makes it
+/// knowable, and closing is the last thing a refresh does to a connection
+/// -- every sweep on that connection has already committed. Nothing is
+/// left to disqualify, and reaching back to un-commit them is precisely
+/// what `adr/0006` forbids.
+///
+/// So it is not a taint. It is a REPORT, and the thing being fixed here is
+/// that `refresh` threw it away: `let _ = handle.close().await`. A refresh
+/// that discards it finishes quietly and **exits 0** while the last thing
+/// the connection did was break the wire contract. `RefreshReport::failed`
+/// is the cron job's exit code, and this is the assertion that keeps it
+/// honest.
+///
+/// The adapter here writes a frame with no terminating newline and exits:
+/// nothing will ever terminate it, it is not the host's to discard, and it
+/// is only detectable at end of stream -- after every reply this refresh
+/// asked for had already been delivered and judged.
+#[tokio::test]
+async fn a_violation_on_the_way_out_reaches_the_refresh_report() {
+    if !support::python3_available() {
+        eprintln!("python3 not found on PATH -- skipping");
+        return;
+    }
+    let scratch = Scratch::new("terminal-violation");
+    let store = store(&scratch);
+    // `refresh` spawns the adapter itself, from the argv on file, and
+    // forwards no environment -- so this one cannot be the fixture-driven
+    // fake adapter, which is configured entirely through `SUMER_FIXTURE`.
+    sumer_store::store::upsert_adapter(
+        store.conn(),
+        ADAPTER_ID,
+        &[
+            "python3".to_owned(),
+            "-c".to_owned(),
+            HONEST_UNTIL_THE_END.to_owned(),
+        ],
+    )
+    .unwrap();
+    let mut store = store;
+
+    let report = sumer_store::refresh::refresh(&mut store, &Default::default())
+        .await
+        .expect("the refresh itself completes -- every read was answered");
+
+    assert_eq!(
+        report.sweeps.len(),
+        1,
+        "the adapter answered everything it was asked: {:?}",
+        report.sweeps
+    );
+    assert_eq!(
+        report
+            .adapter_errors
+            .iter()
+            .map(|(_, message)| message.as_str())
+            .collect::<Vec<_>>(),
+        vec!["the connection ended in a wire-contract violation: UnterminatedFrame"],
+        "how the connection ENDED is part of the report"
+    );
+    assert!(
+        report.failed(),
+        "and a refresh whose adapter broke the protocol on the way out does not exit 0"
+    );
+}
+
+/// An adapter that answers every read of one refresh correctly and then,
+/// on its way out, writes a frame it never terminates.
+const HONEST_UNTIL_THE_END: &str = r#"
+import sys, json
+def send(o):
+    sys.stdout.write(json.dumps(o) + "\n")
+    sys.stdout.flush()
+fetched = {"fetched": {"page_empty": False}}
+while True:
+    line = sys.stdin.readline()
+    if not line:
+        break
+    req = json.loads(line)
+    i, op = req["id"], req["op"]
+    if op == "hello":
+        send({"id": i, "ok": {"protocol": "1", "adapter_id": "fake-adapter",
+              "adapter_version": "0.1.0", "local_id_derivation": "fixture-literal@1",
+              "capabilities": ["resources.list", "balances.read", "history.read", "status.read"],
+              "max_in_flight": 1}})
+    elif op == "resources.list":
+        send({"id": i, "ok": {"resources": [{"resource_id": "acct", "provider_id": "p1",
+              "kind": "bank_checking", "label": "Checking"}]}})
+    elif op == "status.read":
+        send({"id": i, "ok": {"statuses": [{"resource_id": "acct", "outcome": fetched}]}})
+    elif op == "balances.read":
+        send({"id": i, "ok": {"observations": [], "statuses": [
+              {"resource_id": "acct", "outcome": {"fetched": {"page_empty": True}}}]}})
+    elif op == "history.read":
+        send({"id": i, "ok": {"observations": [{"resource_id": "acct", "local_id": "keep",
+              "state": "active", "surface": "s", "posting": "posted", "raw_sign": "provider_positive",
+              "amount": {"asset": "usd", "amount": "10.00"}, "description": "keep",
+              "provenance": {"adapter_id": "fake-adapter", "provider_id": "p1", "surface": "s",
+                             "observed_at": "2026-01-01T00:00:00Z", "completeness": "complete"}}],
+              "statuses": [{"resource_id": "acct", "outcome": fetched,
+                            "page": {"cursor_resumable": "exact", "next": None}}]}})
+        # No newline: a frame nothing will ever terminate.
+        sys.stdout.write('{"id":99,"ok":')
+        sys.stdout.flush()
+        sys.exit(0)
+"#;

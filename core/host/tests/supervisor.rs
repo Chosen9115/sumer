@@ -182,6 +182,55 @@ async fn duplicate_reply_is_a_fatal_violation() {
     );
 }
 
+/// **A violation behind a delivered reply is visible the instant the
+/// caller has that reply.**
+///
+/// The test above is the transport half: the first reply is delivered, and
+/// it stays delivered. This is the half the caller needs to be able to act
+/// on it. A caller that got an `Ok` and is about to DESTROY something on
+/// the strength of it (`sumer_store::sweep` retracting a record absent from
+/// a complete sweep) has to be able to ask whether the connection that
+/// served it has since been caught breaking the contract -- and get the
+/// answer now, not one `close()` later.
+///
+/// So: no sleep. The test above needs 150ms because `Terminal` is only
+/// latched after `supervise` reaps the child; `contract_violation` is
+/// published by the reader at the point of DECODE, and the reader judges
+/// every frame it has decoded before it hands control back. Both frames go
+/// out in one `write`, so both arrive in one `read`, so the violation is
+/// established before the task awaiting the reply is ever polled. If this
+/// ever needs a sleep to pass, that guarantee is gone and every gate built
+/// on it is racing.
+#[tokio::test]
+async fn a_violation_behind_a_delivered_reply_is_visible_at_once() {
+    // ONE write carrying the reply and its duplicate -- see above.
+    let script = format!(
+        "{PRELUDE}\nhello_ok(read())\nreq = read()\nf = json.dumps({{'id': req['id'], 'ok': {{'resources': []}}}})\nsys.stdout.write(f + '\\n' + f + '\\n')\nsys.stdout.flush()\n"
+    );
+    let handle = spawn(&script, Duration::from_secs(2))
+        .await
+        .expect("handshake");
+    assert!(
+        handle.contract_violation().is_none(),
+        "nothing is established against a connection that has only said hello"
+    );
+
+    let reply = handle.resources_list().await;
+    assert!(
+        reply.is_ok(),
+        "the legitimate reply is delivered: {reply:?}"
+    );
+    assert!(
+        matches!(
+            handle.contract_violation(),
+            Some(ProtocolViolationKind::DuplicateId)
+        ),
+        "the violation riding in behind that reply is established by the time the caller \
+         holds it, got {:?}",
+        handle.contract_violation()
+    );
+}
+
 // ---------------------------------------------------------------------
 // Crash and hang
 // ---------------------------------------------------------------------
