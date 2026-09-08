@@ -44,16 +44,16 @@ The normative rule is `spec/observation.md` §8, which binds any host and not
 only this one (with the two rules revision 1 added stated in §2 and §3). This ADR records why these mechanisms were chosen over their
 alternatives, and what they cost.
 
-### 1. The evidence is a complete sweep, and it has eight gates
+### 1. The evidence is a complete sweep, and it has nine gates
 
 A **sweep** is one `history.read` for one resource. Retraction is licensed only
 by a sweep that (1) began at `page: None`, (2) ran on one adapter process and
 one crawl, (3) drained to `next: null`, (4) reported `fetched` on every page,
 (5) carried no *anonymous* `degraded` entry, (6) reported
 `cursor_resumable: exact` on every page, (7) ran over one connection whose
-hello `local_id_derivation` is recorded on the crawl row, and (8) carried no
-observation whose
-`provenance.adapter_id` was not that connection's own.
+hello `local_id_derivation` is recorded on the crawl row, (8) carried no
+observation whose `provenance.adapter_id` was not that connection's own, and
+(9) ran on a connection that broke no wire contract anywhere in that refresh.
 
 Fail any one and the sweep is **partial**: its observations still persist as
 evidence, and nothing is retracted.
@@ -92,6 +92,29 @@ Bitcoin adapter re-walks the whole history on any crawl regardless. The cursor
 is **dropped** when the resource's fingerprint or the adapter's derivation
 changes, which discharges ADR 0004's binding paragraph on this PR, and no
 `page: None` request ever carries a cursor.
+
+**The ninth gate is refresh-scoped, and it is a gate rather than a taint.**
+Conditions 1–8 judge one sweep. Condition 9 judges the connection across the
+whole refresh: a `balances.read` that broke the wire contract disqualifies
+every sweep that follows it on that connection. The alternative considered was
+a refresh-scoped *taint* — a flag outside §8.1 that suppresses retraction
+without joining the list. Rejected: §8.1's value is that it is exhaustive, and
+a second disqualification path that does not appear in it turns the list into a
+trap for the next reader. Conditions 2 and 7 are already connection-scoped, so
+the list was never purely per-page, and the audit row
+(`crawl.disqualified_reason`) keeps one vocabulary instead of two.
+
+The taint is forward-only: a violation disqualifies every sweep that starts
+after it, and the adapter-wide reads all precede every sweep. A sweep that
+already committed decided on the evidence it had, and decision 3's revision
+comparison revives a wrongly retracted record for free on the next complete
+sweep — so nothing here needs to reach backwards.
+
+The narrowness matters as much as the rule. Only a **contract violation** taints
+— `invalid_request`, or a fatal protocol violation. An honest `err`, a timeout,
+a crash: those are failures in the vocabulary the contract provides, and a host
+that treated them as taint would disable retraction on any rate-limited
+balances call.
 
 ### 2. One transaction
 
@@ -275,6 +298,18 @@ absent one. Refusing whole is only safe because a refused read writes no row:
 what is on screen goes stale rather than staying `live` with another adapter's
 number on it. Under the marker scheme that refusal would have owed a marker
 path of its own — a sixth path to enumerate.
+
+**Bounded by the request, not by the status.** The rule refuses a volunteered
+balance whether or not the reply carries a status entry for it. The
+status-bounded version — refuse a balance whose resource has no status — was
+the obvious one and is rejected: it accepts the reply that carries *both* a
+volunteered balance and a volunteered `fetched` status for the resource it just
+stopped listing, which is the same figure on the same screen reading the same
+`live`, with better paperwork. The request is the one bound the adapter does
+not also author. It is also the cheaper rule to hold: bounding by the request
+makes "a balance whose resource has no status entry" unreachable rather than
+merely unlikely, since coverage already gives every requested resource exactly
+one status.
 
 **And one admission rule the derivation did not cover.** Deriving freshness
 answers *which read wrote this row*; it says nothing about which rows are
@@ -480,4 +515,4 @@ additive to the observation chain, so a host that stopped deriving absence
 entirely would show a superset of records and lose no evidence. What is
 expensive is loosening a gate — a host that retracts on weaker evidence than
 this cannot un-tell a user that their history was missing, which is why the
-eight conditions are spec text rather than an implementation detail.
+nine conditions are spec text rather than an implementation detail.

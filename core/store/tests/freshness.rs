@@ -180,6 +180,63 @@ async fn a_balance_for_a_resource_nobody_asked_about_is_refused() {
     );
 }
 
+/// **And a status beside the figure does not buy it in.** The rule above is
+/// bounded by the REQUEST, not by whether a status happens to exist. This is
+/// the reply that separates the two: the adapter has stopped listing the
+/// account, so nobody asked about it, and it volunteers a balance *and* a
+/// matching `fetched` status for it anyway -- honest provenance, plausible
+/// figure, complete paperwork.
+///
+/// A status-bounded rule (`adr/0006` records it as the rejected alternative)
+/// accepts this one: the status is right there, so the figure gets a §6
+/// outcome and a `Live` staleness derived from it, and `999.00` goes back on
+/// screen reading `live` for a resource the listing dropped. That is the same
+/// user-facing bug as the unstatused case, with better paperwork -- and the
+/// weaker rule passes the unstatused test, which is why this one has to
+/// exist.
+#[tokio::test]
+async fn a_volunteered_balance_is_refused_even_when_a_status_comes_with_it() {
+    if !support::python3_available() {
+        return;
+    }
+    let scratch = Scratch::new("statused-volunteered-balance");
+    let fixture = fixture(
+        &scratch,
+        vec![
+            Run::new(Vec::new()).balances(vec![balance("available", Some("42.00"))]),
+            Run::new(Vec::new())
+                .lists(&[])
+                .balances(vec![balance("available", Some("999.00"))])
+                .balance_statuses(serde_json::json!([
+                    {"resource_id": support::RESOURCE_ID,
+                     "outcome": {"fetched": {"page_empty": false}}}
+                ])),
+        ],
+    );
+    let mut store = store(&scratch);
+    refresh_run(&mut store, &fixture, 0, SweepOptions::default()).await;
+    assert!(line(&store, "available").contains("live"), "the first read");
+    let before = rows(&store, "available").len();
+
+    refresh_run(&mut store, &fixture, 1, SweepOptions::default()).await;
+
+    assert_eq!(
+        rows(&store, "available").len(),
+        before,
+        "a figure for a resource the call never named never enters the \
+         store, however complete the paperwork around it"
+    );
+    let available = line(&store, "available");
+    assert!(
+        !available.contains("999.00"),
+        "and it never reaches the screen: {available}"
+    );
+    assert!(
+        !available.contains("live") && available.contains("42.00"),
+        "what is left is the last figure that WAS asked for, stale: {available}"
+    );
+}
+
 /// The control: a resource that is still listed and does carry a status is
 /// read, stored and rendered `live` exactly as before. The rule above
 /// refuses a reply that speaks out of turn -- not a reply that answers.

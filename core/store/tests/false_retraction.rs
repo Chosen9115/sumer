@@ -437,6 +437,7 @@ async fn a_record_retracted_under_one_resource_revives_under_another() {
             fingerprint: "fp1",
             provider_id: "p1",
             history_start: None,
+            connection_violation: None,
             options: SweepOptions::default(),
         };
         let report = sweep::sweep_resource(store, &handle, &input)
@@ -837,6 +838,7 @@ async fn a_record_reported_under_a_second_resource_is_live_under_it() {
             fingerprint,
             provider_id: "p1",
             history_start: None,
+            connection_violation: None,
             options: SweepOptions::default(),
         };
         let report = sweep::sweep_resource(store, &handle, &input)

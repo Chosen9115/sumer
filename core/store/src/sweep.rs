@@ -1,7 +1,7 @@
 //! The sweep: one `history.read` for one resource, from `page: None` to
 //! `next: null`, and the retraction it does or does not earn.
 //!
-//! # The eight-condition gate (`spec/observation.md` §8.1)
+//! # The nine-condition gate (`spec/observation.md` §8.1)
 //!
 //! A **sweep** is one `history.read` for one resource that
 //!
@@ -16,11 +16,34 @@
 //!    on the crawl row,
 //! 8. carried no observation whose `provenance.adapter_id` was some other
 //!    adapter's -- the one disqualifier that also DROPS the offending
-//!    record, because there is nowhere honest to store it.
+//!    record, because there is nowhere honest to store it,
+//! 9. ran on a connection that broke no wire contract anywhere in this
+//!    refresh -- including on the reads that are not this sweep's.
 //!
 //! Fail any one and the crawl is PARTIAL: its observations still persist
 //! (they are evidence, and evidence is never thrown away), and **nothing
 //! is retracted**.
+//!
+//! ## Condition (9) is refresh-scoped, and deliberately
+//!
+//! Conditions (2) and (7) are already about the CONNECTION rather than
+//! about the pages, so a connection-scoped condition is not a foreign body
+//! in this list. (9) widens the window to the whole refresh: a
+//! `balances.read` that answered for a resource nobody asked about broke
+//! the contract before the first page of any sweep was requested, and an
+//! adapter that answers questions nobody asked has demonstrated it is not
+//! answering the protocol. Absence is evidence only when the host is
+//! confident it looked properly, and this one is not. The conservative
+//! direction costs a stale row; the permissive one destroys a record.
+//!
+//! The taint is FORWARD-ONLY: it disqualifies every sweep that starts after
+//! the violation, not the ones already committed. The adapter-wide reads
+//! (`hello`, `resources.list`, `status.read`, `balances.read`) all precede
+//! every sweep, so a violation there taints all of them; a violation inside
+//! one resource's own page loop taints the siblings swept after it. Nothing
+//! reaches backwards, because nothing has to: a sweep that already
+//! committed decided on the evidence it had, and a wrongly retracted record
+//! revives on the next complete sweep that carries it (§8.4).
 //!
 //! ## Condition (5) is an exemption, not a veto
 //!
@@ -59,8 +82,10 @@ use sumer_host::fold::Fold;
 use sumer_host::paging::ResumeState;
 use sumer_host::time;
 use sumer_host::AdapterHandle;
+use sumer_host::HostError;
 use sumer_wire::{
     CursorResumable, Observation, PageRequest, ReadOutcome, ResourceQuery, ResourceStatus, Rfc3339,
+    WireErrorCode,
 };
 
 use crate::error::Result;
@@ -121,6 +146,12 @@ pub struct SweepReport {
     /// Set when the read itself failed. The resource is reported failed
     /// (`refresh` exits 1) and nothing is retracted.
     pub error: Option<String>,
+    /// Set when this sweep's own `history.read` broke the wire contract,
+    /// for the caller to feed into condition (9) of the sweeps that follow
+    /// it on the same connection. This sweep is already disqualified; its
+    /// siblings are not, and the violation says as much about them as a
+    /// `balances.read` violation says about all of them.
+    pub contract_violation: Option<String>,
 }
 
 impl SweepReport {
@@ -137,7 +168,38 @@ impl SweepReport {
             disqualified_reason: None,
             discrepancies: Vec::new(),
             error: None,
+            contract_violation: None,
         }
+    }
+}
+
+/// Did this failure mean the connection **broke the wire contract**, as
+/// opposed to failing honestly? Condition (9)'s discriminator.
+///
+/// An adapter that answers `err` in the contract's own closed vocabulary,
+/// that times out, or that dies, has failed -- it has not lied. None of
+/// those says anything about the history the connection goes on to serve,
+/// and a host that treated them as taint would switch off retraction for a
+/// resource on any rate-limited read. Two things do taint:
+///
+/// * `invalid_request`, which is how the host spells "this reply is not the
+///   shape the contract requires" -- a balance for a resource nobody asked
+///   about, a `statuses` array that does not cover its request. It also
+///   covers an adapter genuinely returning `err: invalid_request` to a
+///   request the host formed itself: the host knows its own request was
+///   well formed, so the adapter is either wrong about the protocol or
+///   broken, and either way is not answering it.
+/// * a fatal [`ProtocolViolation`](HostError::ProtocolViolation), which has
+///   already killed the process. Every sweep after it fails condition (2)
+///   anyway; naming it here costs nothing and says why.
+pub(crate) fn broke_the_contract(error: &HostError) -> bool {
+    match error {
+        HostError::Wire(err) => err.code == WireErrorCode::InvalidRequest,
+        HostError::ProtocolViolation(_) => true,
+        HostError::Timeout
+        | HostError::AdapterCrashed { .. }
+        | HostError::Spawn(_)
+        | HostError::IdsExhausted => false,
     }
 }
 
@@ -166,13 +228,26 @@ struct Gate {
     /// user is told `rate_limited on page 3` rather than the name of a
     /// condition they never read.
     not_fetched: Option<String>,
+    /// Condition (9), and the only input to this gate that the page loop
+    /// did not observe: a wire-contract violation this connection
+    /// committed EARLIER IN THIS REFRESH, on a read that is not this
+    /// sweep's. Carries the reason so the crawl row says which violation,
+    /// not merely that there was one.
+    connection_violation: Option<String>,
 }
 
 impl Gate {
-    /// `None` if all eight hold. Otherwise the first condition that failed
+    /// `None` if all nine hold. Otherwise the first condition that failed
     /// -- written to `crawl.disqualified_reason`, which is the audit of why
     /// retraction did or did not happen.
     fn disqualifier(&self) -> Option<String> {
+        // (9) first: it is the one fact that was already true before this
+        // sweep sent a single request, and it says the connection is not
+        // answering the protocol -- which is the strongest reason on the
+        // list to distrust everything else it went on to say.
+        if let Some(violation) = &self.connection_violation {
+            return Some(violation.clone());
+        }
         if !self.began_at_start_of_history {
             return Some("did not begin at the start of available history".to_owned());
         }
@@ -226,6 +301,11 @@ pub struct SweepInput<'a> {
     pub provider_id: &'a str,
     /// From `status.read`, when the adapter reported one.
     pub history_start: Option<Rfc3339>,
+    /// Condition (9): `Some(reason)` when this connection has already
+    /// broken the wire contract during this refresh. Every sweep on that
+    /// connection is disqualified, including the ones whose own pages are
+    /// flawless -- see the module docs.
+    pub connection_violation: Option<&'a str>,
     pub options: SweepOptions,
 }
 
@@ -286,6 +366,7 @@ pub async fn sweep_resource(
         hello_derivation: input.hello_derivation.to_owned(),
         not_fetched: None,
         foreign_provenance: false,
+        connection_violation: input.connection_violation.map(str::to_owned),
     };
 
     // --- the fold ----------------------------------------------------
@@ -367,6 +448,13 @@ pub async fn sweep_resource(
                 // nothing is retracted.
                 let reason = format!("adapter_failed_on_page_{page_number}: {e}");
                 store::finish_crawl(store.conn(), crawl_id, false, false, Some(&reason))?;
+                // Condition (9) for this sweep's SIBLINGS: a page that broke
+                // the contract taints every sweep the same refresh starts
+                // after it, exactly as a `balances.read` violation does.
+                if broke_the_contract(&e) {
+                    report.contract_violation =
+                        Some(format!("history.read broke the wire contract: {e}"));
+                }
                 report.disqualified_reason = Some(reason.clone());
                 report.error = Some(reason);
                 return Ok(report);
@@ -1139,6 +1227,7 @@ mod tests {
             fingerprint,
             provider_id: "p1",
             history_start: None,
+            connection_violation: None,
             options: SweepOptions::default(),
         }
     }

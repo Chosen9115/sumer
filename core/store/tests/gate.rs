@@ -1,4 +1,4 @@
-//! The eight-condition gate (`spec/observation.md` §8.1), one case per
+//! The nine-condition gate (`spec/observation.md` §8.1), one case per
 //! disqualifier.
 //!
 //! Every case has the same shape, and the shape is the point:
@@ -21,7 +21,7 @@ mod support;
 use serde_json::json;
 use support::{
     chain_len, drained_status, fixture, live_ids, obs, only, page, refresh_run, retractions, store,
-    Run, Scratch,
+    Run, Scratch, ADAPTER_ID,
 };
 
 use sumer_store::sweep::SweepOptions;
@@ -88,7 +88,7 @@ async fn assert_partial(runs: Vec<Run>, expected_reason: &str) {
 }
 
 // ---------------------------------------------------------------------
-// The control: all eight hold
+// The control: all nine hold
 // ---------------------------------------------------------------------
 
 /// **L1**: a qualifying sweep omitting a live `local_id` writes exactly one
@@ -703,4 +703,174 @@ async fn a_resumed_sweep_carries_the_stored_cursor_and_retracts_nothing() {
     assert_eq!(report.retracted, 0);
     assert_eq!(retractions(&store), Vec::<(String, String)>::new());
     assert!(live_ids(&store).contains(&"drop".to_owned()));
+}
+
+// ---------------------------------------------------------------------
+// (9) A connection that broke the contract earlier in this refresh
+// ---------------------------------------------------------------------
+
+/// **A protocol violation taints the whole refresh, not just the read that
+/// carried it.**
+///
+/// The other eight conditions are facts about the sweep's own pages, or
+/// about the connection *while it was sweeping*. This one reaches back to a
+/// read that is not the sweep's at all: a `balances.read` answering for a
+/// resource nobody asked about is refused where it is decoded, the error is
+/// reported -- and the refresh then walked into the sweeps, drained one,
+/// called it complete and retracted a live record on its evidence. The
+/// violation and the retraction were on the same connection, seconds apart.
+///
+/// An adapter that has just answered a question nobody asked has
+/// demonstrated it is not answering the protocol, and absence is evidence
+/// only when the host is confident it looked properly. The conservative
+/// direction costs a stale row; the permissive one destroys a record.
+#[tokio::test]
+async fn a_contract_violation_earlier_in_the_refresh_disqualifies_the_sweep() {
+    // A balance for a resource this refresh never listed and never asked
+    // about: `invalid_request`, refused whole at the decode.
+    let volunteered = json!({
+        "resource_id": "ghost",
+        "category": "available",
+        "amount": {"asset": "usd", "amount": "999.00"},
+        "provenance": {"adapter_id": ADAPTER_ID, "provider_id": "p1", "surface": "s",
+                       "observed_at": "2026-01-01T00:00:00Z", "completeness": "complete"}
+    });
+    assert_partial(
+        vec![
+            plant(),
+            // A flawless sweep -- drained, fetched, exact -- on a connection
+            // that has already broken the contract.
+            Run::new(vec![page(
+                None,
+                vec![obs("keep", "11.00")],
+                drained_status(None),
+            )])
+            .balances(vec![volunteered]),
+        ],
+        "balances.read broke the wire contract",
+    )
+    .await;
+}
+
+/// The control for (9): the same drained sweep on a connection whose
+/// `balances.read` failed **honestly** still retracts.
+///
+/// Condition (9) is about a broken contract, not about a failed read. An
+/// adapter answering with an `err` envelope is using the vocabulary the
+/// contract gives it, and is saying nothing about the history it goes on to
+/// serve. Widening (9) to any error would let one rate-limited balances call
+/// switch off retraction for the resource -- and every read fails sometimes.
+#[tokio::test]
+async fn an_honest_balances_failure_leaves_the_sweep_qualifying() {
+    if !support::python3_available() {
+        return;
+    }
+    let scratch = Scratch::new("honest-balance-failure");
+    let fixture = fixture(
+        &scratch,
+        vec![
+            plant(),
+            Run::new(vec![page(
+                None,
+                vec![obs("keep", "11.00")],
+                drained_status(None),
+            )])
+            .balances_read_err(),
+        ],
+    );
+    let mut store = store(&scratch);
+    refresh_run(&mut store, &fixture, 0, SweepOptions::default()).await;
+
+    let report = only(
+        refresh_run(&mut store, &fixture, 1, SweepOptions::default())
+            .await
+            .0,
+    );
+    assert!(
+        report.complete,
+        "an honest failure is not a violation: {:?}",
+        report.disqualified_reason
+    );
+    assert_eq!(
+        retractions(&store),
+        vec![(
+            "drop".to_owned(),
+            sumer_store::sweep::REASON_ABSENT.to_owned()
+        )],
+        "and the record genuinely absent from a complete sweep still retracts"
+    );
+}
+
+/// **And a violation inside one resource's sweep taints the next
+/// resource's.**
+///
+/// The same rule, on the read that is easiest to overlook: an adapter with
+/// two resources whose FIRST `history.read` breaks the contract, and whose
+/// second is drained, fetched and exact. The second sweep is the one that
+/// would have retracted, and the connection that serves it has already
+/// proved it is not answering the protocol. Withholding the taint here --
+/// covering only the `balances.read` case, which happens to be the one that
+/// was reported -- is the enumerate-the-failure-paths mistake
+/// `adr/0006` decision 8 exists to record.
+///
+/// The taint is forward-only. `other` is swept first and disqualifies
+/// itself; `acct` is swept after and inherits it.
+#[tokio::test]
+async fn a_violation_in_one_sweep_disqualifies_the_next() {
+    if !support::python3_available() {
+        return;
+    }
+    let scratch = Scratch::new("tainted-sibling");
+    let both = json!([{"resource_id": "other"}, {"resource_id": support::RESOURCE_ID}]);
+    let fixture = fixture(
+        &scratch,
+        vec![
+            plant(),
+            Run::new(vec![
+                // `other` is swept first: a reply whose `statuses` do not
+                // cover the resource it was asked about -- `invalid_request`.
+                json!({"when": {}, "do": [{"op": "reply_ok", "body": {
+                    "observations": [], "statuses": []
+                }}]}),
+                // `acct` is swept second, and its own page is flawless.
+                page(None, vec![obs("keep", "11.00")], drained_status(None)),
+            ])
+            .lists(&["other", support::RESOURCE_ID])
+            .statuses(both.clone())
+            .balance_statuses(both),
+        ],
+    );
+    let mut store = store(&scratch);
+    refresh_run(&mut store, &fixture, 0, SweepOptions::default()).await;
+
+    let reports = refresh_run(&mut store, &fixture, 1, SweepOptions::default())
+        .await
+        .0;
+    assert_eq!(reports.len(), 2, "two resources, two sweeps");
+    let acct = reports
+        .iter()
+        .find(|r| r.resource_id == support::RESOURCE_ID)
+        .expect("the second resource was swept");
+    assert!(
+        !acct.complete,
+        "a flawless sweep on an already-broken connection is still partial"
+    );
+    assert!(
+        acct.disqualified_reason
+            .as_deref()
+            .is_some_and(|reason| reason.starts_with("history.read broke the wire contract")),
+        "and it says which violation: {:?}",
+        acct.disqualified_reason
+    );
+    assert_eq!(
+        retractions(&store),
+        Vec::<(String, String)>::new(),
+        "nothing is retracted on the evidence of that connection"
+    );
+    assert!(live_ids(&store).contains(&"drop".to_owned()));
+    assert_eq!(
+        chain_len(&store, "keep"),
+        2,
+        "the evidence it did read still persists"
+    );
 }

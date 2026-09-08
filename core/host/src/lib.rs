@@ -754,7 +754,7 @@ fn check_status_coverage<'a>(
 /// from the adapter's bytes only by JSON whitespace and key order.
 fn drop_oversized<T: serde::Serialize>(
     observations: Vec<T>,
-    statuses: &mut Vec<ResourceStatus>,
+    statuses: &mut [ResourceStatus],
     measure: impl Fn(&T) -> bool,
     key: impl Fn(&T) -> (String, Option<String>),
 ) -> Vec<T> {
@@ -792,35 +792,35 @@ fn drop_oversized<T: serde::Serialize>(
 /// converted a disqualifying signal into an exempting one and retracted a
 /// live record. Nothing the host writes here can weaken what the adapter
 /// said.
+///
+/// **And nothing the host writes here can INVENT what the adapter did not
+/// say.** `statuses` is a slice, not a `Vec`, so this cannot grow it -- an
+/// oversized record for a resource with no status entry of its own is
+/// dropped and nothing is recorded against it. It used to push a
+/// host-authored `ResourceStatus { outcome: fetched }` for that resource,
+/// which is the most permissive outcome §6 has and one no adapter ever
+/// reported. That entry was inert only because every reader downstream
+/// happens to look statuses up by the resource it asked about; "inert
+/// because nobody currently reads it" is not a property a host-authored
+/// outcome is allowed to rest on. The arm is now unrepresentable rather
+/// than unused, and the case it covered is a reply that was already
+/// off-contract: only an observation for a resource this call did not
+/// request can reach it (`check_status_coverage` gives every requested one
+/// a status entry), and such an observation is refused outright on a
+/// balances reply and dropped unstored by the sweep on a history one.
 fn report_oversized(
-    statuses: &mut Vec<ResourceStatus>,
+    statuses: &mut [ResourceStatus],
     resource_id: String,
     local_id: Option<String>,
     bytes: usize,
 ) {
-    let degraded = Degraded {
-        local_id,
-        bytes: u64::try_from(bytes).unwrap_or(u64::MAX),
-    };
-    match statuses
+    if let Some(existing) = statuses
         .iter_mut()
         .find(|status| status.resource_id == resource_id)
     {
-        Some(existing) => existing.degraded.push(degraded),
-        // A resource that produced an observation but no status entry is
-        // already a malformed reply (the conformance suite's assertion to
-        // make). The host still records what it dropped rather than
-        // omitting a record silently, and `fetched` is the only outcome
-        // consistent with having received observations from it.
-        None => statuses.push(ResourceStatus {
-            resource_id,
-            outcome: ReadOutcome::Fetched { page_empty: false },
-            degraded: vec![degraded],
-            provider_detail: None,
-            page: None,
-            credential_expires_at: None,
-            strong_auth_expires_at: None,
-            history_start: None,
-        }),
+        existing.degraded.push(Degraded {
+            local_id,
+            bytes: u64::try_from(bytes).unwrap_or(u64::MAX),
+        });
     }
 }

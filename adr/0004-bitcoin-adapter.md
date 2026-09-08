@@ -434,7 +434,7 @@ as a fifth patch to a file-based baseline.
 
 **Discharged in revision 5.** It landed there, and not as a fifth patch to
 anything here. The host derives absence itself from a **complete sweep** —
-one `history.read` that began at `page: None`, drained, and passed eight
+one `history.read` that began at `page: None`, drained, and passed nine
 gates — and writes it to an append-only retraction table under the same
 SQLite transaction as the sweep's final page. The three requirements this
 paragraph set are met and one of them turned out to be unnecessary: the

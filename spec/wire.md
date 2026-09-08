@@ -395,7 +395,14 @@ cannot put a figure on the user's screen by offering it unasked. This binds
 the reply from the opposite side to the `statuses` rule above: exactly one
 status for each resource requested, and no observation for any resource that
 was not. Extra `statuses` are inert rather than fatal, since no observation
-may reference one.
+may reference one — and volunteering one beside a volunteered balance does not
+buy the balance in, because the bound is the request.
+
+**The refusal is `invalid_request`, and it costs more than the read.** A reply
+of this shape is a wire-contract violation, so under `spec/observation.md` §8.1
+condition (9) it also disqualifies every sweep the same refresh runs over that
+connection: nothing that connection reports afterwards can license a retraction
+until a later refresh opens a clean one.
 
 `history.read` is deliberately **not** bound this way, and the asymmetry is
 worth understanding before you copy one rule onto the other. A history reply

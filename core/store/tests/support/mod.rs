@@ -155,6 +155,8 @@ pub struct Run {
     pub hello_adapter_id: String,
     /// Answer `status.read` with an `err` envelope instead of a reply.
     pub status_err: bool,
+    /// Answer `balances.read` with an `err` envelope instead of a reply.
+    pub balances_err: bool,
     pub history: Vec<Value>,
     pub statuses: Value,
     pub balances: Vec<Value>,
@@ -174,6 +176,7 @@ impl Run {
             derivation: DERIVATION.to_owned(),
             hello_adapter_id: ADAPTER_ID.to_owned(),
             status_err: false,
+            balances_err: false,
             history,
             statuses: json!([{"resource_id": RESOURCE_ID}]),
             balances: Vec::new(),
@@ -207,6 +210,14 @@ impl Run {
     /// What this run's HELLO calls itself.
     pub fn announces(mut self, adapter_id: &str) -> Run {
         self.hello_adapter_id = adapter_id.to_owned();
+        self
+    }
+
+    /// `balances.read` fails HONESTLY -- an `err` envelope in the
+    /// contract's own vocabulary, which is not a protocol violation and
+    /// must not taint the sweeps (§8.1 condition 9).
+    pub fn balances_read_err(mut self) -> Run {
+        self.balances_err = true;
         self
     }
 
@@ -267,11 +278,15 @@ impl Run {
                 } else {
                     json!({"op": "reply_ok", "body": {"statuses": self.statuses}})
                 }]}],
-                "balances.read": [{"do": [{"op": "reply_ok", "body": {
-                    "observations": self.balances,
-                    "statuses": self.balance_statuses
-                        .unwrap_or_else(|| json!([{"resource_id": RESOURCE_ID}]))
-                }}]}],
+                "balances.read": [{"do": [if self.balances_err {
+                    json!({"op": "reply_err", "code": "internal", "message": "balances.read is down"})
+                } else {
+                    json!({"op": "reply_ok", "body": {
+                        "observations": self.balances,
+                        "statuses": self.balance_statuses
+                            .unwrap_or_else(|| json!([{"resource_id": RESOURCE_ID}]))
+                    }})
+                }]}],
                 "history.read": self.history
             }
         })

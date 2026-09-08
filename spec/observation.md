@@ -242,6 +242,21 @@ gives — a balances reply meets no judge downstream of the decode — and it is
 safe for the same reason: a refused read writes no row, so the figures already
 on screen go stale rather than being replaced by figures nobody asked for.
 
+**A status the adapter volunteered alongside the balance does not rescue it.**
+The bound is the REQUEST, not the presence of a status entry. The two coincide
+in the case above and come apart in the one that matters: an adapter that
+volunteers *both* a balance and a matching `fetched` status for the resource it
+just dropped from its listing has produced complete paperwork for a figure
+nobody asked for, and a status-bounded rule admits it — same figure, same
+screen, same `live`, one more field. The request is the only bound the adapter
+does not also author.
+
+**And such a reply is a wire-contract violation, not merely a rejected one.**
+The read is refused with `invalid_request`, and under §8.1 condition (9) that
+refusal disqualifies every sweep the same refresh goes on to run over that
+connection. A connection that has just answered a question nobody asked does
+not, in the same breath, get to license the retraction of a live record.
+
 **What this does not refuse.** A resource that is still listed and does carry
 its own status entry is being *answered*, not volunteered: its balance is
 stored exactly as before, however many resources the call named. Dropping a
@@ -673,11 +688,11 @@ project's. It is written this tightly because the failure mode is not an error
 message: deriving absence wrongly means telling a user that their money's
 history is missing.
 
-### 8.1 A complete sweep: eight conditions
+### 8.1 A complete sweep: nine conditions
 
 A **sweep** is one `history.read` for one resource, pursued to its end. A host
 MUST NOT derive absence from anything else. A sweep is **complete** only if all
-eight of these hold:
+nine of these hold:
 
 | # | Condition | Why it is not optional |
 |---|---|---|
@@ -689,11 +704,60 @@ eight of these hold:
 | 6 | Every page reported `cursor_resumable: exact` | Derived from §5: `batch_restart`'s intermediate cursor is explicitly not trusted across a resume and `none` has no durable cursor at all, so neither family supports the claim "this read covered the whole span between its start and its drain." A resource in either family therefore never produces a complete sweep, and never retracts. |
 | 7 | It ran over **one connection**, whose hello `local_id_derivation` (`spec/wire.md` §4) the host recorded against that crawl | The ids a sweep is compared against are only comparable to the ids it emitted if one derivation produced both. |
 | 8 | Every observation's `provenance.adapter_id` was the connection's own | §3 keys every per-record structure by `(adapter_id, local_id)`, and a host keys the rows it is about to compare against by the adapter it is connected to. An observation naming another adapter means those two keyings have come apart, and the host is holding two notions of one chain. **A host cannot conclude an absence from a set it cannot key.** |
+| 9 | The connection broke **no wire contract anywhere in this refresh**, including on reads that were not this sweep's |  A host derives absence from the *shape* of a read, so it has to be able to trust that the connection is answering the questions it was asked. An adapter that has just answered one nobody asked has demonstrated it is not. Absence is evidence only when the host is confident it looked properly. |
 
-**Failing any one of the eight makes the sweep PARTIAL.** A partial sweep still
+**Failing any one of the nine makes the sweep PARTIAL.** A partial sweep still
 persists every observation it read — those are evidence, and evidence is never
 discarded for being incomplete — and **retracts nothing**. There is no partial
 retraction, and no threshold that turns a partial sweep into a whole one.
+
+**Condition (9) is refresh-scoped, and this list is where it belongs.** The
+first eight conditions are facts about one sweep — its pages, or the connection
+*while it was sweeping*. (9) widens the window to the whole refresh of that
+adapter: every read the host made on that connection, in order, `hello`
+onwards. A `balances.read` that answers for a resource the call did not name is
+refused at the decode long before the first page of any sweep is requested, and
+it disqualifies every sweep on that connection — including the ones whose own
+pages are flawless.
+
+**The taint is forward-only**, and it is the whole refresh's reads in order
+that (9) quantifies over: a violation disqualifies every sweep that *starts
+after* it, not the ones already committed. A sweep that has already run decided
+on the evidence it had, and a retraction it made is not final — the next
+complete sweep that carries the record again revives it (§8.4). A sweep that
+has not started yet has no such excuse. In practice the adapter-wide reads
+(`hello`, `resources.list`, `status.read`, `balances.read`) all precede every
+sweep, so a violation there taints all of them; a violation inside one
+resource's own `history.read` taints that resource's siblings swept after it.
+
+It is a **condition in this list**, not a separate taint mechanism sitting
+beside it, and that placement is the decision. This table's whole value is that
+it is exhaustive: a host implementer reads nine rows and knows every reason a
+retraction can be withheld, and an auditor reading `crawl.disqualified_reason`
+finds every verdict spelled in one vocabulary. A second, unlisted mechanism that
+disqualifies sweeps without appearing here would make the table a lie in
+exactly the way that costs a reader their next bug. Conditions (2) and (7) are
+already about the connection rather than about the pages, so a
+connection-scoped condition is not a foreign body here.
+
+**What (9) does not cover: an honest failure.** An adapter that answers `err`
+in the contract's own closed vocabulary (`spec/wire.md` §8), that times out, or
+that dies, has failed — it has not lied. None of those says anything about the
+history the connection goes on to serve, and a host that treated them as taint
+would switch off retraction for a resource on any rate-limited balances call,
+which is to say most of the time. What taints is a reply the host could not
+reconcile with the contract: `invalid_request` — the code a host uses for a
+reply that is not the shape the protocol requires — and a fatal protocol
+violation. The asymmetry is deliberate and it is the same one §4 draws between
+`fetched` and everything else: a host distinguishes "I could not read" from "I
+was told something that cannot be true."
+
+Contrast the `hello`-mismatch rule below, which abandons the whole refresh
+before writing anything. That rule is stronger because a connection that is not
+the adapter it replaced has nowhere honest to put *anything* it says. A
+connection that merely broke the contract on one read still speaks for the
+right chain, so what it delivered is kept as evidence — it just no longer
+licenses a conclusion drawn from what is missing.
 
 **Condition (8) is the single exception, and it is one observation wide.** An
 observation naming another adapter is refused rather than stored: there is

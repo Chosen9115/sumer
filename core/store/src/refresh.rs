@@ -188,16 +188,29 @@ pub async fn refresh_adapter(
 
     // Balances are batched, never paginated, and are appended verbatim --
     // the adapter's exact amount string, or NULL for "looked, don't know".
+    //
+    // `connection_violation` is condition (9)'s input: a reply this
+    // connection sent that broke the wire contract disqualifies every sweep
+    // below, however clean their own pages are
+    // (`spec/observation.md` §8.1).
+    let mut connection_violation = None;
     match handle.balances_read(resource_ids.clone()).await {
         Ok(read) => {
+            // ONE transaction for the whole reply. Nothing in the loop can
+            // fail on the protocol -- see below -- but a reply is one
+            // answer, and half of one written to disk is a torn read of the
+            // user's money whatever tore it.
+            let txn = store.transaction()?;
             for balance in &read.observations {
                 // **A stored outcome is always the one the adapter
-                // reported** (`spec/observation.md` §2). The host refuses a
-                // reply that observes a resource it did not request, and
-                // every requested resource carries exactly one status (§6),
-                // so this lookup finds one; if it ever did not, the honest
-                // answer is to say so rather than to invent an outcome and
-                // stamp a figure with a freshness nobody gave it.
+                // reported** (`spec/observation.md` §2). This lookup cannot
+                // miss: `balances_read` refuses a reply carrying a balance
+                // for a resource the call did not request, and refuses one
+                // that does not give every REQUESTED resource exactly one
+                // status entry (§6), so every balance that reaches here has
+                // one. The arm exists because the alternative is an
+                // `expect`, and nothing in this crate panics on an adapter
+                // reply.
                 let status = read
                     .statuses
                     .iter()
@@ -210,25 +223,43 @@ pub async fn refresh_adapter(
                         ))
                     })?;
                 let outcome = outcome_label(&status.outcome);
-                store::append_balance(store.conn(), adapter_id, read_id, balance, &outcome)?;
+                store::append_balance(&txn, adapter_id, read_id, balance, &outcome)?;
             }
+            txn.commit()?;
         }
-        Err(e) => errors.push(format!("balances.read failed: {e}")),
+        Err(e) => {
+            if sweep::broke_the_contract(&e) {
+                connection_violation = Some(format!("balances.read broke the wire contract: {e}"));
+            }
+            errors.push(format!("balances.read failed: {e}"));
+        }
     }
 
     let mut reports = Vec::new();
     for descriptor in &listed.resources {
         let fingerprint = sweep::resource_fingerprint(descriptor);
-        let input = sweep::SweepInput {
-            adapter_id,
-            resource_id: &descriptor.resource_id,
-            hello_derivation: &hello_derivation,
-            fingerprint: &fingerprint,
-            provider_id: &descriptor.provider_id,
-            history_start: sweep::history_start(&statuses, &descriptor.resource_id),
-            options,
+        let report = {
+            let input = sweep::SweepInput {
+                adapter_id,
+                resource_id: &descriptor.resource_id,
+                hello_derivation: &hello_derivation,
+                fingerprint: &fingerprint,
+                provider_id: &descriptor.provider_id,
+                history_start: sweep::history_start(&statuses, &descriptor.resource_id),
+                connection_violation: connection_violation.as_deref(),
+                options,
+            };
+            sweep::sweep_resource(store, handle, &input).await?
         };
-        reports.push(sweep::sweep_resource(store, handle, &input).await?);
+        // The taint is FORWARD-ONLY, and the ordering is the whole reason
+        // it can be: a sweep that already committed decided on the evidence
+        // it had, and a retraction is revivable -- the next complete sweep
+        // that carries the record again brings it back (§8.4). A sweep that
+        // has not started yet has no such excuse.
+        if connection_violation.is_none() {
+            connection_violation.clone_from(&report.contract_violation);
+        }
+        reports.push(report);
     }
     Ok(AdapterRefresh {
         sweeps: reports,

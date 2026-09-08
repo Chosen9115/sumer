@@ -3,7 +3,7 @@
 //!
 //! Three things live here that live nowhere else.
 //!
-//! **The sweep gate** ([`sweep`]): eight conditions that decide whether one
+//! **The sweep gate** ([`sweep`]): nine conditions that decide whether one
 //! `history.read` is strong enough evidence to conclude that a record the
 //! store holds live is *gone*. Fail any one and the observations still
 //! persist -- they are evidence -- but nothing is retracted.

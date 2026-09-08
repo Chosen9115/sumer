@@ -585,6 +585,83 @@ async fn an_observation_over_the_cap_is_dropped_and_reported() {
     assert_eq!(page.cursor_resumable, sumer_wire::CursorResumable::Exact);
 }
 
+/// **The host never authors an outcome, not even for a resource it was not
+/// asked about.** A reply to a `history.read` for `acct1` that also carries
+/// observations for `acct2` -- which has no status entry, because nobody
+/// requested it -- used to grow `statuses` by a host-written
+/// `ResourceStatus { outcome: fetched }` when one of those observations was
+/// oversized. `fetched` is the most permissive outcome §6 has, and no
+/// adapter ever said it. It was inert only because every reader downstream
+/// looks statuses up by the resource it asked about.
+///
+/// The same reply pins the other half of the same rule: the off-resource
+/// observation that DOES fit carries `Staleness::Unavailable`, not `Live`.
+/// Its resource reported no outcome, and `Live` is the one freshness claim
+/// nothing here has the evidence to make (spec/observation.md §1).
+#[tokio::test]
+async fn an_off_resource_observation_gets_no_invented_status_and_no_invented_freshness() {
+    let script = format!(
+        "{PRELUDE}\nhello_ok(read(), capabilities=['history.read'])\n\
+         def obs(resource_id, local_id, description):\n\
+        \x20   return {{'resource_id': resource_id, 'local_id': local_id, 'state': 'active',\n\
+        \x20           'surface': 'checking', 'posting': 'posted',\n\
+        \x20           'amount': {{'asset': 'USD', 'amount': '1.00'}},\n\
+        \x20           'raw_sign': 'provider_positive', 'description': description,\n\
+        \x20           'provenance': {{'adapter_id': 'a', 'provider_id': 'p', 'surface': 'checking',\n\
+        \x20                          'observed_at': '2026-09-06T12:00:00Z', 'completeness': 'complete'}}}}\n\
+         req = read()\n\
+         send({{'id': req['id'], 'ok': {{\n\
+        \x20   'observations': [obs('acct1', 'mine', 'rent'),\n\
+        \x20                    obs('acct2', 'stranger', 'coffee'),\n\
+        \x20                    obs('acct2', 'huge', 'D' * 100000)],\n\
+        \x20   'statuses': [{{'resource_id': 'acct1', 'outcome': {{'fetched': {{'page_empty': False}}}},\n\
+        \x20                 'page': {{'cursor_resumable': 'exact', 'next': None}}}}]}}}})\n"
+    );
+    let handle = spawn(&script, Duration::from_secs(5))
+        .await
+        .expect("handshake");
+    let reply = handle
+        .history_read(vec![sumer_wire::ResourceQuery {
+            resource_id: "acct1".to_owned(),
+            page: None,
+        }])
+        .await
+        .expect("history.read");
+
+    let statuses: Vec<&str> = reply
+        .statuses
+        .iter()
+        .map(|s| s.resource_id.as_str())
+        .collect();
+    assert_eq!(
+        statuses,
+        vec!["acct1"],
+        "the host answers for the resource it asked about and writes no \
+         status of its own for any other"
+    );
+
+    let stranger = reply
+        .observations
+        .iter()
+        .find(|o| o.local_id == "stranger")
+        .expect("the off-resource observation that fits is still delivered");
+    assert_eq!(
+        stranger.provenance.staleness,
+        sumer_wire::Staleness::Unavailable,
+        "an observation whose resource reported no outcome cannot be stamped \
+         `live`: a Staleness default is a claim"
+    );
+
+    assert!(
+        !reply.observations.iter().any(|o| o.local_id == "huge"),
+        "the oversized record is still dropped"
+    );
+    assert!(
+        reply.statuses[0].degraded.is_empty(),
+        "and the drop is not filed against a resource that did not produce it"
+    );
+}
+
 #[tokio::test]
 async fn an_adapter_side_degrade_does_not_destroy_the_staleness_it_reported() {
     // The adapter did the omitting itself (spec/observation.md §6 step 2),
