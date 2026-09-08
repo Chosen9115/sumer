@@ -60,10 +60,11 @@ conforming-looking implementations can disagree about whether
 
 A frame at or under `MAX_FRAME_BYTES` that still contains an oversized
 observation is not a wire-level violation; it is handled inside the reply
-body per `spec/observation.md` §6 — the record is omitted and reported in
-its resource's status `degraded { local_id?, bytes }` field, which sits
-beside that status's `outcome` and never replaces it. A frame that itself exceeds `MAX_FRAME_BYTES` is a
-wire-level violation regardless of what is inside it.
+body per `spec/observation.md` §6 — the record is omitted and reported as a
+`{ local_id?, bytes }` entry appended to its resource's status `degraded`
+list, which sits beside that status's `outcome` and never replaces it. A
+frame that itself exceeds `MAX_FRAME_BYTES` is a wire-level violation
+regardless of what is inside it.
 
 ## 2. Fatal frames: no resync
 
@@ -385,6 +386,32 @@ The wire-level `err.code` vocabulary is closed and small: `unsupported_protocol`
 `unsupported`, `invalid_request`, `not_ready`, `internal`. None of these name a
 resource. If you find yourself wanting to put a `resource_id` in an `err`
 payload, that is the signal you want a `status` outcome instead.
+
+**A reply answers the request and nothing else.** A read names the resources
+it is asking about, and the reply may carry observations only for those. A
+`balances.read` that volunteers a balance for a resource the call did not
+request is refused whole by the host (`spec/observation.md` §2) — an adapter
+cannot put a figure on the user's screen by offering it unasked. This binds
+the reply from the opposite side to the `statuses` rule above: exactly one
+status for each resource requested, and no observation for any resource that
+was not. Extra `statuses` are inert rather than fatal, since no observation
+may reference one — and volunteering one beside a volunteered balance does not
+buy the balance in, because the bound is the request.
+
+**The refusal is `invalid_request`, and it costs more than the read.** A reply
+of this shape is a wire-contract violation, so under `spec/observation.md` §8.1
+condition (9) it also disqualifies every sweep the same refresh runs over that
+connection: nothing that connection reports afterwards can license a retraction
+until a later refresh opens a clean one.
+
+`history.read` is deliberately **not** bound this way, and the asymmetry is
+worth understanding before you copy one rule onto the other. A history reply
+is judged downstream by the retraction gate, which needs to *see* an
+off-contract observation in order to disqualify the sweep for the right
+reason; refusing it at decode would replace a precise gate verdict with a
+generic transport failure. A balances reply meets no such judge — whatever
+survives the decode becomes a stored figure nobody re-examines — so the decode
+is the only place the check can live.
 
 **A reply with zero observations and every status `unavailable` is a SUCCESS
 envelope.** It is `{"id": N, "ok": {"observations": [], "statuses": [...]}}` —

@@ -443,17 +443,6 @@ before it got there. Concretely:
   patched, so a patch that does not match its own `why` reads as identical
   if it trips the same ids. Treat the table as "this pair has a killing
   mutant behind it", not as "this pair is proven by machine".
-- **`sumer_host::fold::Fold` and `sumer_host::paging::ResumeState` have no
-  caller inside the host.** `AdapterHandle` never assigns a revision and
-  never computes a resume request — `history_read` hands back observations
-  and says the fold is somebody else's step. This suite is their only
-  consumer. So "the host assigns `revision: u64` by arrival order"
-  (`spec/observation.md` §1) is proven against the standalone `Fold` and
-  against a `Fold` this suite drives over real adapter reads, and never
-  once end to end through a host that does it on its own behalf. An
-  integration built on `AdapterHandle` alone would get no revisions at all
-  and nothing here would notice. This closes when the CLI arrives and
-  becomes that caller.
 - **The framer's fuzz target has never executed anywhere.** `cargo fuzz run
   codec` is wired into `.github/workflows/nightly.yml` only, against
   `main`, and no nightly run has happened yet. Shipping it unrun is

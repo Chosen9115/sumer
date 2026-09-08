@@ -20,8 +20,9 @@ pub mod fold;
 mod mux;
 pub mod paging;
 mod process;
+pub mod time;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -304,6 +305,98 @@ impl AdapterHandle {
             .unwrap_or_default()
     }
 
+    /// Whether this connection has been **established** to have broken the
+    /// wire contract, as of the instant this is called.
+    ///
+    /// A live query, not a value handed out earlier: the whole reason it
+    /// exists is that a violation can arrive *behind* a reply this
+    /// connection already delivered successfully. The reply is delivered
+    /// -- a delivered reply is delivered, and the host does not retract one
+    /// -- but the caller about to act on it can still ask whether anything
+    /// has since disqualified the connection that served it. That is
+    /// `spec/observation.md` §8.1 condition (9)'s "at the moment of
+    /// commitment", and `sumer_store::sweep` asks it inside the same
+    /// transaction that commits a retraction.
+    ///
+    /// Honest about what it answers: what the host has JUDGED by now, not
+    /// what the adapter has written. Bytes still in the pipe are nobody's
+    /// violation yet. What it does guarantee is that everything the reader
+    /// decoded before it handed over the reply you are holding has already
+    /// been judged -- the reader publishes a violation before it stops.
+    ///
+    /// `None` on a connection the host has caught doing nothing wrong,
+    /// including one that merely failed, timed out, or died: those are
+    /// failures in the vocabulary the contract provides, not violations of
+    /// it.
+    #[must_use]
+    pub fn contract_violation(&self) -> Option<ProtocolViolationKind> {
+        self.mux.violation()
+    }
+
+    /// Whether this connection's violation latch is free **at this
+    /// instant** -- test support for asserting that a caller inside
+    /// [`AdapterHandle::with_contract_violation_held`] genuinely excludes
+    /// every publisher, rather than merely not being overtaken by one. A
+    /// counter that fails to advance proves nothing; a `try_lock` that
+    /// fails does.
+    ///
+    /// Not a synchronization primitive, and never something to branch on
+    /// in real code: `true` says only that nothing held it when asked.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn violation_latch_is_free(&self) -> bool {
+        self.mux.violation_latch_is_free()
+    }
+
+    /// The verdict of [`AdapterHandle::contract_violation`], **held frozen
+    /// for the whole of `f`**.
+    ///
+    /// `contract_violation` answers for an instant that is over by the time
+    /// the caller has the value: the reader task runs on another worker
+    /// thread of a multi-threaded runtime and can publish a violation one
+    /// instruction later. A caller that reads the verdict, decides on it,
+    /// and then makes that decision durable is therefore not doing what it
+    /// looks like it is doing -- the absence of an `.await` between the
+    /// three does not exclude another thread, and the interval spans
+    /// whatever work the decision takes, not a few instructions.
+    ///
+    /// This puts the read and the act in one critical section. Both ways a
+    /// violation can be published -- the reader catching a frame, and a
+    /// terminal reason that is itself a violation -- take the same lock,
+    /// so a violation is established either strictly BEFORE the value
+    /// handed to `f`, or strictly AFTER `f` has returned. That ordering is
+    /// what lets `sumer_store::sweep` say a retraction it committed was
+    /// not licensed by a connection the host had already caught lying: not
+    /// a narrower window, no window.
+    ///
+    /// **What is frozen is the verdict, not the connection.** Replies are
+    /// still delivered, ids still issued and tombstoned, and the reader
+    /// still reads while `f` runs. It has to be that way: a lock that
+    /// stopped delivery would stop it inside the reader task, on a runtime
+    /// worker that holds its core while it waits -- which stops the
+    /// runtime's timers, including the drain budget an adapter's stdout is
+    /// measured against, and reports an adapter that merely answered late
+    /// as `StdoutHeldOpen`. That is a wire-contract violation manufactured
+    /// by the very mechanism that exists to report violations honestly,
+    /// and under condition (9) a false violation suppresses a legitimate
+    /// retraction. The only thing `f` blocks is a violation becoming
+    /// established.
+    ///
+    /// # The contract on `f`
+    ///
+    /// * `f` MUST NOT call back into this handle. `contract_violation`,
+    ///   this function, and the publication paths behind them take the
+    ///   same non-reentrant lock; that is a deadlock, not a wait.
+    /// * `f` MUST NOT be slow. Nothing can be established about this
+    ///   connection's conformance for its duration. It cannot `.await` at
+    ///   all -- the signature sees to that.
+    pub fn with_contract_violation_held<T>(
+        &self,
+        f: impl FnOnce(Option<ProtocolViolationKind>) -> T,
+    ) -> T {
+        self.mux.with_violation_held(f)
+    }
+
     /// Ends this connection and reports **how it ended**.
     ///
     /// Closing the child's stdin (see [`mux::Mux::begin_close`]) makes a
@@ -399,11 +492,14 @@ impl AdapterHandle {
         &self,
         resource_ids: Vec<String>,
     ) -> Result<sumer_wire::StatusReadReply, HostError> {
-        self.call_typed(
+        let params = sumer_wire::StatusReadParams { resource_ids };
+        let reply: sumer_wire::StatusReadReply = self.call_typed(OP_STATUS_READ, &params).await?;
+        check_status_coverage(
             OP_STATUS_READ,
-            sumer_wire::StatusReadParams { resource_ids },
-        )
-        .await
+            params.resource_ids.iter().map(String::as_str),
+            &reply.statuses,
+        )?;
+        Ok(reply)
     }
 
     /// `balances.read`: batched, not paginated (Contract Amendment 1 Ruling
@@ -413,17 +509,76 @@ impl AdapterHandle {
         &self,
         resource_ids: Vec<String>,
     ) -> Result<BalancesRead, HostError> {
+        let params = sumer_wire::BalancesReadParams { resource_ids };
         let (raw, received_at): (sumer_wire::BalancesReadReply, Rfc3339) = self
-            .call_typed_with_receipt(
-                OP_BALANCES_READ,
-                sumer_wire::BalancesReadParams { resource_ids },
-            )
+            .call_typed_with_receipt(OP_BALANCES_READ, &params)
             .await?;
+        check_status_coverage(
+            OP_BALANCES_READ,
+            params.resource_ids.iter().map(String::as_str),
+            &raw.statuses,
+        )?;
+        // **A balances reply answers for this connection's adapter, about
+        // the resources this call asked for, and nothing else.** Two shapes
+        // are refused, and the whole reply with each of them
+        // (`spec/observation.md` §2):
+        //
+        // - a balance whose `provenance.adapter_id` is not the connection's
+        //   own. The contradiction is detectable only here: one layer down
+        //   the caller's `adapter_id` is all that is left, and the figure
+        //   is filed under it, silently reattributing another provider's
+        //   money.
+        // - a balance for a resource this call did not ask about. The
+        //   request bounds what the reply may answer -- nothing in this
+        //   refresh listed that resource, so nothing established that it
+        //   still exists. Stored anyway it lands against the CURRENT read
+        //   and, with no status entry the host asked for behind it, on the
+        //   `Live` staleness and the synthesized outcome a missing entry
+        //   defaults to: a figure rendered `live` on a §6 outcome nobody
+        //   ever gave.
+        //
+        // Whole rather than line by line, for the reason §2 gives: a
+        // history page still faces a gate that can disqualify a sweep and
+        // keep what was honest, and a balances reply faces nothing. Safe,
+        // because freshness is derived -- a refused read writes no row, so
+        // what is on screen goes stale rather than staying `live`.
+        if let Some(foreign) = raw
+            .observations
+            .iter()
+            .find(|b| b.provenance.adapter_id != self.hello.adapter_id)
+        {
+            return Err(HostError::Wire(ErrorBody::new(
+                WireErrorCode::InvalidRequest,
+                format!(
+                    "malformed {OP_BALANCES_READ} reply: a balance for resource {:?} names \
+                     adapter_id {:?} on the connection that announced {:?}",
+                    foreign.resource_id, foreign.provenance.adapter_id, self.hello.adapter_id
+                ),
+            )));
+        }
+        let asked: HashSet<&str> = params.resource_ids.iter().map(String::as_str).collect();
+        if let Some(unasked) = raw
+            .observations
+            .iter()
+            .find(|b| !asked.contains(b.resource_id.as_str()))
+        {
+            return Err(HostError::Wire(ErrorBody::new(
+                WireErrorCode::InvalidRequest,
+                format!(
+                    "malformed {OP_BALANCES_READ} reply: a balance for resource {:?}, which \
+                     this call did not request",
+                    unasked.resource_id
+                ),
+            )));
+        }
         let staleness = staleness_by_resource(&raw.statuses);
         let mut statuses = raw.statuses;
-        let observations = drop_oversized(raw.observations, &mut statuses, |b| {
-            (b.resource_id.clone(), None)
-        })
+        let observations = drop_oversized(
+            raw.observations,
+            &mut statuses,
+            |_| true,
+            |b| (b.resource_id.clone(), None),
+        )
         .into_iter()
         .map(|wire| {
             let stale = staleness_for(&staleness, &wire.resource_id);
@@ -444,14 +599,34 @@ impl AdapterHandle {
         &self,
         resources: Vec<ResourceQuery>,
     ) -> Result<HistoryRead, HostError> {
+        let params = sumer_wire::HistoryReadParams { resources };
         let (raw, received_at): (sumer_wire::HistoryReadReply, Rfc3339) = self
-            .call_typed_with_receipt(OP_HISTORY_READ, sumer_wire::HistoryReadParams { resources })
+            .call_typed_with_receipt(OP_HISTORY_READ, &params)
             .await?;
+        check_status_coverage(
+            OP_HISTORY_READ,
+            params.resources.iter().map(|r| r.resource_id.as_str()),
+            &raw.statuses,
+        )?;
         let staleness = staleness_by_resource(&raw.statuses);
         let mut statuses = raw.statuses;
-        let observations = drop_oversized(raw.observations, &mut statuses, |o| {
-            (o.resource_id.clone(), Some(o.local_id.clone()))
-        })
+        // An observation naming ANOTHER adapter is not measured and not
+        // dropped here: `spec/observation.md` §8.1 condition (8) refuses it
+        // outright and disqualifies the sweep, and that ruling is stronger
+        // than §6's degrade. Dropping it here instead would file it as a
+        // NAMED degrade -- which merely EXEMPTS its `local_id` from
+        // retraction -- so a foreign record would suppress a retraction
+        // rather than block one, exactly the inversion §8.1 forbids ("a
+        // refused observation ... can never suppress a retraction"). It is
+        // passed through to the one place that can tell the difference,
+        // which refuses it and stores nothing.
+        let own = self.hello.adapter_id.clone();
+        let observations = drop_oversized(
+            raw.observations,
+            &mut statuses,
+            |o: &sumer_wire::ObservationWire| o.provenance.adapter_id == own,
+            |o| (o.resource_id.clone(), Some(o.local_id.clone())),
+        )
         .into_iter()
         .map(|wire| {
             let stale = staleness_for(&staleness, &wire.resource_id);
@@ -596,16 +771,58 @@ fn staleness_by_resource(statuses: &[ResourceStatus]) -> HashMap<String, Stalene
         .collect()
 }
 
-/// An observation whose resource named no status at all is `Live` -- it was
-/// still just read off the wire. (The reply is malformed in that case:
-/// every requested `resource_id` appears in `statuses` exactly once. That
-/// is the conformance suite's assertion to make, not a reason to
-/// mis-stamp.)
+/// The staleness this observation's resource reported. The fallback is
+/// reachable only for an observation naming a resource this call did not
+/// request -- refused outright on a `balances.read` (spec/observation.md
+/// §2), and not part of any swept resource's page on a `history.read`. It
+/// is `Unavailable` rather than `Live` because a default is a claim, and
+/// `Live` is the one claim nothing here has the evidence to make.
 fn staleness_for(by_resource: &HashMap<String, Staleness>, resource_id: &str) -> Staleness {
     by_resource
         .get(resource_id)
         .copied()
-        .unwrap_or(Staleness::Live)
+        .unwrap_or(Staleness::Unavailable)
+}
+
+/// **Every requested `resource_id` appears in `statuses` exactly once**
+/// (spec/observation.md §6) -- never twice, never zero times. Refused here,
+/// where the reply is decoded, rather than defended against in each of the
+/// readers downstream: staleness stamping above, the retraction gate in
+/// `sumer-store`, the balance outcome label. Every one of them reaches for
+/// one entry per resource and takes the first match, and every one of them
+/// spells an absent entry as its own permissive default. §6 carries the
+/// reasoning, including which default is the dangerous one.
+fn check_status_coverage<'a>(
+    op: &str,
+    requested: impl IntoIterator<Item = &'a str>,
+    statuses: &[ResourceStatus],
+) -> Result<(), HostError> {
+    let malformed = |detail: String| {
+        HostError::Wire(ErrorBody::new(
+            WireErrorCode::InvalidRequest,
+            format!(
+                "malformed {op} reply: {detail}; every requested resource_id appears in \
+                 `statuses` exactly once"
+            ),
+        ))
+    };
+    let mut seen: HashSet<&str> = HashSet::new();
+    for status in statuses {
+        if !seen.insert(status.resource_id.as_str()) {
+            return Err(malformed(format!(
+                "resource {:?} appears in `statuses` more than once",
+                status.resource_id
+            )));
+        }
+    }
+    for resource_id in requested {
+        if !seen.contains(resource_id) {
+            return Err(malformed(format!(
+                "resource {resource_id:?} was requested and does not appear in `statuses` at all"
+            )));
+        }
+    }
+    Ok(())
 }
 
 // ---------------------------------------------------------------------
@@ -629,12 +846,16 @@ fn staleness_for(by_resource: &HashMap<String, Staleness>, resource_id: &str) ->
 /// from the adapter's bytes only by JSON whitespace and key order.
 fn drop_oversized<T: serde::Serialize>(
     observations: Vec<T>,
-    statuses: &mut Vec<ResourceStatus>,
+    statuses: &mut [ResourceStatus],
+    measure: impl Fn(&T) -> bool,
     key: impl Fn(&T) -> (String, Option<String>),
 ) -> Vec<T> {
     observations
         .into_iter()
         .filter(|observation| {
+            if !measure(observation) {
+                return true;
+            }
             let bytes = serde_json::to_vec(observation).map_or(usize::MAX, |v| v.len());
             if bytes <= MAX_OBSERVATION_BYTES {
                 return true;
@@ -646,118 +867,52 @@ fn drop_oversized<T: serde::Serialize>(
         .collect()
 }
 
-/// Records the dropped record on one resource's status. It sets that
-/// entry's `degraded` field rather than adding a second entry -- **every
-/// requested `resource_id` appears in `statuses` exactly once**
+/// Records the dropped record on one resource's status. It **appends to**
+/// that entry's `degraded` list rather than adding a second status entry --
+/// **every requested `resource_id` appears in `statuses` exactly once**
 /// (spec/observation.md §6) -- and rather than replacing its `outcome`,
 /// which carries a different fact: how fresh what this resource *did*
 /// deliver is. Overwriting `stale { as_of }` here would mis-stamp a
 /// perfectly good cached sibling as `Live`.
+///
+/// **Appends, and never overwrites.** This runs once per dropped record, so
+/// a single slot lost every drop but the last: two oversized records on one
+/// page left the first unexplained, and an unexplained absence is retracted.
+/// Worse, an *anonymous* degrade the adapter itself reported -- which
+/// disqualifies the sweep (§8.1 condition 5) -- was overwritten by this
+/// host-authored NAMED one, which merely exempts one id. That silently
+/// converted a disqualifying signal into an exempting one and retracted a
+/// live record. Nothing the host writes here can weaken what the adapter
+/// said.
+///
+/// **And nothing the host writes here can INVENT what the adapter did not
+/// say.** `statuses` is a slice, not a `Vec`, so this cannot grow it -- an
+/// oversized record for a resource with no status entry of its own is
+/// dropped and nothing is recorded against it. It used to push a
+/// host-authored `ResourceStatus { outcome: fetched }` for that resource,
+/// which is the most permissive outcome §6 has and one no adapter ever
+/// reported. That entry was inert only because every reader downstream
+/// happens to look statuses up by the resource it asked about; "inert
+/// because nobody currently reads it" is not a property a host-authored
+/// outcome is allowed to rest on. The arm is now unrepresentable rather
+/// than unused, and the case it covered is a reply that was already
+/// off-contract: only an observation for a resource this call did not
+/// request can reach it (`check_status_coverage` gives every requested one
+/// a status entry), and such an observation is refused outright on a
+/// balances reply and dropped unstored by the sweep on a history one.
 fn report_oversized(
-    statuses: &mut Vec<ResourceStatus>,
+    statuses: &mut [ResourceStatus],
     resource_id: String,
     local_id: Option<String>,
     bytes: usize,
 ) {
-    let degraded = Degraded {
-        local_id,
-        bytes: u64::try_from(bytes).unwrap_or(u64::MAX),
-    };
-    match statuses
+    if let Some(existing) = statuses
         .iter_mut()
         .find(|status| status.resource_id == resource_id)
     {
-        Some(existing) => existing.degraded = Some(degraded),
-        // A resource that produced an observation but no status entry is
-        // already a malformed reply (the conformance suite's assertion to
-        // make). The host still records what it dropped rather than
-        // omitting a record silently, and `fetched` is the only outcome
-        // consistent with having received observations from it.
-        None => statuses.push(ResourceStatus {
-            resource_id,
-            outcome: ReadOutcome::Fetched { page_empty: false },
-            degraded: Some(degraded),
-            provider_detail: None,
-            page: None,
-            credential_expires_at: None,
-            strong_auth_expires_at: None,
-            history_start: None,
-        }),
-    }
-}
-
-// ---------------------------------------------------------------------
-// Host clock: RFC 3339 "now", stdlib-only.
-// ---------------------------------------------------------------------
-
-/// The host's own receipt-time stamp, formatted to second precision as
-/// `YYYY-MM-DDTHH:MM:SSZ` -- exactly the shape [`Rfc3339::new`] validates.
-/// No date/time dependency: a calendar-correct proleptic Gregorian
-/// conversion from a Unix timestamp is a well-known, self-contained
-/// algorithm (Hinnant's `civil_from_days`), and nothing here needs time
-/// zones, locales, or calendar arithmetic beyond that.
-pub(crate) fn now_rfc3339() -> Rfc3339 {
-    let since_epoch = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default();
-    let total_secs = i64::try_from(since_epoch.as_secs()).unwrap_or(i64::MAX);
-    let days = total_secs.div_euclid(86_400);
-    let secs_of_day = total_secs.rem_euclid(86_400);
-    let hour = secs_of_day / 3600;
-    let minute = (secs_of_day % 3600) / 60;
-    let second = secs_of_day % 60;
-    let (year, month, day) = civil_from_days(days);
-    let text = format!("{year:04}-{month:02}-{day:02}T{hour:02}:{minute:02}:{second:02}Z");
-    Rfc3339::new(text).unwrap_or_else(|e| {
-        // Unreachable except if `Rfc3339`'s own validation rules change
-        // shape: `year`/`month`/`day`/`hour`/`minute`/`second` above are
-        // all in-range by construction (the civil-calendar algorithm and
-        // the `div_euclid`/`rem_euclid` splits guarantee it), formatted
-        // into exactly the 20-byte shape the validator requires.
-        unreachable!("now_rfc3339 built a timestamp its own crate rejects: {e}")
-    })
-}
-
-/// Civil (proleptic Gregorian) date from a day count since the Unix epoch.
-/// Howard Hinnant's `civil_from_days`
-/// (<http://howardhinnant.github.io/date_algorithms.html>), valid for any
-/// `days >= 0` (all we need: [`now_rfc3339`] never sees a pre-1970 value).
-fn civil_from_days(days: i64) -> (i64, i64, i64) {
-    let z = days + 719_468;
-    let era = z.div_euclid(146_097);
-    let doe = z - era * 146_097; // [0, 146096]
-    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365; // [0, 399]
-    let y = yoe + era * 400;
-    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100); // [0, 365]
-    let mp = (5 * doy + 2) / 153; // [0, 11]
-    let d = doy - (153 * mp + 2) / 5 + 1; // [1, 31]
-    let m = if mp < 10 { mp + 3 } else { mp - 9 }; // [1, 12]
-    let y = if m <= 2 { y + 1 } else { y };
-    (y, m, d)
-}
-
-#[cfg(test)]
-#[allow(clippy::unwrap_used, clippy::expect_used)]
-mod lib_tests {
-    use super::*;
-
-    #[test]
-    fn now_rfc3339_is_well_formed_and_recent() {
-        let ts = now_rfc3339();
-        assert!(
-            ts.as_str().starts_with("20"),
-            "expected a 21st-century date, got {ts:?}"
-        );
-        assert!(ts.as_str().ends_with('Z'));
-    }
-
-    #[test]
-    fn civil_from_days_matches_known_dates() {
-        // 1970-01-01 is day 0 by definition.
-        assert_eq!(civil_from_days(0), (1970, 1, 1));
-        // 2000-03-01 is a well-known anchor for this algorithm.
-        assert_eq!(civil_from_days(11_017), (2000, 3, 1));
-        // 2026-09-06, comfortably inside this milestone's timeframe.
-        assert_eq!(civil_from_days(20_702), (2026, 9, 6));
+        existing.degraded.push(Degraded {
+            local_id,
+            bytes: u64::try_from(bytes).unwrap_or(u64::MAX),
+        });
     }
 }

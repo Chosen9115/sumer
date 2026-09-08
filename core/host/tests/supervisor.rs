@@ -182,6 +182,55 @@ async fn duplicate_reply_is_a_fatal_violation() {
     );
 }
 
+/// **A violation behind a delivered reply is visible the instant the
+/// caller has that reply.**
+///
+/// The test above is the transport half: the first reply is delivered, and
+/// it stays delivered. This is the half the caller needs to be able to act
+/// on it. A caller that got an `Ok` and is about to DESTROY something on
+/// the strength of it (`sumer_store::sweep` retracting a record absent from
+/// a complete sweep) has to be able to ask whether the connection that
+/// served it has since been caught breaking the contract -- and get the
+/// answer now, not one `close()` later.
+///
+/// So: no sleep. The test above needs 150ms because `Terminal` is only
+/// latched after `supervise` reaps the child; `contract_violation` is
+/// published by the reader at the point of DECODE, and the reader judges
+/// every frame it has decoded before it hands control back. Both frames go
+/// out in one `write`, so both arrive in one `read`, so the violation is
+/// established before the task awaiting the reply is ever polled. If this
+/// ever needs a sleep to pass, that guarantee is gone and every gate built
+/// on it is racing.
+#[tokio::test]
+async fn a_violation_behind_a_delivered_reply_is_visible_at_once() {
+    // ONE write carrying the reply and its duplicate -- see above.
+    let script = format!(
+        "{PRELUDE}\nhello_ok(read())\nreq = read()\nf = json.dumps({{'id': req['id'], 'ok': {{'resources': []}}}})\nsys.stdout.write(f + '\\n' + f + '\\n')\nsys.stdout.flush()\n"
+    );
+    let handle = spawn(&script, Duration::from_secs(2))
+        .await
+        .expect("handshake");
+    assert!(
+        handle.contract_violation().is_none(),
+        "nothing is established against a connection that has only said hello"
+    );
+
+    let reply = handle.resources_list().await;
+    assert!(
+        reply.is_ok(),
+        "the legitimate reply is delivered: {reply:?}"
+    );
+    assert!(
+        matches!(
+            handle.contract_violation(),
+            Some(ProtocolViolationKind::DuplicateId)
+        ),
+        "the violation riding in behind that reply is established by the time the caller \
+         holds it, got {:?}",
+        handle.contract_violation()
+    );
+}
+
 // ---------------------------------------------------------------------
 // Crash and hang
 // ---------------------------------------------------------------------
@@ -400,6 +449,41 @@ async fn host_stamps_received_at_and_computes_live_staleness() {
     assert!(provenance.received_at.as_str().ends_with('Z'));
 }
 
+/// **A balance naming another adapter is refused where it is detectable.**
+///
+/// The connection announced `a` in its hello and then handed over a figure
+/// whose `provenance.adapter_id` is `b`. One layer down the store has only
+/// the connection's own id to file it under, so the contradiction would be
+/// discarded and `b`'s money recorded as `a`'s. `history.read` refuses this
+/// shape at the retraction gate (spec/observation.md §8.1 condition 8); a
+/// balance passes no gate at all, so the check belongs here, at the decode,
+/// where the hello is still in reach.
+///
+/// The whole reply goes, not the one line: everything after this decodes
+/// into rows nobody re-examines, so dropping the single balance would leave
+/// the rest to be stored as if the connection had never contradicted
+/// itself.
+#[tokio::test]
+async fn a_balance_naming_another_adapter_is_refused() {
+    let script = format!(
+        "{PRELUDE}\nhello_ok(read(), capabilities=['balances.read'])\nreq = read()\nsend({{'id': req['id'], 'ok': {{\n    'observations': [{{\n        'resource_id': 'acct1', 'category': 'available',\n        'amount': {{'asset': 'usd', 'amount': '2000.00'}},\n        'provenance': {{'adapter_id': 'b', 'provider_id': 'p', 'surface': 's',\n                       'observed_at': '2026-01-01T00:00:00Z',\n                       'completeness': 'complete'}}\n    }}],\n    'statuses': [{{'resource_id': 'acct1', 'outcome': {{'fetched': {{'page_empty': False}}}}}}]\n}}}})\n"
+    );
+    let handle = spawn(&script, Duration::from_secs(2))
+        .await
+        .expect("handshake");
+    match handle.balances_read(vec!["acct1".to_owned()]).await {
+        Err(HostError::Wire(err)) => {
+            assert_eq!(err.code, sumer_wire::WireErrorCode::InvalidRequest);
+            assert!(
+                err.message.contains("adapter_id") && err.message.contains("\"b\""),
+                "the refusal names the contradiction: {}",
+                err.message
+            );
+        }
+        other => panic!("a balance attributed to another adapter must be refused: {other:?}"),
+    }
+}
+
 // ---------------------------------------------------------------------
 // Backpressure: the deadline bounds the write too, not just the wait
 // ---------------------------------------------------------------------
@@ -523,8 +607,8 @@ async fn an_observation_over_the_cap_is_dropped_and_reported() {
         }
         other => panic!("the degrade must not overwrite the freshness outcome, got {other:?}"),
     }
-    match &status.degraded {
-        Some(degraded) => {
+    match status.degraded.as_slice() {
+        [degraded] => {
             assert_eq!(degraded.local_id.as_deref(), Some("huge"));
             assert!(
                 degraded.bytes > 65_536,
@@ -532,7 +616,7 @@ async fn an_observation_over_the_cap_is_dropped_and_reported() {
                 degraded.bytes
             );
         }
-        None => panic!("the dropped record must be reported, got {status:?}"),
+        other => panic!("exactly one dropped record must be reported, got {other:?}"),
     }
     assert_eq!(
         reply.observations[0].provenance.staleness,
@@ -548,6 +632,83 @@ async fn an_observation_over_the_cap_is_dropped_and_reported() {
         other => panic!("the resume cursor must survive the degrade, got {other:?}"),
     }
     assert_eq!(page.cursor_resumable, sumer_wire::CursorResumable::Exact);
+}
+
+/// **The host never authors an outcome, not even for a resource it was not
+/// asked about.** A reply to a `history.read` for `acct1` that also carries
+/// observations for `acct2` -- which has no status entry, because nobody
+/// requested it -- used to grow `statuses` by a host-written
+/// `ResourceStatus { outcome: fetched }` when one of those observations was
+/// oversized. `fetched` is the most permissive outcome §6 has, and no
+/// adapter ever said it. It was inert only because every reader downstream
+/// looks statuses up by the resource it asked about.
+///
+/// The same reply pins the other half of the same rule: the off-resource
+/// observation that DOES fit carries `Staleness::Unavailable`, not `Live`.
+/// Its resource reported no outcome, and `Live` is the one freshness claim
+/// nothing here has the evidence to make (spec/observation.md §1).
+#[tokio::test]
+async fn an_off_resource_observation_gets_no_invented_status_and_no_invented_freshness() {
+    let script = format!(
+        "{PRELUDE}\nhello_ok(read(), capabilities=['history.read'])\n\
+         def obs(resource_id, local_id, description):\n\
+        \x20   return {{'resource_id': resource_id, 'local_id': local_id, 'state': 'active',\n\
+        \x20           'surface': 'checking', 'posting': 'posted',\n\
+        \x20           'amount': {{'asset': 'USD', 'amount': '1.00'}},\n\
+        \x20           'raw_sign': 'provider_positive', 'description': description,\n\
+        \x20           'provenance': {{'adapter_id': 'a', 'provider_id': 'p', 'surface': 'checking',\n\
+        \x20                          'observed_at': '2026-09-06T12:00:00Z', 'completeness': 'complete'}}}}\n\
+         req = read()\n\
+         send({{'id': req['id'], 'ok': {{\n\
+        \x20   'observations': [obs('acct1', 'mine', 'rent'),\n\
+        \x20                    obs('acct2', 'stranger', 'coffee'),\n\
+        \x20                    obs('acct2', 'huge', 'D' * 100000)],\n\
+        \x20   'statuses': [{{'resource_id': 'acct1', 'outcome': {{'fetched': {{'page_empty': False}}}},\n\
+        \x20                 'page': {{'cursor_resumable': 'exact', 'next': None}}}}]}}}})\n"
+    );
+    let handle = spawn(&script, Duration::from_secs(5))
+        .await
+        .expect("handshake");
+    let reply = handle
+        .history_read(vec![sumer_wire::ResourceQuery {
+            resource_id: "acct1".to_owned(),
+            page: None,
+        }])
+        .await
+        .expect("history.read");
+
+    let statuses: Vec<&str> = reply
+        .statuses
+        .iter()
+        .map(|s| s.resource_id.as_str())
+        .collect();
+    assert_eq!(
+        statuses,
+        vec!["acct1"],
+        "the host answers for the resource it asked about and writes no \
+         status of its own for any other"
+    );
+
+    let stranger = reply
+        .observations
+        .iter()
+        .find(|o| o.local_id == "stranger")
+        .expect("the off-resource observation that fits is still delivered");
+    assert_eq!(
+        stranger.provenance.staleness,
+        sumer_wire::Staleness::Unavailable,
+        "an observation whose resource reported no outcome cannot be stamped \
+         `live`: a Staleness default is a claim"
+    );
+
+    assert!(
+        !reply.observations.iter().any(|o| o.local_id == "huge"),
+        "the oversized record is still dropped"
+    );
+    assert!(
+        reply.statuses[0].degraded.is_empty(),
+        "and the drop is not filed against a resource that did not produce it"
+    );
 }
 
 #[tokio::test]
@@ -570,7 +731,7 @@ async fn an_adapter_side_degrade_does_not_destroy_the_staleness_it_reported() {
         \x20                                    'completeness': 'complete'}}}}],\n\
         \x20   'statuses': [{{'resource_id': 'acct1',\n\
         \x20                 'outcome': {{'stale': {{'as_of': '2026-09-06T11:00:00Z'}}}},\n\
-        \x20                 'degraded': {{'local_id': 'huge', 'bytes': 260000}}}}]}}}})\n"
+        \x20                 'degraded': [{{'local_id': 'huge', 'bytes': 260000}}]}}]}}}})\n"
     );
     let handle = spawn(&script, Duration::from_secs(5))
         .await
@@ -593,9 +754,9 @@ async fn an_adapter_side_degrade_does_not_destroy_the_staleness_it_reported() {
         status.outcome,
         sumer_wire::ReadOutcome::Stale { .. }
     ));
-    let degraded = status.degraded.as_ref().expect("the degrade is reported");
-    assert_eq!(degraded.local_id.as_deref(), Some("huge"));
-    assert_eq!(degraded.bytes, 260_000);
+    assert_eq!(status.degraded.len(), 1, "the degrade is reported");
+    assert_eq!(status.degraded[0].local_id.as_deref(), Some("huge"));
+    assert_eq!(status.degraded[0].bytes, 260_000);
 }
 
 #[tokio::test]
@@ -897,5 +1058,180 @@ async fn an_exited_adapter_is_never_blamed_for_ignoring_stdin_eof() {
     match handle.close().await {
         Some(Terminal::Violation(ProtocolViolationKind::StdoutHeldOpen)) => {}
         other => panic!("expected StdoutHeldOpen, got {other:?}"),
+    }
+}
+
+/// **Every requested `resource_id` appears in `statuses` exactly once**
+/// (spec/observation.md §6), on every read that carries statuses -- not
+/// only on the one whose downstream reader happened to be audited.
+///
+/// A reply naming a resource twice is refused where it is decoded. Every
+/// reader of a `statuses` array takes the first entry that matches, so an
+/// adapter answering cleanly and then contradicting itself in the same
+/// array gets judged on the clean half: `sumer-store`'s sweep reads a
+/// complete page and retracts, and a balance line is labelled with an
+/// outcome the resource also denied. One guard at the decode boundary is
+/// what keeps every one of those readers from having to remember.
+#[tokio::test]
+async fn a_reply_naming_one_resource_twice_is_refused_on_every_read() {
+    let statuses = "[{'resource_id': 'acct1', 'outcome': {'fetched': {'page_empty': True}}},\
+                     {'resource_id': 'acct1', 'outcome': 'unavailable'}]";
+    let script = format!(
+        "{PRELUDE}\nhello_ok(read(), capabilities=['balances.read', 'status.read'])\n\
+         for _ in range(2):\n\
+        \x20   req = read()\n\
+        \x20   send({{'id': req['id'], 'ok': {{'observations': [], 'statuses': {statuses}}}\n\
+        \x20         if req['op'] == 'balances.read' else {{'statuses': {statuses}}}}})\n"
+    );
+    let handle = spawn(&script, Duration::from_secs(5))
+        .await
+        .expect("handshake");
+
+    match handle.balances_read(vec!["acct1".to_owned()]).await {
+        Err(HostError::Wire(err)) => assert!(
+            err.message.contains("more than once"),
+            "the refusal names the malformation, got {err:?}"
+        ),
+        other => panic!("a duplicate resource must be refused, got {other:?}"),
+    }
+    match handle.status_read(vec!["acct1".to_owned()]).await {
+        Err(HostError::Wire(err)) => assert!(err.message.contains("more than once")),
+        other => panic!("a duplicate resource must be refused, got {other:?}"),
+    }
+}
+
+// ---------------------------------------------------------------------
+// Holding condition (9)'s verdict must not invent a violation
+// ---------------------------------------------------------------------
+
+/// **Holding the verdict must not stop the connection, or the host starts
+/// inventing violations.**
+///
+/// The shape that broke when the verdict was held on the mux's lifecycle
+/// lock: the gate holds the verdict across a commit, an adapter's late
+/// reply to a tombstoned id arrives during that hold, and delivering it
+/// blocks on the same lock -- inside the reader task, on a runtime worker.
+/// The adapter then exits, `process::supervise` reaps it and gives the
+/// stream `process::READER_DRAIN` to reach its end, and the budget expires
+/// on a reader that is not waiting on the adapter at all but on the host's
+/// own lock. The connection is reported as having held its stdout open
+/// past its exit.
+///
+/// Nothing this adapter did is a violation. It answered late -- which
+/// spec/wire.md §6 permits, and which the host answers with a tombstone,
+/// not a kill -- and then exited. And a false violation is not a safe
+/// direction to fail in: §8.1 condition (9) reads one as grounds to
+/// suppress a retraction, so the host stays quiet about a record it should
+/// have retracted, on evidence it invented.
+///
+/// # Why the assertion is the runtime's clock, and not `StdoutHeldOpen`
+///
+/// Because the stall is deterministic and the misclassification it causes
+/// is not. A reply blocked inside the reader task blocks a runtime worker
+/// **holding that worker's core**, and with it the runtime's driver: no
+/// timers, no readiness, for the whole hold. That is not one stalled
+/// connection, it is the process. Whether the drain budget then expires on
+/// the right side of the reap is a scheduling race -- the freeze often
+/// swallows the reap too and hides its own consequence. Racing that is not
+/// a test; the stall is not a race, and it is the only way to reach the
+/// misclassification, so the stall is what is asserted, alongside the
+/// outcome that must not appear.
+///
+/// # Why the hold runs on its own thread
+///
+/// Because the real one does: `sumer_store`'s sweep commits from the
+/// thread that called `Runtime::block_on`, never from a worker. It also
+/// keeps the measurement honest. A hold that blocks a runtime-associated
+/// thread can stall the driver on *any* build, correct or not, if that
+/// thread happens to be driving -- which is a false failure waiting for a
+/// loaded machine. Blocking a thread the runtime does not own leaves the
+/// only possible stall the one this test is about.
+///
+/// One-sided by construction: on a build that does not stall delivery the
+/// timer keeps its own 20ms schedule and no amount of machine load moves it
+/// near the bound; on one that does, it stops for the whole hold, which is
+/// more than double the bound.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_held_verdict_does_not_freeze_the_connection_or_invent_a_violation() {
+    // 400ms deadline: the first call is tombstoned long before the reply
+    // it is waiting for. The adapter answers it anyway at ~1s and exits in
+    // the same breath.
+    let script = format!(
+        "{PRELUDE}\nimport time\nhello_ok(read())\nreq = read()\ntime.sleep(1.0)\n\
+         send({{'id': req['id'], 'ok': {{'resources': []}}}})\nsys.exit(0)\n"
+    );
+    let handle = std::sync::Arc::new(
+        spawn(&script, Duration::from_millis(400))
+            .await
+            .expect("handshake"),
+    );
+
+    let timed_out = handle.resources_list().await;
+    assert!(
+        matches!(timed_out, Err(HostError::Timeout)),
+        "the first call must be tombstoned, not answered: {timed_out:?}"
+    );
+
+    // A tokio timer on the runtime this connection lives on: the cheapest
+    // thing that stops when the runtime does.
+    let base = std::time::Instant::now();
+    let last_tick = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+    {
+        let last_tick = last_tick.clone();
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+                let now = u64::try_from(base.elapsed().as_millis()).unwrap_or(u64::MAX);
+                last_tick.store(now, std::sync::atomic::Ordering::SeqCst);
+            }
+        });
+    }
+
+    // The gate's critical section, exaggerated to 2.5s: it opens before the
+    // late reply lands (~0.6s from here) and stays open long past the 1s
+    // drain budget the adapter's exit starts.
+    let gate = {
+        let handle = handle.clone();
+        let last_tick = last_tick.clone();
+        std::thread::spawn(move || {
+            handle.with_contract_violation_held(|violation| {
+                std::thread::sleep(Duration::from_millis(2500));
+                let now = u64::try_from(base.elapsed().as_millis()).unwrap_or(u64::MAX);
+                let last = last_tick.load(std::sync::atomic::Ordering::SeqCst);
+                (violation, now.saturating_sub(last))
+            })
+        })
+    };
+    tokio::time::sleep(Duration::from_millis(2600)).await;
+    let (seen, stalled_for) = gate.join().expect("the gate thread");
+
+    assert!(
+        stalled_for < 800,
+        "the runtime went {stalled_for}ms without servicing a 20ms timer while the \
+         verdict was held: delivering a late reply is waiting on the same lock, inside \
+         the reader task, on a worker whose core it holds while it waits. A host that \
+         cannot run its own timers cannot reap a child or meet a drain budget either, \
+         and an adapter that merely answered late gets charged with StdoutHeldOpen"
+    );
+    assert_eq!(
+        seen, None,
+        "nothing this adapter did is a violation: it replied late to an id the host \
+         had already given up on, and spec/wire.md §6 says the connection survives"
+    );
+    assert_eq!(
+        handle.contract_violation(),
+        None,
+        "and none was established while the verdict was held either -- a reply the \
+         host stalled on its own lock is not an adapter holding its stdout open"
+    );
+    let handle = std::sync::Arc::try_unwrap(handle)
+        .ok()
+        .expect("the gate thread is joined");
+    match handle.close().await {
+        Some(Terminal::Crashed(Some(0))) => {}
+        other => panic!(
+            "a late reply and a clean exit, judged while a verdict was held, must \
+             still read as a clean exit -- got {other:?}"
+        ),
     }
 }

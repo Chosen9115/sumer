@@ -14,33 +14,49 @@ and it is not revocable.
 reports what the provider says now. It does not remember what it saw last
 time in order to announce that something has gone.
 
-What that means for you, concretely: **a transaction dropped from the
-mempool, or reorged out of the chain, stays in the host's live set.** The
-host was told the transaction was there, nothing ever tells it otherwise,
-and no later sync of this adapter corrects it. Everything else is
-self-correcting, on a `history.read` with no `page`: a re-mined
-transaction, a changed height and a new transaction all arrive on that
-crawl. (A *cursor-resumed* crawl corrects only what lands strictly above
-the cursor — a height that moved to at or below it is suppressed, and that
-is a known limit of its own, below.) A *disappearance* is corrected by
-neither, because absence is not expressible on this wire without a
-tombstone and a tombstone is exactly what this adapter no longer sends.
+**The host closes this now, and this adapter did not change.** A Sumer host
+derives absence itself: when a `history.read` that began at `page: None`
+drains, reports `fetched` on every page and passes the rest of the eight
+gates in `spec/observation.md` §8.1, a record the host holds live and the
+sweep did not carry is **retracted** — recorded in the host's own
+append-only retraction table, under the same transaction as the sweep's
+final page. So a transaction dropped from the mempool or reorged out no
+longer sits in the live set forever. See
+`adr/0006-host-side-retraction.md`.
 
-**Why it was removed rather than fixed.** Retracting needs the adapter to
-remember what it reported, and a lost retraction is lost permanently:
-nothing probes a transaction no baseline holds. That one unrecoverable
-write forced every state write to be gated on the reply actually reaching
-stdout, and four adversarial rounds each found a different defect in that
-one boundary — a budget scoped wrong, a commit ordered wrong, a commit
-predicate wrong, and a cursor-resumed page filtering an omitted tombstone
-out of the accumulator. The fifth design was not attempted. Without
-retraction there is no unrecoverable write, so there is no delivery gate
-and no boundary to get wrong: every failure mode collapses to "re-derive on
-the next sync".
+Two things that follow, and neither is a footnote:
 
-**It comes back in PR 4**, designed once against the host's own persistence
-rather than against a file this adapter races itself on. See
-`adr/0004-bitcoin-adapter.md` decision 7.
+- **The reason is coarser than a tombstone's was.** A host deriving absence
+  cannot tell `reorged_out` from `dropped_from_mempool`, and does not
+  guess: both arrive as `absent_from_complete_sweep`. The distinction
+  needed state this adapter deliberately no longer keeps.
+- **A host that does not implement §8 is still exposed.** The limit closes
+  at the host layer, not here. Against any host that only ingests what this
+  adapter emits, a disappearance is still never reported — because absence
+  is not expressible on this wire, and a tombstone is exactly what this
+  adapter does not send.
+
+**Why it was removed from here rather than fixed here.** Retracting needs
+the adapter to remember what it reported, and a lost retraction is lost
+permanently: nothing probes a transaction no baseline holds. That one
+unrecoverable write forced every state write to be gated on the reply
+actually reaching stdout, and four adversarial rounds each found a
+different defect in that one boundary — a budget scoped wrong, a commit
+ordered wrong, a commit predicate wrong, and a cursor-resumed page
+filtering an omitted tombstone out of the accumulator. The fifth design was
+not attempted. Without retraction there is no unrecoverable write, so there
+is no delivery gate and no boundary to get wrong: every failure mode here
+collapses to "re-derive on the next sync". Host-side there is no gate to
+get wrong either — the evidence is the sweep rather than a remembered
+baseline, so nothing is lost by losing it, and nothing is deleted.
+
+Everything else this adapter reports is self-correcting on a `history.read`
+with no `page`: a re-mined transaction, a changed height and a new
+transaction all arrive on that crawl. (A *cursor-resumed* crawl corrects
+only what lands strictly above the cursor — a height that moved to at or
+below it is suppressed, and that is a known limit of its own, below. A
+Sumer host's `refresh` always sweeps from `page: None`, so it pays that
+cost only on an explicit `--resume`.)
 
 ## Backend
 
@@ -307,9 +323,10 @@ to assume. When an observation exceeds `MAX_OBSERVATION_BYTES` (64 KiB):
    provenance `completeness` becomes `partial`. Nothing else about the
    record changes;
 2. if it is *still* too large, it is omitted entirely, its resource's status
-   entry gains `degraded {local_id, bytes}` **beside** its `outcome` (never
-   instead of it), and the page keeps emitting everything else. One
-   pathological record must never brick a resource.
+   entry gains a `degraded {local_id, bytes}` entry — one per omitted
+   record — **beside** its `outcome` (never instead of it), and the page
+   keeps emitting everything else. One pathological record must never brick
+   a resource.
 
 ### A crawl is one point-in-time snapshot
 
@@ -535,10 +552,13 @@ run 1 reports it as `stale { as_of }` and emits no history at all.
   per resource, dropped as soon as the crawl drains. A host that starts
   crawls and never finishes them grows the adapter's memory by one wallet
   history per resource, once.
-- **No disappearance is ever reported.** The headline limit, stated in full
-  at the top of this file. A transaction dropped from the mempool or reorged
-  out stays in the host's live set until PR 4 lands the capability against
-  the host's own persistence.
+- **No disappearance is ever reported *by this adapter*.** The headline
+  limit, stated in full at the top of this file. It is now closed on the
+  host side — a Sumer host retracts such a record itself from a complete
+  sweep (`spec/observation.md` §8) — at the cost of a coarser reason:
+  `absent_from_complete_sweep`, never `reorged_out` or
+  `dropped_from_mempool`. Against a host that does not derive absence, the
+  limit stands unchanged.
 - **A cursor-resumed read never carries a revision that lands at or below
   the cursor.** A transaction this adapter reported `pending` and that is
   confirmed at a height at or below that cursor by the time of the next
@@ -548,16 +568,18 @@ run 1 reports it as `stale { as_of }` and emits no history at all.
   process as much as across two — pages of one crawl are one frozen
   snapshot, and a resume that outlives its crawl re-fetches. Only a
   `history.read` with no `page` re-emits it at its current state and repairs
-  the record. This is the same family as the limit below, and closes the
-  same way.
+  the record — which is what a Sumer host's `refresh` issues every time, so
+  in practice the record is repaired on the next refresh. It remains a real
+  limit for any host that resumes from a stored cursor by default.
 - **Adding an address does not invalidate a host-held cursor.** The new
   address's history sits at heights at or below the cursor, which `exact`
   forbids re-emitting, and this adapter has no channel to tell the host.
-  Latent in this PR only because cursors die with the crawl (`next: null`
-  on a drained page, and nothing persists them). **PR 4's cursor
-  persistence must invalidate the stored cursor when the address-set hash
-  changes**, or "adding an address is a revision" is false for history. See
-  ADR 0004.
+  **Closed on the host side**: a Sumer host records a `fingerprint` per
+  resource and drops the stored cursor when it changes, and `refresh`
+  sweeps from `page: None` regardless. Against a host that persists cursors
+  and does not invalidate them on a resource-definition change, "adding an
+  address is a revision" is still false for history. See ADR 0004 (revision
+  5) and `adr/0006-host-side-retraction.md`.
 - `window` page requests are not served (see above).
 - The mempool listing is capped by the provider at 50 transactions per
   address and is not paged.

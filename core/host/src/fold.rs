@@ -12,15 +12,14 @@
 //! expectations are checked against **one** implementation instead of two
 //! that could silently diverge.
 //!
-//! **Known limit: nothing in this crate calls it.** [`crate::AdapterHandle`]
-//! never assigns a revision -- `history_read` hands observations back and
-//! says the fold is the caller's step -- so the conformance suite is this
-//! module's only consumer today. "The host assigns `revision` by arrival
-//! order" is therefore proven against `Fold` itself, and against a `Fold`
-//! the suite drives over real adapter reads, but never end to end through
-//! a host doing it on its own behalf: an integration built on
-//! `AdapterHandle` alone would get no revisions at all and nothing would
-//! notice. Closes when the CLI arrives and becomes that caller.
+//! `sumer refresh` is this module's caller inside the host: it replays one
+//! ADAPTER's stored observations into one `Fold` in stored order (the key
+//! is `(adapter_id, local_id)`, so a per-resource replay would split a
+//! chain the moment a `local_id` moved resource), ingests the sweep's, and
+//! takes [`Fold::live_set`] as the base it derives retraction from
+//! (`spec/observation.md` §8). Revision assignment
+//! therefore has exactly one implementation, exercised both end to end by
+//! the CLI and directly by the conformance suite.
 //!
 //! **Revision order vs. chain order are two different things, on purpose.**
 //! `revision` is assigned strictly in the order [`Fold::ingest`] is called
@@ -130,6 +129,26 @@ impl Fold {
             .get(&(adapter_id.to_owned(), local_id.to_owned()))
             .map(|entries| entries.iter().map(|e| &e.revisioned).collect())
             .unwrap_or_default()
+    }
+
+    /// The highest `revision` in one chain -- the newest thing the host
+    /// has LEARNED about that key, which is not always the chain's head.
+    ///
+    /// The head is the last entry in the fold's total order; `revision` is
+    /// arrival order. The two disagree whenever `received_at` does not
+    /// increase with arrival (two surfaces reconciled out of order in one
+    /// page, or a wall clock that stepped backwards between refreshes),
+    /// and a question asked in arrival order must be answered in arrival
+    /// order. Liveness is such a question -- "has anything been learned
+    /// since the retraction at revision N?" -- so it asks this, not
+    /// `chain().last()`. Asking the head instead lets a backwards clock
+    /// step bury a record whose revision can then never grow past the
+    /// retraction, permanently.
+    #[must_use]
+    pub fn highest_revision(&self, adapter_id: &str, local_id: &str) -> Option<u64> {
+        self.chains
+            .get(&(adapter_id.to_owned(), local_id.to_owned()))
+            .and_then(|entries| entries.iter().map(|e| e.revisioned.revision).max())
     }
 
     /// Every `(adapter_id, local_id)` this fold has ever seen an

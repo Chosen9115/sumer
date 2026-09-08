@@ -7,14 +7,17 @@
 //! A5 (exact-resume) checks one implementation instead of trusting two to
 //! agree.
 //!
-//! **Known limit: nothing in this crate calls it either.** Like
-//! [`crate::fold`], this module's only consumer today is the conformance
-//! suite; [`crate::AdapterHandle`] issues whatever page request its caller
-//! hands it and computes no resume of its own. Closes when the CLI
-//! arrives.
+//! `sumer refresh` is this module's caller inside the host: it drives a
+//! resource's page loop through one [`ResumeState`], which is also what
+//! makes "a resumed sweep never retracts" checkable -- a sweep that did
+//! not begin at `page: None` fails the first gate in
+//! `spec/observation.md` §8.1.
 //!
 //! The three `cursor_resumable` families answer one question differently:
-//! *what do I resend if I have to start this page over right now?*
+//! *what do I resend if I have to start this read over right now?* That is
+//! the only question [`ResumeState::next_request`] answers -- a page loop
+//! advances on the reply's own `next`, because two of the three families
+//! have a durable point that never moves.
 //!
 //! - `exact` -- the durable point is the `next` from the last **completed**
 //!   page. Every completed page is a safe place to resume from.
@@ -54,10 +57,20 @@ impl ResumeState {
         }
     }
 
-    /// What to send for the next page fetch -- whether that is simply
-    /// "the next page in an uninterrupted read" or "resume after a crash,
-    /// on a fresh connection with no memory of it": both ask the same
-    /// question and get the same answer, per the policy table above.
+    /// **The durable resume point**: what to resend if this read had to be
+    /// started over right now, on a fresh connection with no memory of it.
+    /// That is the one question this answers, and it is the one the caller
+    /// persists between pages.
+    ///
+    /// It is **not** "the next page of an uninterrupted read". An earlier
+    /// version of this comment claimed both questions get the same answer;
+    /// its first real caller (`sumer-store`'s sweep) says otherwise and is
+    /// right. Under `batch_restart` and `none` the durable point never
+    /// moves, so a page loop driven by this value asks for the batch start
+    /// for ever and never advances. A loop advances on the page reply's own
+    /// `status.page.next`; it consults this only for the cursor it writes
+    /// down.
+    ///
     /// `None` once an `exact` read has fully drained (a page returned
     /// `next: None`) -- the only family with a terminal state here.
     /// `batch_restart` always resends its batch start and `none` always

@@ -117,6 +117,163 @@ A balances list is the only shape that survives contact with all three without
 either inventing categories a provider never reported or silently dropping
 ones it did.
 
+### Freshness is derived from the read, not written onto the row
+
+A host that keeps a balance history — this one appends every line it reads and
+overwrites nothing — has a problem the wire itself does not. A figure it did
+**not** read this time stays on top of its category's history, still carrying
+the staleness of the last read that *did* succeed, and goes on rendering as
+`Live` long after the reads stopped working.
+
+The rule that answers it is one comparison:
+
+> **A stored balance line is fresh iff the read that wrote it is that
+> adapter's most recent read.** A host opens a read for an adapter **before
+> anything that can fail**, and stamps every line that refresh stores with
+> it. A line from any earlier read is not fresh, and nothing else is.
+
+What the rule constrains is the *ordering*, not the count: opening a read more
+than once in a refresh is harmless, because only the current value is ever
+compared and every extra bump merely re-establishes the same invariant. What
+is not harmless is opening one late. A read opened after the first step that
+can fail leaves every earlier failure stamping its rows with the *previous*
+read, which is exactly the figure-looks-current bug this rule exists to
+remove. A host with more than one entry point into a refresh should open the
+read at each of them rather than reason about which one ran first.
+
+**Why a derivation and not a marker on the row.** The opposite shape is the
+obvious one: on every path where a balance was not read, write a row saying
+so. That shape is correct only if the paths are enumerated exhaustively, and
+they cannot be enumerated by inspection — `adr/0006-host-side-retraction.md`
+records what that cost. Deriving freshness inverts the obligation. Every one
+of these stores no line carrying the read it opened, so every figure it did
+not refresh stops being fresh **by construction**, with nothing to remember:
+
+- a `balances.read` that failed;
+- a reply that named the resource and omitted a category that resource has
+  reported before;
+- a resource the adapter has stopped listing — including one dropped from a
+  listing that otherwise **succeeded**, which no failure path ever visits;
+- a `resources.list` or a `status.read` that never returned;
+- a process that would not spawn;
+- a connection refused under §8.1's `hello` rule.
+
+Only the last of those is a rule of this document; the rest are ways a refresh
+can end. That is the point: the list does not have to be complete. A path
+nobody anticipated writes no rows either, and its figures go stale on the same
+comparison as everything else.
+
+**The converse holds, and is easy to get backwards.** A failure *after* a
+successful balances read must not downgrade a figure that genuinely was read
+this run. The read is opened once and stamps what it stored; a sweep that
+fails afterwards does not un-stamp it. Freshness is a claim about which read
+produced the line, never about whether the refresh that opened that read went
+on to succeed at everything else.
+
+**A host writes no balance row of its own.** §8.4's answer for retractions — a
+separate table, with **no provider field to fabricate** — needs no restatement
+here, because there is no host-authored balance row on which to fabricate one.
+The **`unread:` outcome prefix** an earlier version of this document required
+is **withdrawn**: a stored `outcome` is now always the §6 outcome the adapter
+reported for that resource, in the reply the line came from, and nothing else.
+
+A consumer still has two claims to tell apart, and still can:
+
+- **"the provider could not tell me"** is a line from the latest read whose
+  `amount` is null — the adapter looked and does not know, and null is
+  UNKNOWN, **never zero**;
+- **"I did not read this"** is any line the latest read did not write.
+
+The first is evidence about a provider; the second is a statement about the
+host. They are now different by construction rather than by a prefix: one is
+in the current read, the other is not.
+
+A category with no stored line is left alone. There is no figure there to
+protect from looking falsely current, and writing anything for it would be the
+host asserting the category exists on the strength of nothing.
+
+### A balance from another adapter is refused, and so is its reply
+
+> **A balance whose `provenance.adapter_id` is not the connection's own is
+> refused, and with it the whole `balances.read` reply.**
+
+§8.1 condition (8) refuses a foreign *observation* one at a time, and can
+afford to: downstream of the decode a history page still faces the retraction
+gate, a judge that disqualifies the sweep and keeps what was honest. A
+balances reply has no such judge. A host files each balance under the
+connection it came from, so a contradiction that survives the decode is
+silently resolved in favour of the wrong adapter — the figure lands under the
+connection's `adapter_id`, and the claim that some other adapter observed it
+is simply lost.
+
+It is refused whole rather than line by line because nothing downstream of the
+decode could tell a refused line from an absent one: the rest of the reply
+would be stored as if the connection had never contradicted itself, and no
+consumer could see that it had. Refusing whole is only *safe* because
+freshness is derived — a refused read writes no row, so what is on screen goes
+stale rather than staying `live` with another adapter's number on it. A marker
+scheme would have owed this refusal a path of its own, which is one more path
+to enumerate.
+
+### A balance nobody asked for is refused, and so is its reply
+
+> **A `balances.read` reply may carry a balance only for a `resource_id` the
+> call requested. A balance for any other resource is refused, and with it the
+> whole reply.**
+
+This is §6's coverage rule seen from the other end, and it is one rule, not
+two: a reply that answers for a resource nobody asked about carries no status
+the host asked for either, so the figure arrives with **no §6 outcome behind
+it** — and every reader of a missing status entry falls back to a permissive
+default. The line is stored against the read that is current, stamped `Live`
+because nothing said otherwise, with an outcome the host had to invent, and
+`sumer balances` prints it as `live`. **A `Staleness` default is a claim**, and
+a host that defaults to `Live` is asserting a freshness it was never told. No
+observation without a status; no freshness claim without an outcome.
+
+The shape is not hypothetical. An adapter that listed resources A and B, and
+whose next **successful** listing carries only A, is asked about A alone. A
+reply that volunteers B's balance anyway — honest provenance, plausible figure,
+no status — puts B back on screen as `live` on the strength of nothing, in the
+exact case the derived-freshness rule above had just made go stale.
+
+It is refused whole rather than line by line for the reason the previous rule
+gives — a balances reply meets no judge downstream of the decode — and it is
+safe for the same reason: a refused read writes no row, so the figures already
+on screen go stale rather than being replaced by figures nobody asked for.
+
+**A status the adapter volunteered alongside the balance does not rescue it.**
+The bound is the REQUEST, not the presence of a status entry. The two coincide
+in the case above and come apart in the one that matters: an adapter that
+volunteers *both* a balance and a matching `fetched` status for the resource it
+just dropped from its listing has produced complete paperwork for a figure
+nobody asked for, and a status-bounded rule admits it — same figure, same
+screen, same `live`, one more field. The request is the only bound the adapter
+does not also author.
+
+**And such a reply is a wire-contract violation, not merely a rejected one.**
+The read is refused with `invalid_request`, and under §8.1 condition (9) that
+refusal disqualifies every sweep the same refresh goes on to run over that
+connection. A connection that has just answered a question nobody asked does
+not, in the same breath, get to license the retraction of a live record.
+
+**What this does not refuse.** A resource that is still listed and does carry
+its own status entry is being *answered*, not volunteered: its balance is
+stored exactly as before, however many resources the call named. Dropping a
+figure an adapter legitimately reported would be this rule's own bug.
+
+**A host therefore never holds a balance for a resource it has no `resource`
+row for.** A `balances.read` names the resources of the listing that opened
+the refresh, so an accepted line always has one. There is no orphan-balance
+case to define, because nothing can reach it.
+
+A `history.read` reply is bounded by its request in the same way, and the
+bound is enforced downstream rather than at the decode: an observation
+addressed to a resource the sweep did not ask about is not part of that
+resource's page, and §8.1's gate drops it unstored instead of folding it in.
+Its provenance is judged first even so — condition (8) is about every
+observation on the page, whatever resource it names.
+
 ## 3. History observations
 
 **Adapters emit observations, not revisions.** A history observation is:
@@ -165,11 +322,11 @@ that interprets either. A consumer that renders it as markup is the bug; the
 `(adapter_id, local_id)`.** It does not appear in what an adapter emits.
 
 Why this is a requirement and not a convenience: a restarted or stateless
-adapter — which describes most real adapters, since this milestone's cursor
-and revision stores are in-memory on the host side (see
-`constitution/FOUNDING_PLAN.md` §10) — has no durable memory of how many times
-it has previously emitted an observation for a given `local_id`. It cannot
-know, correctly, that the observation it is about to emit is "revision 3."
+adapter — which describes most real adapters, and the reference Bitcoin
+adapter by deliberate design (`adr/0004-bitcoin-adapter.md` decision 7) — has
+no durable memory of how many times it has previously emitted an observation
+for a given `local_id`. It cannot know, correctly, that the observation it is
+about to emit is "revision 3."
 Requiring it to know that would demand a capability no real adapter has:
 either persistent state the adapter must maintain and keep consistent with the
 host forever, or a round-trip query to the host before every emission to ask
@@ -240,6 +397,48 @@ the deduplication key, and is not present on every observation to begin with
 (it is optional; a pending-only surface may have nothing the provider itself
 calls an id yet). The live set is always the fold over observations keyed by
 `local_id`, never a naive unique-by-`provider_id` pass.
+
+### One `local_id`, one `resource_id` at a time
+
+**An adapter MUST NOT report the same `local_id` under two `resource_id`s at
+the same time.** This is the rule above seen from the adapter's end. Because a
+record is keyed `(adapter_id, local_id)` and `resource_id`s are free to
+collide, the key carries no resource in it — so a `local_id` that turns up
+under a second `resource_id` can only mean the record **moved**, and the host
+will treat it as exactly that: the move is a changed fact, so it appends a
+revision, the record is live under the new resource, and the old resource's
+listing no longer contains it. Nothing is retracted there — the fold's head for
+that key now names the other resource, so the old resource's next sweep does
+not find it in the live set it diffs against (§8) and has nothing to retract.
+
+The host can tell a move from a re-report only because the two differ, so
+`resource_id` is one of the fields the host's content hash discriminates on.
+Leave it out and the second resource's observation is deduplicated against the
+first's head: nothing is stored under the new resource, the head keeps the old
+resource's attribution, and the old resource's next sweep retracts a record the
+adapter reported in that very refresh — with the outcome decided by which
+resource happened to be swept first.
+
+**The counterexample is real, and the escape hatch is the `local_id` itself.**
+A transfer between two of the user's own wallets is genuinely visible from
+both, and the provider will hand the adapter the same id for it twice. Two
+resources reporting one real-world event are two records in this model, not
+one, so the adapter must derive **distinct `local_id`s** for them — by taking
+the resource id as an input to the derivation alongside the provider data. The
+reference Bitcoin adapter already does this: `local_id = "<resource_id>:<txid>"`
+(`adapters/bitcoin/src/map.rs`, `adr/0004-bitcoin-adapter.md` decision 2). This
+rule makes that convention normative for every adapter rather than a local
+habit of one. It costs the derivation nothing: a resource id is ordinary
+adapter-scoped input, and the function stays the deterministic pure function
+this section requires.
+
+**An adapter that ignores this produces a well-defined, useless history.** One
+`local_id` reported under two resources on every refresh appends one revision
+per sweep for ever — a chain that grows without a single fact changing — and
+the record renders under whichever resource swept last. The host cannot do
+better: "moved" and "reported twice" are the same bytes, and choosing between
+them would mean inventing evidence. This is the adapter's bug, and it is the
+adapter's to fix.
 
 ## 4. One model, two domains: pending→posted and reorg
 
@@ -334,6 +533,21 @@ produced any observations. A status entry is:
     rate_limited { retry_after_ms }, unavailable, reauth_required, revoked,
     gone, sca_required
 
+**Neither half is tidiness.** Every reader of a `statuses` array reaches for
+one entry per resource and takes the first match, so a **duplicate** entry is
+contradictory evidence judged on whichever half the reader matched first: an
+adapter that answers cleanly and then with `stale` and an anonymous `degraded`
+is read as complete and undegraded, and the sweep retracts on it. A **missing**
+entry is worse, because every one of those readers spells the absence as its
+own permissive default. `history_start` is the sharp one: it is optional, so a
+resource with no entry at all is indistinguishable from one that reported no
+lower bound on its history — the widest possible answer, under which the whole
+of history is in reach and every absence is evidence (§8.2). A missing bound
+must never widen what an absence may be evidence of. Staleness defaults the
+same way, to `Live` (§1), which is why §2 refuses a balance for a resource the
+call never asked about rather than storing a figure whose freshness no outcome
+supports.
+
 **`outcome` carries the freshness fact and nothing else.** It is what §1's
 staleness table reads, so anything that overwrites it changes how every
 observation from that resource is stamped. The oversized-observation
@@ -341,13 +555,25 @@ degrade below is not a freshness fact — a resource can be serving cached
 data *and* have dropped one record for size — so it rides in its own
 optional field:
 
-    degraded?: { local_id?, bytes }
+    degraded?: [ { local_id?, bytes } ]
 
-An absent `degraded` means nothing was dropped. It is set by whichever
-side did the omitting (the adapter, or the host enforcing the cap at
-decode), and it never replaces `outcome`: a resource that answers
-`stale { as_of }` and drops an oversized record reports both, on one entry,
-and its surviving observations are still stamped `Cached`.
+**`degraded` is a list, one entry per dropped record.** An absent list and
+an empty one say the same thing — nothing was dropped — so the field is
+omitted when empty rather than sent as `[]`. Whichever side did the omitting
+(the adapter, or the host enforcing the cap at decode) **appends** an entry;
+no side ever *sets* the field, and it never replaces `outcome`: a resource
+that answers `stale { as_of }` and drops an oversized record reports both,
+on one entry, and its surviving observations are still stamped `Cached`.
+
+**Append, never set — nothing a host writes may weaken what an adapter
+said.** A single-valued `degraded` loses every drop but the last: two
+oversized records on one page leave the first an unexplained absence, and an
+unexplained absence is retracted (§8). Worse, the two kinds of entry are not
+interchangeable — an **anonymous** entry disqualifies a sweep (§8.1
+condition 5) while a **named** one merely exempts one id — so a
+host-authored named entry overwriting an adapter's anonymous one converts a
+signal that blocks a retraction into one that permits it. Appending is what
+lets both facts survive on one entry.
 
 **Oversized-observation handling** is a two-step degrade, never a hard
 failure of the page:
@@ -361,29 +587,41 @@ failure of the page:
    is the one field with no bounded shape.
 2. If the observation is **still** too large after truncating
    `provider_extra` (an oversized `description`, for instance, is not fixed
-   by step 1), the adapter **omits that observation entirely**, sets
-   `degraded { local_id?, bytes }` on that resource's status entry — leaving
-   the entry's `outcome` exactly as it would have been otherwise — and
-   **continues the page**: it keeps emitting every other observation that
-   fits.
+   by step 1), the adapter **omits that observation entirely**, appends a
+   `{ local_id?, bytes }` entry to that resource's status entry's `degraded`
+   list — leaving the entry's `outcome` exactly as it would have been
+   otherwise — and **continues the page**: it keeps emitting every other
+   observation that fits.
 
 **The host enforces the cap too, at decode.** Steps 1 and 2 are the
 adapter's obligations, and an adapter that skips them is non-conforming — but
 "the adapter promised" is not enforcement. A host MUST measure each decoded
 observation and, for any that still exceeds `MAX_OBSERVATION_BYTES`, perform
-step 2 itself: omit that observation, set `degraded { local_id?, bytes }` on
-its resource's status entry, and continue the page. The host does
-not attempt step 1 (truncating `provider_extra` on the adapter's behalf) —
-that would hand a caller a record the adapter never emitted, silently
-altered.
+step 2 itself: omit that observation, append a `{ local_id?, bytes }` entry
+to its resource's status entry's `degraded` list, and continue the page. The
+host does not attempt step 1 (truncating `provider_extra` on the adapter's
+behalf) — that would hand a caller a record the adapter never emitted,
+silently altered.
 
 Because **every requested `resource_id` appears in `statuses` exactly once**,
-the host sets `degraded` on that resource's existing entry rather than
-appending a second one; everything else on the entry — `outcome`,
+the host appends to that resource's existing entry's `degraded` list rather
+than adding a second status entry. The two rules are separate and both hold:
+one status entry per resource, and on it as many `degraded` entries as
+records were dropped. Everything else on the entry — `outcome`,
 `provider_detail`, and `page`, so the resource stays resumable — is left
-untouched. `bytes` is the size the host measured on its own serialization
+untouched, and so is every entry already in the list, including any the
+adapter wrote. `bytes` is the size the host measured on its own serialization
 of the decoded observation, which differs from the adapter's bytes only in
 JSON whitespace and key order.
+
+**One observation is exempt from that measurement**: one whose
+`provenance.adapter_id` is not the connection's own. §8.1 condition (8)
+refuses such an observation outright, whatever its size, and that refusal
+outranks this section — it is never measured, never dropped for being
+oversized, and never turned into a `degraded` entry. §8.1 carries the
+reason. A *balance* whose `provenance.adapter_id` is foreign is not measured
+either, and for a stronger reason: §2 refuses its whole reply, so nothing in
+it reaches this section at all.
 
 **Why `degraded` is a field and not an outcome.** An earlier version of this
 document spelled the degrade as an outcome, `oversized_observation`, which
@@ -422,3 +660,407 @@ collapsing them into one field would make the host unable to tell "reconnect
 this credential" from "re-run this authentication step" apart. It also
 reports `history_start?`, since a provider may only ever have promised history
 back to a given point, distinct from any pagination cursor.
+
+## 8. When a host may derive absence
+
+Every section above this one describes something an adapter says. This one
+describes something no adapter ever says, and that a host must therefore work
+out for itself: that a record the provider used to report is **gone**.
+
+**Absence is not expressible on this wire.** An adapter reports what *is*.
+There is no frame meaning "and nothing else exists," no per-resource manifest,
+and no way for the host to tell an adapter what it has already seen — the host
+is always the requester (`spec/wire.md` §1), a request carries no prior state,
+and a reply carries observations and statuses and nothing that quantifies over
+their complement.
+
+A tombstone (§4) is not a counterexample. A `tombstoned` observation is an
+adapter's *positive* claim about one named `local_id` it went and checked. An
+adapter that cannot make that claim — because it keeps no memory of what it
+reported last time, which is what `adr/0004-bitcoin-adapter.md` decision 7
+records — says nothing at all about the record, and "said nothing" is
+indistinguishable on the wire from "never existed."
+
+So a host that wants to know a record disappeared has to **derive** it, from
+the shape of a read rather than from anything carried inside it. The rest of
+this section is the rule for that derivation. It binds any host, not only this
+project's. It is written this tightly because the failure mode is not an error
+message: deriving absence wrongly means telling a user that their money's
+history is missing.
+
+### 8.1 A complete sweep: nine conditions
+
+A **sweep** is one `history.read` for one resource, pursued to its end. A host
+MUST NOT derive absence from anything else. A sweep is **complete** only if all
+nine of these hold:
+
+| # | Condition | Why it is not optional |
+|---|---|---|
+| 1 | It began at `page: None` | A read resumed from a stored cursor has, by construction, not looked at what lies behind that cursor. It cannot speak for it. |
+| 2 | Every page came from **one adapter process** and **one** host-side crawl | A sweep stitched across a restart, or across two crawl attempts, is two partial views of two different moments — never one view of one. |
+| 3 | It drained: the final page returned `next: null` | An undrained read has, by its own report, more to say. |
+| 4 | Every page's status entry for that resource carried outcome `fetched` | `fetched { page_empty }` (either value) is the only outcome that claims the page was actually read. Every other outcome in §6 — `stale`, `not_fetched`, `rate_limited`, `unavailable`, `reauth_required`, `revoked`, `gone`, `sca_required` — says something else. |
+| 5 | No page carried an **anonymous** `degraded` entry for that resource | See below; a `degraded` entry that names a `local_id` is a different fact and does not disqualify. `degraded` is a list (§6), and it is judged entry by entry: one anonymous entry fails this condition however many named entries sit beside it. |
+| 6 | Every page reported `cursor_resumable: exact` | Derived from §5: `batch_restart`'s intermediate cursor is explicitly not trusted across a resume and `none` has no durable cursor at all, so neither family supports the claim "this read covered the whole span between its start and its drain." A resource in either family therefore never produces a complete sweep, and never retracts. |
+| 7 | It ran over **one connection**, whose hello `local_id_derivation` (`spec/wire.md` §4) the host recorded against that crawl | The ids a sweep is compared against are only comparable to the ids it emitted if one derivation produced both. |
+| 8 | Every observation's `provenance.adapter_id` was the connection's own | §3 keys every per-record structure by `(adapter_id, local_id)`, and a host keys the rows it is about to compare against by the adapter it is connected to. An observation naming another adapter means those two keyings have come apart, and the host is holding two notions of one chain. **A host cannot conclude an absence from a set it cannot key.** |
+| 9 | The connection had broken **no wire contract anywhere in this refresh**, including on reads that were not this sweep's — judged against what the host has established **at the moment this sweep commits**, not merely at the moment of each call | A host derives absence from the *shape* of a read, so it has to be able to trust that the connection is answering the questions it was asked. An adapter that has just answered one nobody asked has demonstrated it is not. Absence is evidence only when the host is confident it looked properly. **A violation need not surface as a failed call**: it can arrive behind a reply the host has already delivered, so a host that judges this condition on a value captured when the sweep started will commit on evidence it has already disproved. |
+
+**Failing any one of the nine makes the sweep PARTIAL.** A partial sweep still
+persists every observation it read — those are evidence, and evidence is never
+discarded for being incomplete — and **retracts nothing**. There is no partial
+retraction, and no threshold that turns a partial sweep into a whole one.
+
+**Condition (9) is refresh-scoped, and this list is where it belongs.** The
+first eight conditions are facts about one sweep — its pages, or the connection
+*while it was sweeping*. (9) widens the window to the whole refresh of that
+adapter: every read the host made on that connection, in order, `hello`
+onwards. A `balances.read` that answers for a resource the call did not name is
+refused at the decode long before the first page of any sweep is requested, and
+it disqualifies every sweep on that connection — including the ones whose own
+pages are flawless.
+
+**The taint is forward-only**, and it is the whole refresh's reads in order
+that (9) quantifies over: a violation disqualifies every sweep that *starts
+after* it, not the ones already committed. A sweep that has already run decided
+on the evidence it had, and a retraction it made is not final — the next
+complete sweep that carries the record again revives it (§8.4). A sweep that
+has not started yet has no such excuse. In practice the adapter-wide reads
+(`hello`, `resources.list`, `status.read`, `balances.read`) all precede every
+sweep, so a violation there taints all of them; a violation inside one
+resource's own `history.read` taints that resource's siblings swept after it.
+
+**(9) is judged at the moment of COMMITMENT.** A violation is not always
+something a read *returns*. An adapter may answer a qualifying final page —
+drained, `fetched`, `exact` — and, in the same breath, send a duplicate reply or
+a malformed frame. The host detects it and ends the connection, but it cannot
+un-deliver a reply already handed to the caller, and it MUST NOT: a delivered
+reply is delivered. So the sweep holds a successful read and no error arm ever
+runs. A host MUST therefore evaluate (9) against the violation state of the
+connection **as of the instant it commits** the sweep's verdict — inside the
+same decision as the other eight conditions, so that a violation established
+between the last reply and the commit disqualifies rather than being raced past.
+
+**Reading the verdict late is not enough; the ordering MUST be enforced.** A
+host that merely re-reads the violation state shortly before committing has
+narrowed the window, not closed it. Detection typically runs concurrently with
+the sweep — a reader task on another thread — so between the read and the commit
+sits every instruction the commit takes, and a violation published there is one
+the host established *before* the sweep was durable. The absence of a suspension
+point between the read and the commit proves nothing: another thread does not
+need this one to yield. A host MUST therefore make the two mutually exclusive,
+so that every violation it establishes falls either strictly before the verdict
+the sweep judged on or strictly after that sweep is durable. Holding the lock
+that guards the violation state across the commit is the obvious way; any
+mechanism with the same ordering is conforming.
+
+**Only the violation state.** The exclusion MUST NOT extend to the rest of the
+connection. A host that freezes the whole connection for the length of the
+commit stops delivering replies too, and a reply stalled inside the host's own
+reader is a reader that misses whatever deadline the host measures its adapters
+against -- so the adapter gets charged with a violation the host manufactured.
+That is not a safe direction to fail in: under this very condition a false
+violation suppresses a legitimate retraction, so the mechanism meant to keep the
+gate honest becomes a second way to get it wrong. The rule is an ordering on
+publication, and publication is the only thing it may exclude.
+
+This is not retroactive and does not contradict the paragraph above: the
+ordering is *detection, then commitment*. What is forbidden is reconsidering a
+sweep that has already committed. A sweep that has not committed yet is still
+deciding, and it must decide on everything the host knows by then. A host can
+only answer for violations it has judged by that instant — bytes still in
+flight are nobody's violation yet — and that is the honest limit of the
+condition, not a licence to read the answer early.
+
+It is a **condition in this list**, not a separate taint mechanism sitting
+beside it, and that placement is the decision. This table's whole value is that
+it is exhaustive: a host implementer reads nine rows and knows every reason a
+retraction can be withheld, and an auditor reading `crawl.disqualified_reason`
+finds every verdict spelled in one vocabulary. A second, unlisted mechanism that
+disqualifies sweeps without appearing here would make the table a lie in
+exactly the way that costs a reader their next bug. Conditions (2) and (7) are
+already about the connection rather than about the pages, so a
+connection-scoped condition is not a foreign body here.
+
+**What (9) does not cover: an honest failure.** An adapter that answers `err`
+in the contract's own closed vocabulary (`spec/wire.md` §8), that times out, or
+that dies, has failed — it has not lied. None of those says anything about the
+history the connection goes on to serve, and a host that treated them as taint
+would switch off retraction for a resource on any rate-limited balances call,
+which is to say most of the time. What taints is a reply the host could not
+reconcile with the contract: `invalid_request` — the code a host uses for a
+reply that is not the shape the protocol requires — and a fatal protocol
+violation. The asymmetry is deliberate and it is the same one §4 draws between
+`fetched` and everything else: a host distinguishes "I could not read" from "I
+was told something that cannot be true."
+
+Contrast the `hello`-mismatch rule below, which abandons the whole refresh
+before writing anything. That rule is stronger because a connection that is not
+the adapter it replaced has nowhere honest to put *anything* it says. A
+connection that merely broke the contract on one read still speaks for the
+right chain, so what it delivered is kept as evidence — it just no longer
+licenses a conclusion drawn from what is missing.
+
+**Condition (8) is the single exception, and it is one observation wide.** An
+observation naming another adapter is refused rather than stored: there is
+nowhere to put it. Under this connection's `adapter_id` the host would be
+recording, as fact, a provenance the record itself denies; under the
+`adapter_id` the record names, one adapter would be appending to another's
+history, which is the reason §3 keys ids per-adapter at all. There is no third
+place. The rest of the page persists exactly as it would under any other
+disqualifier — a refused observation is not a poisoned page. A refused
+observation is also **not** counted as one this adapter reported: it can never
+suppress a retraction, or a host would learn to hide a disappearance by
+mislabelling its provenance.
+
+**A connection that does not claim to be the adapter it replaced is refused
+whole.** Condition (8) compares an observation's `provenance.adapter_id`
+against *the connection's own*, and a host learns that from the connection's
+`hello`, never from the `adapter_id` it has stored for the argv it ran. If
+those two disagree, the host MUST abandon the whole refresh for that adapter
+before writing anything, rather than sweeping and refusing observations one at
+a time. The reason is that there is nowhere honest to put anything such a
+connection says: stored under the recorded `adapter_id` the host records as
+fact a provenance the connection denies, and stored under the announced one
+this adapter writes another's history (`spec/wire.md` §10). Refusing
+observation by observation still lets everything else it says land under a key
+it never claimed. A host that trusts the id it remembered over the id that
+just announced itself is holding exactly the two notions of one chain that
+condition (8) exists to catch.
+
+**Condition (8) outranks §6.** An observation whose `provenance.adapter_id` is
+not the connection's own is refused **whatever its size**. It is never
+measured against `MAX_OBSERVATION_BYTES`, never dropped for being oversized,
+and never turned into a `degraded` entry — the foreign provenance is decided
+first, and nothing about the record's size can change that answer.
+
+The order matters because the two dispositions point opposite ways. A refusal
+**blocks** a retraction: the sweep is partial and nothing retracts. A named
+`degraded` entry **exempts one id and permits the sweep to complete**: every
+other absent record still retracts. So a host that measured first and filed an
+oversized foreign observation as a degrade would convert the strongest signal
+in this gate into a permission — one record's provenance breaking the keying
+would license the retraction of everything else absent from that read, instead
+of blocking it. That was a live bug, and this ordering is the fix.
+
+**A `degraded` entry naming a `local_id` exempts that id and does not
+disqualify the sweep.** §6's `degraded` list carries one
+`{ local_id?, bytes }` entry per record omitted for size. When an entry names
+the id, the host knows exactly which record did not arrive and why: it exempts
+that `(adapter_id, local_id)` from retraction on this sweep and treats the
+rest as complete. When `local_id` is absent, the host knows only that
+*something* is missing and cannot say what, and condition 5 fails.
+
+**Every entry is judged on its own, and the disqualifier wins.** A page whose
+`degraded` list holds one anonymous entry and nine named ones fails condition
+5: the nine tell the host which nine records to exempt, and the one still
+leaves an unnamed record missing. A disqualifier cannot be diluted by adding
+named entries beside it — which is exactly what a single-valued `degraded`
+allowed, by letting a later named entry overwrite an earlier anonymous one
+(§6).
+
+Why that split is load-bearing rather than a nicety: the alternative — any
+degrade disqualifies — hands one oversized record a permanent veto. §6's
+degrade is deterministic per observation: it depends on `MAX_OBSERVATION_BYTES`
+and the observation, so the same record is omitted on every read of it. A
+resource holding one such record would never produce a complete sweep again,
+and retraction would be dead for that resource **forever**. Where record size
+is provider-influenced — a `description` or a `provider_extra` blob a third
+party can grow — that veto is **third-party-triggerable**: anyone who can put
+bytes into your history can switch off your host's ability to ever notice a
+disappearance. Naming the id costs a field and turns a permanent blackout into
+one exempt record.
+
+### 8.2 Three exemptions, none of them a threshold
+
+A complete sweep still does not retract everything absent from it. Three
+exemptions apply. **None of them is a percentage.** A rule of the form "refuse
+if more than N% would go" is a number with nothing behind it; each of these has
+a reason instead.
+
+**`history_start`.** A host refreshing a resource already calls `status.read`,
+which reports `history_start?` per resource (§7). If that resource's status
+entry carries `history_start`, every live head whose
+`effective_at ?? observed_at` **precedes** it is exempt from this sweep's
+retraction. This is not a threshold — it is `history_start` doing the exact job
+it exists for: bounding what an absence is allowed to be evidence of. The
+provider has said how far back it answers at all, so absence before that point
+is evidence of nothing. Without the exemption, a provider that prunes its
+history — or an Esplora deployment re-pointed at a differently-pruned one —
+retracts a user's entire early history, and **nothing later corrects it**: the
+next sweep is just as complete, and just as empty back there.
+
+**That comparison is between instants, never between strings.** Both
+timestamps are `Rfc3339` (§1), which admits fractional seconds and numeric
+offsets, so the two spellings of one moment are not the same text:
+`"…T00:00:00Z"` sorts *after* `"…T00:00:00.500Z"` as text and *before* it as a
+time, and `2026-01-01T01:00:00+02:00` and `2026-01-01T00:00:00Z` are one
+instant written two ways. Both cases are reachable on the wire, and both put a
+record that lies inside the provider's window on the wrong side of the bound
+and retract it. A host MUST parse both values and order the instants.
+
+**A timestamp that cannot be ordered exempts rather than retracts.** If either
+value cannot be placed on a line -- it fails to parse, it names a date the
+calendar does not have, or it carries precision finer than the host can order
+-- the head is exempt. Parsing is not the only way a timestamp can fail to be
+a point in time. `2026-02-30` is well-formed and is not a date; a host that
+normalizes it forward to March 2 has not read the adapter's timestamp, it has
+invented a different one, and moved the record across the bound while doing
+so. A fraction finer than the host's resolution is worse than imprecise: two
+distinct instants truncate to the same value and compare **equal**, which
+turns `at >= start` from false to true. Both are silent, and both retract.
+The two errors are not symmetric: a
+wrong exemption leaves a stale row that the next sweep can still retract, and
+a wrong retraction destroys a record of the user's money. Where the host
+cannot tell, it keeps the record.
+
+An exempted sweep still records a `history_start_exempt` discrepancy. This is
+the only one of the three exemptions that otherwise leaves no trace anywhere —
+the other two visibly retract nothing where a retraction was expected, and this
+one silently retracts *some* of what was absent — so without the row a user has
+no way to learn that a bound was applied at all.
+
+**A changed vantage.** If the sweep's `provider_id` (§1) differs from the last
+`provider_id` recorded for that resource, the sweep **retracts nothing**,
+records a `vantage_changed` discrepancy, and stores the new value. A different
+vantage is a different question: what one deployment can see now is not
+evidence about what another one held. **The rule terminates** — the next sweep
+from that same vantage finds `provider_id` unchanged and retracts normally. It
+exempts one sweep, not the resource.
+
+**An empty sweep against a non-empty live set.** A complete sweep carrying zero
+observations for a resource whose live set is not empty **retracts nothing**,
+records an `empty_sweep` discrepancy, and reports it to the user. Retracting
+100% of a resource requires an explicit, per-invocation confirmation from the
+user (in this project's CLI, `refresh --confirm-empty`). **100% is the one
+constant that needs no justification.** Every fraction below it is a threshold
+in disguise and has to be argued for; "everything you had is gone" is the one
+claim worth stopping to ask about no matter what any percentage rule would have
+concluded.
+
+### 8.3 Three reasons, in this order
+
+A retraction records **why** the record is absent. The reason is chosen by the
+first of these tests that matches, in this order:
+
+| Order | Test | Reason |
+|---|---|---|
+| 1 | The head's recorded derivation ≠ this sweep's derivation | `derivation_changed` |
+| 2 | The head's recorded fingerprint ≠ this sweep's fingerprint | `resource_definition_changed` |
+| 3 | Neither | `absent_from_complete_sweep` |
+
+A resource's **fingerprint** is the host's record of the resource *definition*
+the observations were read under — for a watch-only Bitcoin wallet, its address
+set. How it is computed is a host matter (this project's host digests the
+resource descriptor the adapter itself reports, so a definition change the
+adapter does not describe is invisible to it); what is normative here is only
+that a sweep run under a fingerprint different from a record's own retires that
+record under row 2 rather than row 3.
+
+**A software change must never retire records under a reason that blames the
+provider.** A derivation bump (§3 — a new `local_id_derivation` is a different
+pure function and produces different ids for the same real-world records) and a
+change to the resource definition are both **migrations**, recorded in the
+sweep's own transaction, not provider absences. Old-derivation ids can never be
+re-emitted by the new function, so they must retire — but under a reason that
+names the software change. Records that still exist come back on that same
+sweep under their new ids with a new revision, and are never retracted at all.
+Each of the first two reasons also writes one discrepancy row per sweep, so a
+migration is one visible event rather than a silent mass retirement.
+
+**A record a sweep re-observes is re-stamped under that sweep's rules.** A host
+that recognises an unchanged record and appends nothing to its chain MUST still
+refresh the derivation *and* the fingerprint it holds against that chain's
+head, not only whatever "last seen" marker it keeps. This is a correctness
+rule, not a bookkeeping nicety. A record that **survived** an address change
+was genuinely re-emitted under the new address set; leaving the old fingerprint
+on it means its ordinary disappearance three sweeps later matches row 2, and
+reports `resource_definition_changed` — a software change from three sweeps ago
+blamed for a record the provider simply stopped reporting. That is the exact
+failure this ordering exists to prevent, arriving through the back door.
+
+**Condition 7 gates on the per-sweep hello value only.** The derivation
+compared in row 1 is the one *this sweep's* connection announced in hello and
+the host recorded on that crawl. Two other readings of the same sentence are
+available and both are catastrophic. Comparing the sweep against every
+derivation present in stored history deadlocks retraction forever: a chain that
+has ever mixed derivations never qualifies again. Comparing it against the
+adapter's current stored derivation buries an entire pre-upgrade history under
+`absent_from_complete_sweep` — a provider-absence reason for a change the
+provider had no part in.
+
+### 8.4 A retraction is not an observation
+
+**A host cannot author an Observation.** It has no amount, no surface, no
+posting and no provider provenance for a record it did not read: §1's
+provenance is an adapter's account of a provider, and a host filling those
+fields in on its own behalf is fabricating provider evidence — the one thing
+this document is arranged throughout to prevent. A derived absence therefore
+never enters the observation chain. It is a separate, append-only record:
+
+    retraction { adapter_id, local_id, revision, reason, crawl_id, retracted_at }
+
+with **no provider field to fabricate**, where `revision` is the **highest
+revision in the chain** it retracts and `crawl_id` names the sweep that derived
+it.
+
+Liveness is then one rule over both tables:
+
+> A record is live iff the fold's live set (§3) contains it **and** its
+> chain's **highest** `revision` exceeds every retraction `revision` recorded
+> for that `(adapter_id, local_id)`.
+
+**The chain's highest revision, not the head's — those are two different
+questions.** `revision` is **arrival order**: the host stamps it as
+observations come off the wire (§3). The chain *head* is not the newest
+arrival; it is the winner of §3's fold total order,
+`(received_at, surface, arrival_index)`. Both orders are correct for what they
+answer. The head answers "what is true about this record now," which is a
+question about the provider's account of it. Liveness answers "has this host
+learned anything about this key since the retraction at revision N," which is a
+question about arrival — so it has to be asked in arrival order.
+
+Compare a retraction's revision against the *head's* and the two orders are
+mixed, which can bury a record for ever. Both ways they disagree are ordinary,
+not exotic. Two surfaces reporting the same event in one page already sort by
+`surface` ahead of arrival index, so the later arrival need not be the head. And
+a wall clock that steps **backwards** between refreshes — an NTP correction, a
+VM snapshot restore, a machine resuming with a bad RTC — stamps every
+re-emission with a `received_at` below the buried head's, so every honest sweep
+sorts *under* that head and the head's revision never grows past the
+retraction. The record stays retracted for ever while its chain grows one row
+per refresh, because dedup is off for a record the host believes buried (below).
+Reading the chain's highest revision has neither failure: a revision, once
+assigned, is never outranked by an older arrival.
+
+**Head *selection* is unchanged.** §3's total order still decides which
+observation the fold presents as the record's current state and which one the
+user sees, and it is still that head whose derivation and fingerprint §8.3's
+re-stamp refreshes. Only the liveness comparison moved.
+
+**This is why revival needs no special case.** A later sweep that re-emits the
+record appends revision N+1, which exceeds the retraction's N, and the record
+is live again by the same rule that hid it — no un-retraction, no deletion, no
+second mechanism to keep consistent with the first. It is the same reason §4
+makes the chain append-only: a restated fact is a legal entry, not a
+contradiction.
+
+**Which is why a host must not deduplicate a record its own retraction has
+buried.** Recognising a re-emitted record as byte-identical to its chain head
+and appending nothing is right in the ordinary case and wrong in exactly this
+one: a reorg that re-mines a transaction re-emits it **byte-identically**, so a
+dedup firing there would append no revision, leave the chain's highest
+revision at N, and keep the record retracted forever — no matter how many
+honest sweeps carried it. **"Live again" is a changed fact even when the
+content is not**, and a revision is the only way this model has to express a
+changed fact. So while a key's **highest** chain revision is at or below a
+retraction revision for that key, every re-observation of it appends — the same
+revision the liveness rule compares, asked the same way, so dedup and liveness
+can never disagree about whether a record is buried.
+
+**Nothing is deleted.** A retraction hides a record from the live set and from
+everything derived from it; it removes nothing. The chain, the retraction rows,
+and the crawl that produced them all survive, which is what makes a *wrong*
+retraction correctable rather than merely regrettable — and what that does and
+does not bound is stated in `adr/0006-host-side-retraction.md`, not softened
+here.

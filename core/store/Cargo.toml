@@ -1,0 +1,33 @@
+[package]
+name = "sumer-store"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lints]
+workspace = true
+
+[[bin]]
+name = "sumer"
+path = "src/main.rs"
+
+[dependencies]
+sumer-wire = { path = "../wire" }
+sumer-money = { path = "../money" }
+sumer-host = { path = "../host" }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
+# The local store (ADR 0002). `bundled` compiles SQLite itself rather than
+# linking whatever the host machine happens to ship: the CHECK constraints
+# and `PRAGMA user_version` this schema depends on must behave identically
+# on every machine that opens the file, and a distro's libsqlite3 is not a
+# version this project chose.
+rusqlite = { version = "0.40", features = ["bundled"] }
+# `content_hash` (frozen contract): SHA-256 over adapter-authored content.
+sha2 = "0.11"
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
